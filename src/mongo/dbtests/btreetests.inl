@@ -67,18 +67,7 @@
         }
         void insert( BSONObj &key ) {
             const BtreeBucket *b = bt();
-
-#if defined(TESTTWOSTEP)
-            {
-                Continuation c(dl(), recordLoc(), key, Ordering::make(order()), id());
-                b->twoStepInsert(dl(), c, true);
-                c.doIndexInsertionWrites();
-            }
-#else
-            {
-                b->bt_insert( dl(), recordLoc(), key, Ordering::make(order()), true, id(), true );
-            }
-#endif
+            b->bt_insert( dl(), recordLoc(), key, Ordering::make(order()), true, id(), true );
             getDur().commitIfNeeded();
         }
         bool unindex( BSONObj &key ) {
@@ -343,7 +332,10 @@
                                                           false,
                                                           1 ) );
             while( c->ok() ) {
-                if ( c->curKeyHasChild() ) {
+                bool has_child =
+                    c->getBucket().btree()->keyNode(c->getKeyOfs()).prevChildBucket.isNull();
+
+                if (has_child) {
                     toDel.push_back( c->currKey().firstElement().valuestr() );
                 }
                 else {

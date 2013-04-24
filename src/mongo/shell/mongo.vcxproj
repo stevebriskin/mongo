@@ -1696,6 +1696,7 @@ cscript //Nologo "$(ProjectDir)..\shell\createCPPfromJavaScriptFiles.js" "$(Proj
     <ClInclude Include="..\bson\util\bson_extract.h" />
     <ClInclude Include="..\client\dbclientinterface.h" />
     <ClInclude Include="..\client\sasl_client_authenticate.h" />
+    <ClInclude Include="..\db\repl\is_master.h" />
     <ClInclude Include="..\platform\atomic_intrinsics.h" />
     <ClInclude Include="..\platform\atomic_intrinsics_gcc.h">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
@@ -1771,6 +1772,7 @@ cscript //Nologo "$(ProjectDir)..\shell\createCPPfromJavaScriptFiles.js" "$(Proj
     <ClInclude Include="..\util\net\ssl_manager.h" />
     <ClInclude Include="..\util\safe_num.h" />
     <ClInclude Include="..\util\scopeguard.h" />
+    <ClInclude Include="..\util\sequence_util.h" />
     <ClInclude Include="..\util\stack_introspect.h" />
     <ClInclude Include="..\util\string_map.h" />
     <ClInclude Include="..\util\string_map_internal.h" />
@@ -1850,7 +1852,6 @@ cscript //Nologo "$(ProjectDir)..\shell\createCPPfromJavaScriptFiles.js" "$(Proj
     <ClInclude Include="..\db\querypattern.h" />
     <ClInclude Include="..\db\queryutil-inl.h" />
     <ClInclude Include="..\db\queryutil.h" />
-    <ClInclude Include="..\db\replutil.h" />
     <ClInclude Include="..\db\repl\health.h" />
     <ClInclude Include="..\db\repl\rs.h" />
     <ClInclude Include="..\db\repl\rs_config.h" />
@@ -1861,7 +1862,6 @@ cscript //Nologo "$(ProjectDir)..\shell\createCPPfromJavaScriptFiles.js" "$(Proj
     <ClInclude Include="..\scripting\engine.h" />
     <ClInclude Include="..\s\d_chunk_manager.h" />
     <ClInclude Include="..\s\shard.h" />
-    <ClInclude Include="..\targetver.h" />
     <ClInclude Include="..\util\allocator.h" />
     <ClInclude Include="..\util\assert_util.h" />
     <ClInclude Include="..\util\background.h" />

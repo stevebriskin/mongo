@@ -20,7 +20,7 @@
 
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/replutil.h"
+#include "mongo/db/repl/is_master.h"
 #include "mongo/util/background.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -99,6 +99,7 @@ namespace mongo {
                 
                 _currentlyUpdatingCache = true;
                 for ( list< pair<BSONObj,BSONObj> >::iterator i=todo.begin(); i!=todo.end(); i++ ) {
+                    Client::GodScope gs;
                     db.update( NS , i->first , i->second , true );
                 }
                 _currentlyUpdatingCache = false;
@@ -167,7 +168,9 @@ namespace mongo {
         }
 
         bool replicatedToNum(OpTime& op, int w) {
-            if ( w <= 1 || ! _isMaster() )
+            massert( 16805, "replicatedToNum called but not master anymore", _isMaster() );
+
+            if ( w <= 1 )
                 return true;
 
             w--; // now this is the # of slaves i need
@@ -176,7 +179,9 @@ namespace mongo {
         }
 
         bool waitForReplication(OpTime& op, int w, int maxSecondsToWait) {
-            if ( w <= 1 || ! _isMaster() )
+            massert( 16806, "waitForReplication called but not master anymore", _isMaster() );
+
+            if ( w <= 1 )
                 return true;
 
             w--; // now this is the # of slaves i need

@@ -251,6 +251,9 @@
     <Filter Include="JavaScript source files\Included in shell only">
       <UniqueIdentifier>{fccb174d-464d-4ec9-b0fc-630a294c75c0}</UniqueIdentifier>
     </Filter>
+    <Filter Include="db\index">
+      <UniqueIdentifier>{08d06617-bffe-4a15-8da3-34d63ad01c37}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\client\connpool.h">
@@ -497,9 +500,6 @@
       <Filter>db\Header Files\o to z</Filter>
     </ClInclude>
     <ClInclude Include="..\db\scanandorder.h">
-      <Filter>db\Header Files\o to z</Filter>
-    </ClInclude>
-    <ClInclude Include="..\server.h">
       <Filter>db\Header Files\o to z</Filter>
     </ClInclude>
     <ClInclude Include="..\db\ops\query.h">
@@ -872,9 +872,6 @@
       <Filter>db\Header Files\e to n</Filter>
     </ClInclude>
     <ClInclude Include="..\db\index.h">
-      <Filter>db\Header Files\e to n</Filter>
-    </ClInclude>
-    <ClInclude Include="..\db\index_insertion_continuation.h">
       <Filter>db\Header Files\e to n</Filter>
     </ClInclude>
     <ClInclude Include="..\db\index_rebuilder.h">
@@ -1993,7 +1990,6 @@
     <ClInclude Include="..\..\third_party\v8\src\zone-inl.h">
       <Filter>third_party\v8\src\Header Files\o to z</Filter>
     </ClInclude>
-    <ClInclude Include="..\targetver.h" />
     <ClInclude Include="..\pch.h" />
     <ClInclude Include="..\..\third_party\s2\base\basictypes.h">
       <Filter>third_party\s2\base</Filter>
@@ -2286,6 +2282,139 @@
     <ClInclude Include="..\db\parsed_query.h">
       <Filter>db\Header Files\o to z</Filter>
     </ClInclude>
+    <ClInclude Include="..\db\index\btree_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\btree_access_method_internal.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\btree_index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\btree_key_generator.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\catalog_hack.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\index_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\index_descriptor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\btree_interface.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\emulated_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\hash_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\hash_index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index_builder.h">
+      <Filter>db\Header Files\e to n</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\s2_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\s2_common.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\s2_index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\s2_near_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\s2_simple_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\ops\path_support.h">
+      <Filter>db\ops</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\fts_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\haystack_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\haystack_access_method_internal.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\repl\is_master.h">
+      <Filter>db\repl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\s\range_arithmetic.h">
+      <Filter>s</Filter>
+    </ClInclude>
+    <ClInclude Include="..\s\range_deleter.h">
+      <Filter>s</Filter>
+    </ClInclude>
+    <ClInclude Include="..\s\range_deleter_mock_env.h">
+      <Filter>s</Filter>
+    </ClInclude>
+    <ClInclude Include="..\s\range_deleter_stats.h">
+      <Filter>s</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\2d_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\2d_common.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\2d_index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\index\btree_based_builder.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\util\sequence_util.h">
+      <Filter>util\Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\sort_phase_one.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\pdfile_private.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\pdfile_version.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\projection.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\queryoptimizercursor.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\querypattern.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\queryutil.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\queryutil-inl.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\record.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\restapi.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\taskqueue.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\ttl.h">
+      <Filter>db\Header Files\o to z</Filter>
+    </ClInclude>
+    <ClInclude Include="..\server.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\client\connpool.cpp">
@@ -2524,9 +2653,6 @@
       <Filter>dbtests</Filter>
     </ClCompile>
     <ClCompile Include="queryutiltests.cpp">
-      <Filter>dbtests</Filter>
-    </ClCompile>
-    <ClCompile Include="removetests.cpp">
       <Filter>dbtests</Filter>
     </ClCompile>
     <ClCompile Include="replsettests.cpp">
@@ -4323,6 +4449,81 @@
     </ClCompile>
     <ClCompile Include="..\db\parsed_query.cpp">
       <Filter>db\Source Files\o to z</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\btree_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\btree_key_generator.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="dbhelper_tests.cpp">
+      <Filter>dbtests</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\btree_index_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\btree_interface.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\hash_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\hash_index_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index_builder.cpp">
+      <Filter>db\Source Files\e to n</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\s2_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\s2_index_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\s2_near_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\s2_simple_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\ops\path_support.cpp">
+      <Filter>db\ops</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\fts_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\haystack_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_arithmetic.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_arithmetic_test.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter_mock_env.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter_stat_test.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter_stats.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter_test.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\2d_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\2d_index_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\index\btree_based_builder.cpp">
+      <Filter>db\index</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

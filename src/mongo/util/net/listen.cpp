@@ -16,10 +16,12 @@
  */
 
 
-#include "pch.h"
-#include "listen.h"
-#include "message_port.h"
+#include "mongo/pch.h"
+
+#include "mongo/util/net/listen.h"
+
 #include "mongo/base/owned_pointer_vector.h"
+#include "mongo/util/net/message_port.h"
 
 #ifndef _WIN32
 
@@ -97,26 +99,13 @@ namespace mongo {
     Listener::Listener(const string& name, const string &ip, int port, bool logConnect ) 
         : _port(port), _name(name), _ip(ip), _logConnect(logConnect), _elapsedTime(0) { 
 #ifdef MONGO_SSL
-        _ssl = NULL;
-        if (cmdLine.sslOnNormalPorts) {
-            const SSLParams params(cmdLine.sslPEMKeyFile, 
-                                   cmdLine.sslPEMKeyPassword,
-                                   cmdLine.sslCAFile,
-                                   cmdLine.sslCRLFile,
-                                   cmdLine.sslWeakCertificateValidation,
-                                   cmdLine.sslFIPSMode);
-            _ssl = new SSLManager(params);
-        }
+        _ssl = getSSLManager();
 #endif
     }
     
     Listener::~Listener() {
         if ( _timeTracker == this )
             _timeTracker = 0;
-#ifdef MONGO_SSL
-        delete _ssl;
-        _ssl = 0;
-#endif
     }
 
     bool Listener::_setupSockets( const vector<SockAddr>& mine , vector<SOCKET>& socks ) {

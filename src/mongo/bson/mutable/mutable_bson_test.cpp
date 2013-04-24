@@ -845,5 +845,248 @@ namespace {
         ASSERT_EQUALS(false, e3Child.getValueBool());
     }
 
+    TEST(Document, RenameDeserialization) {
+        // Regression test for a bug where certain rename operations failed to deserialize up
+        // the tree correctly, resulting in a lost rename
+        static const char inJson[] =
+            "{"
+            "  'a' : { 'b' : { 'c' : { 'd' : 4 } } }"
+            "}";
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+
+        mmb::Document doc(inObj);
+        mmb::Element a = doc.root().leftChild();
+        ASSERT_TRUE(a.ok());
+        mmb::Element b = a.leftChild();
+        ASSERT_TRUE(b.ok());
+        mmb::Element c = b.leftChild();
+        ASSERT_TRUE(c.ok());
+        c.rename("C");
+        mongo::BSONObj outObj = doc.getObject();
+        static const char outJson[] =
+            "{"
+            "  'a' : { 'b' : { 'C' : { 'd' : 4 } } }"
+            "}";
+        ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    }
+
+    TEST(Document, RemoveElementWithOpaqueRightSibling) {
+        // Regression test for a bug where removing an element with an opaque right sibling
+        // would access an invalidated rep. Note that this test may or may not fail depending
+        // on the details of memory allocation: failures would be clearly visible with
+        // valgrind, however.
+        static const char inJson[] =
+            "{"
+            "  'a' : 1, 'b' : 2, 'c' : 3"
+            "}";
+
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+        mmb::Document doc(inObj);
+
+        mmb::Element a = doc.root().leftChild();
+        ASSERT_TRUE(a.ok());
+        a.remove();
+
+        static const char outJson[] =
+            "{"
+            "  'b' : 2, 'c' : 3"
+            "}";
+        mongo::BSONObj outObj = doc.getObject();
+        ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    }
+
+    TEST(Document, AddRightSiblingToElementWithOpaqueRightSibling) {
+        // Regression test for a bug where adding a right sibling to a node with an opaque
+        // right sibling would potentially access an invalidated rep. Like the 'remove' test
+        // above, this may or may not crash, but would be visible under a memory checking tool.
+        static const char inJson[] =
+            "{"
+            "  'a' : 1, 'b' : 2, 'c' : 3"
+            "}";
+
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+        mmb::Document doc(inObj);
+
+        mmb::Element a = doc.root().leftChild();
+        ASSERT_TRUE(a.ok());
+        mmb::Element newElt = doc.makeElementString("X", "X");
+        ASSERT_OK(a.addSiblingRight(newElt));
+
+        static const char outJson[] =
+            "{"
+            "  'a' : 1, 'X' : 'X', 'b' : 2, 'c' : 3"
+            "}";
+        mongo::BSONObj outObj = doc.getObject();
+        ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    }
+
+    TEST(Document, ArrayIndexedAccessFromJson) {
+        static const char inJson[] =
+            "{"
+            " a : 1, b : [{ c : 1 }]"
+            "}";
+
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+        mmb::Document doc(inObj);
+
+        mmb::Element a = doc.root().leftChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS("a", a.getFieldName());
+        ASSERT_EQUALS(mongo::NumberInt, a.getType());
+
+        mmb::Element b = a.rightSibling();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS("b", b.getFieldName());
+        ASSERT_EQUALS(mongo::Array, b.getType());
+
+        mmb::Element b0 = b[0];
+        ASSERT_TRUE(b0.ok());
+        ASSERT_EQUALS("0", b0.getFieldName());
+        ASSERT_EQUALS(mongo::Object, b0.getType());
+    }
+
+    TEST(Document, ArrayIndexedAccessFromManuallyBuilt) {
+        mmb::Document doc;
+        mmb::Element root = doc.root();
+        ASSERT_TRUE(root.ok());
+        {
+            ASSERT_OK(root.appendInt("a", 1));
+            mmb::Element b = doc.makeElementArray("b");
+            ASSERT_TRUE(b.ok());
+            ASSERT_OK(root.pushBack(b));
+            mmb::Element b0 = doc.makeElementObject("ignored");
+            ASSERT_TRUE(b0.ok());
+            ASSERT_OK(b.pushBack(b0));
+            ASSERT_OK(b0.appendInt("c", 1));
+        }
+
+        mmb::Element a = doc.root().leftChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS("a", a.getFieldName());
+        ASSERT_EQUALS(mongo::NumberInt, a.getType());
+
+        mmb::Element b = a.rightSibling();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS("b", b.getFieldName());
+        ASSERT_EQUALS(mongo::Array, b.getType());
+
+        mmb::Element b0 = b[0];
+        ASSERT_TRUE(b0.ok());
+        ASSERT_EQUALS("ignored", b0.getFieldName());
+        ASSERT_EQUALS(mongo::Object, b0.getType());
+    }
+
+    TEST(Document, EndElement) {
+        mmb::Document doc;
+        mmb::Element end = doc.end();
+        ASSERT_FALSE(end.ok());
+        mmb::Element missing = doc.root().leftChild();
+        ASSERT_EQUALS(end, missing);
+        missing = doc.root().rightChild();
+        ASSERT_EQUALS(end, missing);
+        missing = doc.root().leftSibling();
+        ASSERT_EQUALS(end, missing);
+        missing = doc.root().rightSibling();
+        ASSERT_EQUALS(end, missing);
+    }
+
+    TEST(Document, ConstEndElement) {
+        const mmb::Document doc;
+        mmb::ConstElement end = doc.end();
+        ASSERT_FALSE(end.ok());
+        mmb::ConstElement missing = doc.root().leftChild();
+        ASSERT_EQUALS(end, missing);
+        missing = doc.root().rightChild();
+        ASSERT_EQUALS(end, missing);
+        missing = doc.root().leftSibling();
+        ASSERT_EQUALS(end, missing);
+        missing = doc.root().rightSibling();
+        ASSERT_EQUALS(end, missing);
+    }
+
+    TEST(Element, EmptyDocHasNoChildren) {
+        mmb::Document doc;
+        ASSERT_FALSE(doc.root().hasChildren());
+    }
+
+    TEST(Element, PopulatedDocHasChildren) {
+        mmb::Document doc;
+        ASSERT_OK(doc.root().appendInt("a", 1));
+        ASSERT_TRUE(doc.root().hasChildren());
+        mmb::Element lc = doc.root().leftChild();
+        ASSERT_FALSE(lc.hasChildren());
+    }
+
+    TEST(Element, LazyEmptyDocHasNoChildren) {
+        static const char inJson[] = "{}";
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+        mmb::Document doc(inObj);
+        ASSERT_FALSE(doc.root().hasChildren());
+    }
+
+    TEST(Element, LazySingletonDocHasChildren) {
+        static const char inJson[] = "{ a : 1 }";
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+        mmb::Document doc(inObj);
+        ASSERT_TRUE(doc.root().hasChildren());
+        ASSERT_FALSE(doc.root().leftChild().hasChildren());
+    }
+
+    TEST(Element, LazyConstDoubletonDocHasChildren) {
+        static const char inJson[] = "{ a : 1, b : 2 }";
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+        const mmb::Document doc(inObj);
+        ASSERT_TRUE(doc.root().hasChildren());
+        ASSERT_FALSE(doc.root().leftChild().hasChildren());
+        ASSERT_FALSE(doc.root().rightChild().hasChildren());
+        ASSERT_FALSE(doc.root().leftChild() == doc.root().rightChild());
+    }
+
+    TEST(Document, ArraySerialization) {
+
+        static const char inJson[] =
+            "{ "
+            " 'a' : { 'b' : [ 'c', 'd' ] } "
+            "}";
+
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+        mmb::Document doc(inObj);
+
+        mmb::Element root = doc.root();
+        mmb::Element a = root.leftChild();
+        mmb::Element b = a.leftChild();
+        mmb::Element new_array = doc.makeElementArray("XXX");
+        mmb::Element e = doc.makeElementString("e", "e");
+        new_array.pushBack(e);
+        b.pushBack(new_array);
+
+        static const char outJson[] =
+            "{ "
+            " 'a' : { 'b' : [ 'c', 'd', [ 'e' ] ] } "
+            "}";
+
+        const mongo::BSONObj outObj = doc.getObject();
+        ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
+    }
+
+    TEST(Document, SetValueBSONElementFieldNameHandling) {
+        static const char inJson[] = "{ a : 4 }";
+        mongo::BSONObj inObj = mongo::fromjson(inJson);
+        mmb::Document doc(inObj);
+
+        static const char inJson2[] = "{ b : 5 }";
+        mongo::BSONObj inObj2 = mongo::fromjson(inJson2);
+        mongo::BSONObjIterator iterator = inObj2.begin();
+
+        ASSERT_TRUE(iterator.more());
+        const mongo::BSONElement b = iterator.next();
+
+        mmb::Element a = doc.root().leftChild();
+        a.setValueBSONElement(b);
+
+        static const char outJson[] = "{ a : 5 }";
+        ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    }
+
 } // namespace
 

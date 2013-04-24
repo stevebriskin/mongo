@@ -1,3 +1,4 @@
+// XXX THIS FILE IS DEPRECATED.  PLEASE DON'T MODIFY.
 // db/geo/haystack.cpp
 
 /**
@@ -23,6 +24,10 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/index/catalog_hack.h"
+#include "mongo/db/index/haystack_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/namespace-inl.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/index.h"
@@ -169,14 +174,6 @@ namespace mongo {
                     addKey(root, *i, keys);
                 }
             }
-        }
-
-        // XXX: Who could call this and how do they know not to actually do so?
-        shared_ptr<Cursor> newCursor(const BSONObj& query, const BSONObj& order,
-                                     int numWanted) const {
-            shared_ptr<Cursor> c;
-            verify(0);
-            return c;
         }
 
         void searchCommand(NamespaceDetails* nsd,
@@ -343,13 +340,6 @@ namespace mongo {
                 return false;
             }
 
-            int idxNum = idxs[0];
-
-            IndexDetails& id = nsd->idx(idxNum);
-            GeoHaystackSearchIndex *si =
-                static_cast<GeoHaystackSearchIndex*>(id.getSpec().getType());
-            verify(&id == si->getDetails());
-
             BSONElement nearElt = cmdObj["near"];
             BSONElement maxDistance = cmdObj["maxDistance"];
             BSONElement search = cmdObj["search"];
@@ -362,8 +352,11 @@ namespace mongo {
             if (cmdObj["limit"].isNumber())
                 limit = static_cast<unsigned>(cmdObj["limit"].numberInt());
 
-            si->searchCommand(nsd, nearElt.Obj(), maxDistance.numberDouble(), search.Obj(),
-                              result, limit);
+            int idxNum = idxs[0];
+            auto_ptr<IndexDescriptor> desc(CatalogHack::getDescriptor(nsd, idxNum));
+            auto_ptr<HaystackAccessMethod> ham(new HaystackAccessMethod(desc.get()));
+            ham->searchCommand(nearElt.Obj(), maxDistance.numberDouble(), search.Obj(),
+                               &result, limit);
             return 1;
         }
     } nameSearchCommand;

@@ -24,7 +24,9 @@
 #include <string>
 #include <vector>
 
+#include "mongo/base/init.h"
 #include "mongo/bson/util/atomic_int.h"
+#include "mongo/db/cmdline.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/sock.h"
@@ -108,14 +110,38 @@ namespace mongo {
     
     ////////////////////////////////////////////////////////////////
 
-    static mongo::mutex sslInitMtx("SSL Initialization");
-    static bool sslInitialized(false);
+    static SimpleMutex sslManagerMtx("SSL Manager");
+    SSLManager* theSSLManager = NULL;
+
+    void initializeSSL() {
+        SimpleMutex::scoped_lock lck(sslManagerMtx);
+
+        if (theSSLManager != NULL) return;
+
+        if (cmdLine.sslOnNormalPorts) {
+            const SSLParams params(cmdLine.sslPEMKeyFile, 
+                                   cmdLine.sslPEMKeyPassword,
+                                   cmdLine.sslCAFile,
+                                   cmdLine.sslCRLFile,
+                                   cmdLine.sslWeakCertificateValidation,
+                                   cmdLine.sslFIPSMode);
+            theSSLManager = new SSLManager(params);
+        }
+    }
+    
+    MONGO_INITIALIZER(SSLManager)(InitializerContext* context) {
+        initializeSSL();
+        return Status::OK();
+    }
+
+    SSLManager* getSSLManager() {
+        SimpleMutex::scoped_lock lck(sslManagerMtx);
+        if (theSSLManager)
+            return theSSLManager;
+        return NULL;
+    }
 
     void SSLManager::_initializeSSL(const SSLParams& params) {
-        scoped_lock lk(sslInitMtx);
-        if (sslInitialized) 
-            return;  // already done
-
         SSL_library_init();
         SSL_load_error_strings();
         ERR_load_crypto_strings();
@@ -127,8 +153,6 @@ namespace mongo {
         // Add all digests and ciphers to OpenSSL's internal table
         // so that encryption/decryption is backwards compatible
         OpenSSL_add_all_algorithms();
-
-        sslInitialized = true;
     }
 
     SSLManager::SSLManager(const SSLParams& params) : 
@@ -149,6 +173,15 @@ namespace mongo {
         // If renegotiation is needed, don't return from recv() or send() until it's successful.
         // Note: this is for blocking sockets only.
         SSL_CTX_set_mode(_context, SSL_MODE_AUTO_RETRY);
+
+        // Set context within which session can be reused
+        int status = SSL_CTX_set_session_id_context(
+            _context,
+            static_cast<unsigned char*>(static_cast<void*>(&_context)),
+            sizeof(_context));
+        if (!status) {
+            uasserted(16768,"ssl initialization problem");
+        }
 
         SSLThreadInfo::init();
         SSLThreadInfo::get();
@@ -202,8 +235,12 @@ namespace mongo {
             return false;
         }
         
-        SSL_CTX_set_default_passwd_cb_userdata( _context , this );
-        SSL_CTX_set_default_passwd_cb( _context, &SSLManager::password_cb );
+        // If password is empty, use default OpenSSL callback, which uses the terminal
+        // to securely request the password interactively from the user.
+        if (!password.empty()) {
+            SSL_CTX_set_default_passwd_cb_userdata( _context , this );
+            SSL_CTX_set_default_passwd_cb( _context, &SSLManager::password_cb );
+        }
         
         if ( SSL_CTX_use_PrivateKey_file( _context , keyFile.c_str() , SSL_FILETYPE_PEM ) != 1 ) {
             error() << "cannot read key file: " << keyFile << ' ' <<

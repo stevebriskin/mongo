@@ -26,7 +26,7 @@
 #include "mongo/db/databaseholder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/ops/delete.h"
-#include "mongo/db/replutil.h"
+#include "mongo/db/repl/is_master.h"
 #include "mongo/util/background.h"
 
 namespace mongo {
@@ -49,6 +49,9 @@ namespace mongo {
         static string secondsExpireField;
         
         void doTTLForDB( const string& dbName ) {
+
+            //check isMaster before becoming god
+            bool isMaster = isMasterNs( dbName.c_str() );
 
             Client::GodScope god;
 
@@ -100,7 +103,7 @@ namespace mongo {
                         nsd->syncUserFlags( ns );
                     }
                     // only do deletes if on master
-                    if ( ! isMasterNs( dbName.c_str() ) ) {
+                    if ( ! isMaster ) {
                         continue;
                     }
 

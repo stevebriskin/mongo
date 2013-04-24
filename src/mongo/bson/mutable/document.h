@@ -378,6 +378,12 @@ namespace mutablebson {
         /** Returns the root element for this document. */
         inline ConstElement root() const;
 
+        /** Returns an element that will compare equal to a non-ok element. */
+        Element end();
+
+        /** Returns an element that will compare equal to a non-ok element. */
+        ConstElement end() const;
+
     private:
         friend class Element;
 

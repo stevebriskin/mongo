@@ -1061,6 +1061,32 @@ namespace JSTests {
         class InformalDBRefTest : public TestRoundTrip {
             virtual BSONObj bson() const {
                 BSONObjBuilder b;
+                BSONObjBuilder subBuilder(b.subobjStart("a"));
+                subBuilder.append("$ref", "ns");
+                subBuilder.append("$id", "000000000000000000000000");
+                subBuilder.done();
+                return b.obj();
+            }
+
+            // Don't need to return anything because we are overriding both jsonOut and jsonIn
+            virtual string json() const { return ""; }
+
+            // Need to override these because the JSON doesn't actually round trip.
+            // An object with "$ref" and "$id" fields is handled specially and different on the way out.
+            virtual string jsonOut() const {
+                return "{ \"a\" : DBRef( \"ns\", \"000000000000000000000000\" ) }";
+            }
+            virtual string jsonIn() const {
+                stringstream ss;
+                ss << "{ \"a\" : { \"$ref\" : \"ns\" , " <<
+                                "\"$id\" : \"000000000000000000000000\" } }";
+                return ss.str();
+            }
+        };
+
+        class InformalDBRefOIDTest : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
                 OID o;
                 memset( &o, 0, 12 );
                 BSONObjBuilder subBuilder(b.subobjStart("a"));
@@ -1113,6 +1139,17 @@ namespace JSTests {
                                 "\"$id\" : ObjectId( \"000000000000000000000000\" ) , " <<
                                 "\"otherfield\" : \"value\" } }";
                 return ss.str();
+            }
+        };
+
+        class Timestamp : public TestRoundTrip {
+            virtual BSONObj bson() const {
+                BSONObjBuilder b;
+                b.appendTimestamp( "a", 20000ULL, 5 );
+                return b.obj();
+            }
+            virtual string json() const {
+                return "{ \"a\" : Timestamp( 20, 5 ) }";
             }
         };
 
@@ -1387,7 +1424,9 @@ namespace JSTests {
             add< RoundTripTests::DBRefTest >();
             add< RoundTripTests::DBPointerTest >();
             add< RoundTripTests::InformalDBRefTest >();
+            add< RoundTripTests::InformalDBRefOIDTest >();
             add< RoundTripTests::InformalDBRefExtraFieldTest >();
+            add< RoundTripTests::Timestamp >();
             add< NoReturnSpecified >();
         }
     } myall;

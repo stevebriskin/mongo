@@ -23,7 +23,6 @@
 #include <vector>
 
 #include "mongo/db/diskloc.h"
-#include "mongo/db/index_insertion_continuation.h"
 #include "mongo/db/indexkey.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/key.h"
@@ -35,22 +34,6 @@ namespace mongo {
     protected:
         virtual ~IndexInterface() { }
     public:
-        class IndexInserter : private boost::noncopyable {
-        public:
-            IndexInserter();
-            ~IndexInserter();
-
-            void addInsertionContinuation(IndexInsertionContinuation *c);
-            void finishAllInsertions();
-
-        private:
-            std::vector<IndexInsertionContinuation *> _continuations;
-        };
-
-        virtual IndexInsertionContinuation *beginInsertIntoIndex(
-            int idxNo,
-            IndexDetails &_idx, DiskLoc _recordLoc, const BSONObj &_key,
-            const Ordering& _order, bool dupsAllowed) = 0;
 
         virtual int keyCompare(const BSONObj& l,const BSONObj& r, const Ordering &ordering) = 0;
         virtual long long fullValidate(const DiskLoc& thisLoc, const BSONObj &order) = 0;
@@ -116,13 +99,6 @@ namespace mongo {
             BSONObj res = query.extractFieldsUnDotted(k);
             return res;
         }
-
-        /* pull out the relevant key objects from obj, so we
-           can index them.  Note that the set is multiple elements
-           only when it's a "multikey" array.
-           keys will be left empty if key not found in the object.
-        */
-        void getKeysFromObject( const BSONObj& obj, BSONObjSet& keys) const;
 
         /* get the key pattern for this object.
            e.g., { lastname:1, firstname:1 }
@@ -240,24 +216,8 @@ namespace mongo {
         static IndexInterface *iis[];
     };
 
-    struct IndexChanges { /*on an update*/
-        BSONObjSet oldkeys;
-        BSONObjSet newkeys;
-        vector<BSONObj*> removed; // these keys were removed as part of the change
-        vector<BSONObj*> added;   // these keys were added as part of the change
-
-        /** @curObjLoc - the object we want to add's location.  if it is already in the
-                         index, that is allowed here (for bg indexing case).
-        */
-        void dupCheck(IndexDetails& idx, DiskLoc curObjLoc);
-    };
-
     class NamespaceDetails;
     // changedId should be initialized to false
-    void getIndexChanges(vector<IndexChanges>& v, const char *ns, NamespaceDetails& d,
-                         BSONObj newObj, BSONObj oldObj, bool &cangedId);
-    void dupCheck(vector<IndexChanges>& v, NamespaceDetails& d, DiskLoc curObjLoc);
-
     void assureSysIndexesEmptied(const char *ns, IndexDetails *exceptForIdIndex);
     int removeFromSysIndexes(const char *ns, const char *idxName);
 

@@ -568,7 +568,7 @@ namespace mongo {
                     _authMongoCR(userSource, user, password, errmsg, digestPassword));
         }
         else if (saslClientAuthenticate != NULL) {
-            uassertStatusOK(saslClientAuthenticate(this, params, NULL));
+            uassertStatusOK(saslClientAuthenticate(this, params));
         }
         else {
             uasserted(ErrorCodes::BadValue,
@@ -1398,15 +1398,8 @@ namespace mongo {
         SimpleMutex::scoped_lock lk(s_mtx);
         if (s_sslMgr) 
             return s_sslMgr;
-        const SSLParams params(cmdLine.sslPEMKeyFile, 
-                               cmdLine.sslPEMKeyPassword,
-                               cmdLine.sslCAFile,
-                               cmdLine.sslCRLFile,
-                               cmdLine.sslWeakCertificateValidation,
-                               cmdLine.sslFIPSMode);
-        s_sslMgr = new SSLManager(params);
+        s_sslMgr = getSSLManager();
         
-
         return s_sslMgr;
     }
 #endif

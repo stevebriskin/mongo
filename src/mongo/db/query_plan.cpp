@@ -18,6 +18,11 @@
 
 #include "mongo/db/btreecursor.h"
 #include "mongo/db/cmdline.h"
+#include "mongo/db/index_selection.h"
+#include "mongo/db/index/catalog_hack.h"
+#include "mongo/db/index/emulated_cursor.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/index_access_method.h"
 #include "mongo/db/intervalbtreecursor.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/parsed_query.h"
@@ -111,8 +116,8 @@ namespace mongo {
 
         // If the parsing or index indicates this is a special query, don't continue the processing
         if (!_special.empty() ||
-            ( _index->getSpec().getType() &&
-             _index->getSpec().getType()->suitability( _frs, _order ) != USELESS ) ) {
+            ( _index->getSpec().getType() && (USELESS !=
+                IndexSelection::isSuitableFor(_index->getSpec().keyPattern, _frs, _order)))) {
 
             _type  = _index->getSpec().getType();
             if (_special.empty()) _special = _index->getSpec().getType()->getPlugin()->getName();
@@ -247,7 +252,12 @@ doneCheckOrder:
                 // SERVER-5390
                 numWanted = _parsedQuery->getSkip() + _parsedQuery->getNumToReturn();
             }
-            return _type->newCursor( _originalQuery, _order, numWanted );
+
+            IndexDescriptor* descriptor = CatalogHack::getDescriptor(_d, _idxNo);
+            IndexAccessMethod* iam = CatalogHack::getIndex(descriptor);
+            return shared_ptr<Cursor>(EmulatedCursor::make(descriptor, iam, _originalQuery,
+                                                           _order, numWanted,
+                                                           descriptor->keyPattern()));
         }
 
         if ( _utility == Impossible ) {

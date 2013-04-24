@@ -1856,9 +1856,80 @@
     <ClCompile Include="parsed_query.cpp">
       <Filter>db\Source Files\o to z</Filter>
     </ClCompile>
+    <ClCompile Include="index\btree_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\btree_key_generator.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\btree_index_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\btree_interface.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\hash_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\hash_index_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index_builder.cpp">
+      <Filter>db\Source Files\e to n</Filter>
+    </ClCompile>
+    <ClCompile Include="index\s2_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\s2_index_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\s2_near_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\s2_simple_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="ops\path_support.cpp">
+      <Filter>db\ops</Filter>
+    </ClCompile>
+    <ClCompile Include="index\fts_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\haystack_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_arithmetic.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_arithmetic_test.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter_mock_env.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter_stat_test.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter_stats.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="..\s\range_deleter_test.cpp">
+      <Filter>s</Filter>
+    </ClCompile>
+    <ClCompile Include="index\2d_access_method.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\2d_index_cursor.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
+    <ClCompile Include="index\btree_based_builder.cpp">
+      <Filter>db\index</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\targetver.h" />
     <ClInclude Include="..\..\third_party\snappy\config.h">
       <Filter>third_party\snappy</Filter>
     </ClInclude>
@@ -2272,9 +2343,6 @@
       <Filter>db\Header Files\e to n</Filter>
     </ClInclude>
     <ClInclude Include="index.h">
-      <Filter>db\Header Files\e to n</Filter>
-    </ClInclude>
-    <ClInclude Include="index_insertion_continuation.h">
       <Filter>db\Header Files\e to n</Filter>
     </ClInclude>
     <ClInclude Include="indexkey.h">
@@ -3366,9 +3434,6 @@
     <ClInclude Include="record.h">
       <Filter>db\Header Files\o to z</Filter>
     </ClInclude>
-    <ClInclude Include="replutil.h">
-      <Filter>db\Header Files\o to z</Filter>
-    </ClInclude>
     <ClInclude Include="restapi.h">
       <Filter>db\Header Files\o to z</Filter>
     </ClInclude>
@@ -3918,6 +3983,106 @@
     <ClInclude Include="parsed_query.h">
       <Filter>db\Header Files\o to z</Filter>
     </ClInclude>
+    <ClInclude Include="index\btree_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\btree_access_method_internal.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\btree_index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\btree_key_generator.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\catalog_hack.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\index_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\index_descriptor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\btree_interface.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\emulated_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\hash_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\hash_index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index_builder.h">
+      <Filter>db\Header Files\e to n</Filter>
+    </ClInclude>
+    <ClInclude Include="index\s2_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\s2_common.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\s2_index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\s2_near_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\s2_simple_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="ops\path_support.h">
+      <Filter>db\ops</Filter>
+    </ClInclude>
+    <ClInclude Include="index\fts_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\haystack_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\haystack_access_method_internal.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\third_party\snappy\snappy-stubs-public.h">
+      <Filter>third_party\snappy</Filter>
+    </ClInclude>
+    <ClInclude Include="repl\is_master.h">
+      <Filter>db\repl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\s\range_arithmetic.h">
+      <Filter>s</Filter>
+    </ClInclude>
+    <ClInclude Include="..\s\range_deleter.h">
+      <Filter>s</Filter>
+    </ClInclude>
+    <ClInclude Include="..\s\range_deleter_mock_env.h">
+      <Filter>s</Filter>
+    </ClInclude>
+    <ClInclude Include="..\s\range_deleter_stats.h">
+      <Filter>s</Filter>
+    </ClInclude>
+    <ClInclude Include="index\2d_access_method.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\2d_common.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\2d_index_cursor.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="index\btree_based_builder.h">
+      <Filter>db\index</Filter>
+    </ClInclude>
+    <ClInclude Include="..\util\sequence_util.h">
+      <Filter>util\Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\server.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="mongo.ico">
@@ -4359,6 +4524,9 @@
     </Filter>
     <Filter Include="JavaScript source files\Included in shell only">
       <UniqueIdentifier>{023400bc-92fc-4d80-849e-ee5c8c6ca478}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="db\index">
+      <UniqueIdentifier>{222760f0-8bef-42ff-933e-cb765e706d9f}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>

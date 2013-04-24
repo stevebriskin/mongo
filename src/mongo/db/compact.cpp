@@ -18,7 +18,7 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include <string>
 #include <vector>
@@ -33,11 +33,11 @@
 #include "mongo/db/curop-inl.h"
 #include "mongo/db/extsort.h"
 #include "mongo/db/index.h"
+#include "mongo/db/index_builder.h"
 #include "mongo/db/index_update.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/pdfile.h"
-#include "mongo/db/sort_phase_one.h"
 #include "mongo/util/concurrency/task.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/touch_pages.h"
@@ -59,10 +59,8 @@ namespace mongo {
 
     /** @return number of skipped (invalid) documents */
     unsigned compactExtent(const char *ns, NamespaceDetails *d, const DiskLoc diskloc, int n,
-                const scoped_array<IndexSpec> &indexSpecs,
-                scoped_array<SortPhaseOne>& phase1, int nidx, bool validate, 
-                double pf, int pb)
-    {
+                           int nidx, bool validate, double pf, int pb) {
+
         log() << "compact begin extent #" << n << " for namespace " << ns << endl;
         unsigned oldObjSize = 0; // we'll report what the old padding was
         unsigned oldObjSizeWithPadding = 0;
@@ -124,13 +122,6 @@ namespace mongo {
                         recNew = (Record *) getDur().writingPtr(recNew, lenWHdr);
                         addRecordToRecListInExtent(recNew, loc);
                         memcpy(recNew->data(), objOld.objdata(), sz);
-
-                        {
-                            // extract keys for all indexes we will be rebuilding
-                            for( int x = 0; x < nidx; x++ ) { 
-                                phase1[x].addKeys(indexSpecs[x], objOld, loc, false);
-                            }
-                        }
                     }
                     else { 
                         if( ++skipped <= 10 )
@@ -202,8 +193,7 @@ namespace mongo {
         NamespaceDetailsTransient::get(ns).clearQueryCache();
 
         int nidx = d->nIndexes;
-        scoped_array<IndexSpec> indexSpecs( new IndexSpec[nidx] );
-        scoped_array<SortPhaseOne> phase1( new SortPhaseOne[nidx] );
+        scoped_array<BSONObj> indexSpecs( new BSONObj[nidx] );
         {
             NamespaceDetails::IndexIterator ii = d->ii(); 
             // For each existing index...
@@ -225,17 +215,7 @@ namespace mongo {
                     // Pass the element through to the new index spec.
                     b.append(e);
                 }
-                // Add the new index spec to 'indexSpecs'.
-                BSONObj o = b.obj().getOwned();
-                indexSpecs[idxNo].reset(o);
-                // Create an external sorter.
-                phase1[idxNo].sorter.reset
-                        ( new BSONObjExternalSorter
-                           // Use the default index interface, since the new index will be created
-                           // with the default index version.
-                         ( IndexInterface::defaultVersion(),
-                           o.getObjectField("key") ) );
-                phase1[idxNo].sorter->hintNumObjects( d->stats.nrecords );
+                indexSpecs[idxNo] = b.obj().getOwned();
             }
         }
 
@@ -243,8 +223,6 @@ namespace mongo {
         for( int i = 0; i < Buckets; i++ ) { 
             d->deletedList[i].writing().Null();
         }
-
-
 
         // Start over from scratch with our extent sizing and growth
         d->lastExtentSize=0;
@@ -275,7 +253,7 @@ namespace mongo {
         }
 
         for( list<DiskLoc>::iterator i = extents.begin(); i != extents.end(); i++ ) { 
-            skipped += compactExtent(ns, d, *i, n++, indexSpecs, phase1, nidx, validate, pf, pb);
+            skipped += compactExtent(ns, d, *i, n++, nidx, validate, pf, pb);
             pm.hit();
         }
 
@@ -293,18 +271,9 @@ namespace mongo {
         string si = s.db + ".system.indexes";
         for( int i = 0; i < nidx; i++ ) {
             killCurrentOp.checkForInterrupt(false);
-            BSONObj info = indexSpecs[i].info;
+            BSONObj info = indexSpecs[i];
             log() << "compact create index " << info["key"].Obj().toString() << endl;
-            scoped_lock precalcLock(theDataFileMgr._precalcedMutex);
-            try {
-                theDataFileMgr.setPrecalced(&phase1[i]);
-                theDataFileMgr.insert(si.c_str(), info.objdata(), info.objsize());
-            }
-            catch(...) {
-                theDataFileMgr.setPrecalced(NULL);
-                throw;
-            }
-            theDataFileMgr.setPrecalced(NULL);
+            theDataFileMgr.insert(si.c_str(), info.objdata(), info.objsize());
         }
 
         return true;
@@ -364,6 +333,16 @@ namespace mongo {
         }
         CompactCmd() : Command("compact") { }
 
+        virtual std::vector<BSONObj> stopIndexBuilds(const std::string& dbname, 
+                                                     const BSONObj& cmdObj) {
+            std::string systemIndexes = dbname+".system.indexes";
+            std::string coll = cmdObj.firstElement().valuestr();
+            std::string ns = dbname + "." + coll;
+            BSONObj criteria = BSON("ns" << systemIndexes << "op" << "insert" << "insert.ns" << ns);
+
+            return IndexBuilder::killMatchingIndexBuilds(criteria);
+        }
+
         virtual bool run(const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             string coll = cmdObj.firstElement().valuestr();
             if( coll.empty() || db.empty() ) {
@@ -414,8 +393,13 @@ namespace mongo {
                 verify( pb >= 0 && pb <= 1024 * 1024 );
             }
 
+            std::vector<BSONObj> indexesInProg = stopIndexBuilds(db, cmdObj);
+
             bool validate = !cmdObj.hasElement("validate") || cmdObj["validate"].trueValue(); // default is true at the moment
             bool ok = compact(ns, errmsg, validate, result, pf, pb);
+
+            IndexBuilder::restoreIndexes(db+".system.indexes", indexesInProg);
+
             return ok;
         }
     };

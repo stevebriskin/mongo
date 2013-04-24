@@ -91,6 +91,8 @@ function whereConstructorTest (constructorList) {
 
 var dbrefConstructors = {
     "valid" : [
+            // SERVER-8961
+            //"DBRef()",
             "DBRef(\"namespace\", 0)",
             "DBRef(\"namespace\", \"test\")",
             "DBRef(\"namespace\", ObjectId())",
@@ -98,8 +100,6 @@ var dbrefConstructors = {
             "DBRef(true, ObjectId())"
         ],
     "invalid" : [
-            // XXX: this is allowed in v8 but not in spidermonkey
-            // "DBRef()",
             "DBRef(\"namespace\")",
             "DBRef(\"namespace\", ObjectId(), true)"
         ]
@@ -107,7 +107,7 @@ var dbrefConstructors = {
 
 var dbpointerConstructors = {
     "valid" : [
-            // XXX: these are allowed in v8 but not in spidermonkey
+            // SERVER-8961
             //"DBPointer(\"namespace\", 0)",
             //"DBPointer(\"namespace\", \"test\")",
             "DBPointer(\"namespace\", ObjectId())",
@@ -169,9 +169,9 @@ var timestampConstructors = {
 var bindataConstructors = {
     "valid" : [
         'BinData(0,"test")',
-        'BinData()',
+        //'BinData()', SERVER-8961
         'new BinData(0,"test")',
-        'new BinData()'
+        //'new BinData()' SERVER-8961
         ],
     "invalid" : [
         'BinData(0,"test", "test")',
@@ -211,16 +211,22 @@ dbEvalConstructorTest(timestampConstructors);
 dbEvalConstructorTest(bindataConstructors);
 dbEvalConstructorTest(dateConstructors);
 
-mapReduceConstructorTest(dbrefConstructors);
-mapReduceConstructorTest(dbpointerConstructors);
-mapReduceConstructorTest(objectidConstructors);
-mapReduceConstructorTest(timestampConstructors);
-mapReduceConstructorTest(bindataConstructors);
+// SERVER-8963
+if (db.runCommand({buildinfo:1}).javascriptEngine == "V8") {
+    mapReduceConstructorTest(dbrefConstructors);
+    mapReduceConstructorTest(dbpointerConstructors);
+    mapReduceConstructorTest(objectidConstructors);
+    mapReduceConstructorTest(timestampConstructors);
+    mapReduceConstructorTest(bindataConstructors);
+}
 mapReduceConstructorTest(dateConstructors);
 
-whereConstructorTest(dbrefConstructors);
-whereConstructorTest(dbpointerConstructors);
-whereConstructorTest(objectidConstructors);
-whereConstructorTest(timestampConstructors);
-whereConstructorTest(bindataConstructors);
+// SERVER-8963
+if (db.runCommand({buildinfo:1}).javascriptEngine == "V8") {
+    whereConstructorTest(dbrefConstructors);
+    whereConstructorTest(dbpointerConstructors);
+    whereConstructorTest(objectidConstructors);
+    whereConstructorTest(timestampConstructors);
+    whereConstructorTest(bindataConstructors);
+}
 whereConstructorTest(dateConstructors);
