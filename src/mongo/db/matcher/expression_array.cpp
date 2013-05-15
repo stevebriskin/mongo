@@ -20,7 +20,6 @@
 
 #include "mongo/bson/bsonobjiterator.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/matcher.h"
 #include "mongo/db/matcher/expression_internal.h"
 #include "mongo/util/log.h"
 
@@ -29,24 +28,23 @@ namespace mongo {
 
     // ----------
 
-    Status AllExpression::init( const StringData& path ) {
+    Status AllMatchExpression::init( const StringData& path ) {
         _path = path;
+        _fieldRef.parse( _path );
         return Status::OK();
     }
 
-    bool AllExpression::matches( const BSONObj& doc, MatchDetails* details ) const {
-        FieldRef path;
-        path.parse(_path);
+    bool AllMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
 
         bool traversedArray = false;
-        int32_t idxPath = 0;
-        BSONElement e = getFieldDottedOrArray( doc, path, &idxPath, &traversedArray );
+        size_t idxPath = 0;
+        BSONElement e = doc->getFieldDottedOrArray( _fieldRef, &idxPath, &traversedArray );
 
-        string rest = pathToString( path, idxPath+1 );
-
-        if ( e.type() != Array || traversedArray || rest.size() == 0 ) {
+        if ( e.type() != Array || traversedArray || idxPath + 1 == _fieldRef.numParts() ) {
             return matchesSingleElement( e );
         }
+
+        string rest = _fieldRef.dottedField( idxPath+1 );
 
         BSONElementSet all;
 
@@ -62,7 +60,7 @@ namespace mongo {
         return _match( all );
     }
 
-    bool AllExpression::matchesSingleElement( const BSONElement& e ) const {
+    bool AllMatchExpression::matchesSingleElement( const BSONElement& e ) const {
         if ( _arrayEntries.size() == 0 )
             return false;
 
@@ -85,7 +83,7 @@ namespace mongo {
         return _match( all );
     }
 
-    bool AllExpression::_match( const BSONElementSet& all ) const {
+    bool AllMatchExpression::_match( const BSONElementSet& all ) const {
 
         if ( all.size() == 0 )
             return _arrayEntries.singleNull();
@@ -115,23 +113,31 @@ namespace mongo {
         return true;
     }
 
-    void AllExpression::debugString( StringBuilder& debug, int level ) const {
+    void AllMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << _path << " $all TODO\n";
     }
 
+    bool AllMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const AllMatchExpression* realOther = static_cast<const AllMatchExpression*>( other );
+        return _path == realOther->_path && _arrayEntries.equivalent( realOther->_arrayEntries );
+    }
+
     // -------
 
-    bool ArrayMatchingExpression::matches( const BSONObj& doc, MatchDetails* details ) const {
+    bool ArrayMatchingMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
 
         FieldRef path;
         path.parse(_path);
 
         bool traversedArray = false;
-        int32_t idxPath = 0;
-        BSONElement e = getFieldDottedOrArray( doc, path, &idxPath, &traversedArray );
+        size_t idxPath = 0;
+        BSONElement e = doc->getFieldDottedOrArray( path, &idxPath, &traversedArray );
 
-        string rest = pathToString( path, idxPath+1 );
+        string rest = path.dottedField( idxPath+1 );
 
         if ( rest.size() == 0 ) {
             if ( e.type() == Array )
@@ -164,16 +170,36 @@ namespace mongo {
         return false;
     }
 
-    bool ArrayMatchingExpression::matchesSingleElement( const BSONElement& e ) const {
+    bool ArrayMatchingMatchExpression::matchesSingleElement( const BSONElement& e ) const {
         if ( e.type() != Array )
             return false;
         return matchesArray( e.Obj(), NULL );
     }
 
 
+    bool ArrayMatchingMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const ArrayMatchingMatchExpression* realOther =
+            static_cast<const ArrayMatchingMatchExpression*>( other );
+
+        if ( _path != realOther->_path )
+            return false;
+
+        if ( numChildren() != realOther->numChildren() )
+            return false;
+
+        for ( unsigned i = 0; i < numChildren(); i++ )
+            if ( !getChild(i)->equivalent( realOther->getChild(i) ) )
+                return false;
+        return true;
+    }
+
+
     // -------
 
-    Status ElemMatchObjectExpression::init( const StringData& path, const Expression* sub ) {
+    Status ElemMatchObjectMatchExpression::init( const StringData& path, const MatchExpression* sub ) {
         _path = path;
         _sub.reset( sub );
         return Status::OK();
@@ -181,13 +207,13 @@ namespace mongo {
 
 
 
-    bool ElemMatchObjectExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
+    bool ElemMatchObjectMatchExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
         BSONObjIterator i( anArray );
         while ( i.more() ) {
             BSONElement inner = i.next();
             if ( !inner.isABSONObj() )
                 continue;
-            if ( _sub->matches( inner.Obj(), NULL ) ) {
+            if ( _sub->matchesBSON( inner.Obj(), NULL ) ) {
                 if ( details && details->needRecord() ) {
                     details->setElemMatchKey( inner.fieldName() );
                 }
@@ -197,7 +223,7 @@ namespace mongo {
         return false;
     }
 
-    void ElemMatchObjectExpression::debugString( StringBuilder& debug, int level ) const {
+    void ElemMatchObjectMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << _path << " $elemMatch\n";
         _sub->debugString( debug, level + 1 );
@@ -206,30 +232,30 @@ namespace mongo {
 
     // -------
 
-    ElemMatchValueExpression::~ElemMatchValueExpression() {
+    ElemMatchValueMatchExpression::~ElemMatchValueMatchExpression() {
         for ( unsigned i = 0; i < _subs.size(); i++ )
             delete _subs[i];
         _subs.clear();
     }
 
-    Status ElemMatchValueExpression::init( const StringData& path, const Expression* sub ) {
+    Status ElemMatchValueMatchExpression::init( const StringData& path, const MatchExpression* sub ) {
         init( path );
         add( sub );
         return Status::OK();
     }
 
-    Status ElemMatchValueExpression::init( const StringData& path ) {
+    Status ElemMatchValueMatchExpression::init( const StringData& path ) {
         _path = path;
         return Status::OK();
     }
 
 
-    void ElemMatchValueExpression::add( const Expression* sub ) {
+    void ElemMatchValueMatchExpression::add( const MatchExpression* sub ) {
         verify( sub );
         _subs.push_back( sub );
     }
 
-    bool ElemMatchValueExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
+    bool ElemMatchValueMatchExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
         BSONObjIterator i( anArray );
         while ( i.more() ) {
             BSONElement inner = i.next();
@@ -244,7 +270,7 @@ namespace mongo {
         return false;
     }
 
-    bool ElemMatchValueExpression::_arrayElementMatchesAll( const BSONElement& e ) const {
+    bool ElemMatchValueMatchExpression::_arrayElementMatchesAll( const BSONElement& e ) const {
         for ( unsigned i = 0; i < _subs.size(); i++ ) {
             if ( !_subs[i]->matchesSingleElement( e ) )
                 return false;
@@ -252,7 +278,7 @@ namespace mongo {
         return true;
     }
 
-    void ElemMatchValueExpression::debugString( StringBuilder& debug, int level ) const {
+    void ElemMatchValueMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << _path << " $elemMatch\n";
         for ( unsigned i = 0; i < _subs.size(); i++ ) {
@@ -274,14 +300,14 @@ namespace mongo {
         return Status::OK();
     }
 
-    void AllElemMatchOp::add( const ArrayMatchingExpression* expr ) {
+    void AllElemMatchOp::add( const ArrayMatchingMatchExpression* expr ) {
         verify( expr );
         _list.push_back( expr );
     }
 
-    bool AllElemMatchOp::matches( const BSONObj& doc, MatchDetails* details ) const {
+    bool AllElemMatchOp::matches( const MatchableDocument* doc, MatchDetails* details ) const {
         BSONElementSet all;
-        doc.getFieldsDotted( _path, all, false );
+        doc->getFieldsDotted( _path, all, false );
 
         for ( BSONElementSet::const_iterator i = all.begin(); i != all.end(); ++i ) {
             BSONElement sub = *i;
@@ -320,24 +346,50 @@ namespace mongo {
         }
     }
 
+    bool AllElemMatchOp::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const AllElemMatchOp* realOther = static_cast<const AllElemMatchOp*>( other );
+        if ( _path != realOther->_path )
+            return false;
+
+        if ( _list.size() != realOther->_list.size() )
+            return false;
+
+        for ( unsigned i = 0; i < _list.size(); i++ )
+            if ( !_list[i]->equivalent( realOther->_list[i] ) )
+                return false;
+
+        return true;
+    }
+
 
     // ---------
 
-    Status SizeExpression::init( const StringData& path, int size ) {
+    Status SizeMatchExpression::init( const StringData& path, int size ) {
         _path = path;
         _size = size;
         return Status::OK();
     }
 
-    bool SizeExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
+    bool SizeMatchExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
         if ( _size < 0 )
             return false;
         return anArray.nFields() == _size;
     }
 
-    void SizeExpression::debugString( StringBuilder& debug, int level ) const {
+    void SizeMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << _path << " $size : " << _size << "\n";
+    }
+
+    bool SizeMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const SizeMatchExpression* realOther = static_cast<const SizeMatchExpression*>( other );
+        return _path == realOther->_path && _size == realOther->_size;
     }
 
 

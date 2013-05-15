@@ -1082,6 +1082,11 @@ namespace mongo {
 
         virtual bool isFailed() const = 0;
 
+        /**
+         * if not checked recently, checks whether the underlying socket/sockets are still valid
+         */
+        virtual bool isStillConnected() = 0;
+
         virtual void killCursor( long long cursorID ) = 0;
 
         virtual bool callRead( Message& toSend , Message& response ) = 0;
@@ -1192,6 +1197,8 @@ namespace mongo {
          */
         bool isFailed() const { return _failed; }
 
+        bool isStillConnected() { return p ? p->isStillConnected() : true; }
+
         MessagingPort& port() { verify(p); return *p; }
 
         string toStringLong() const {
@@ -1265,7 +1272,7 @@ namespace mongo {
         static bool _lazyKillCursor; // lazy means we piggy back kill cursors on next op
 
 #ifdef MONGO_SSL
-        SSLManager* sslManager();
+        SSLManagerInterface* sslManager();
 #endif
     };
 

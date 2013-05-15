@@ -19,10 +19,32 @@
 
 #include <ostream>
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/mutable/const_element.h"
+#include "mongo/bson/mutable/document.h"
+#include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace mutablebson {
+
+    bool checkDoc(const Document& doc, const BSONObj& exp) {
+
+        // Get the fundamental result via BSONObj's woCompare path. This is the best starting
+        // point, because we think that Document::getObject and the serialization mechanism is
+        // pretty well sorted.
+        BSONObj fromDoc = doc.getObject();
+        const int primaryResult = fromDoc.woCompare(exp);
+
+        // Validate primary result via other comparison paths.
+
+        // Check that the serialized doc compares against the expected value.
+        ASSERT_EQUALS(primaryResult, doc.compareWithBSONObj(exp));
+
+        // Check that mutables serialized result matches against its origin.
+        ASSERT_EQUALS(primaryResult, doc.compareWithBSONObj(fromDoc));
+
+        return (primaryResult == 0);
+    }
 
     std::ostream& operator<<(std::ostream& stream, const ConstElement& elt) {
         stream << "Element("<< static_cast<const void*>(&elt.getDocument()) << ", ";

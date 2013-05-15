@@ -20,49 +20,38 @@
 
 #include "mongo/db/matcher/expression_parser.h"
 
-#include "mongo/bson/bsonobj.h"
-#include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/bson/bsonmisc.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/matcher.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
 
 namespace mongo {
 
-    /// HACK HACK HACK
-
-    MatchDetails::MatchDetails() :
-        _elemMatchKeyRequested() {
-        resetOutput();
-    }
-    void MatchDetails::resetOutput() {
-        _loadedRecord = false;
-        _elemMatchKeyFound = false;
-        _elemMatchKey = "";
-    }
-
-    // ----------------------------
-
-    TEST( ExpressionParserTest, SimpleEQ1 ) {
+    TEST( MatchExpressionParserTest, SimpleEQ1 ) {
         BSONObj query = BSON( "x" << 2 );
-        StatusWithExpression result = ExpressionParser::parse( query );
+        StatusWithMatchExpression result = MatchExpressionParser::parse( query );
         ASSERT_TRUE( result.isOK() );
 
-        ASSERT( result.getValue()->matches( BSON( "x" << 2 ) ) );
-        ASSERT( !result.getValue()->matches( BSON( "x" << 3 ) ) );
+        ASSERT( result.getValue()->matchesBSON( BSON( "x" << 2 ) ) );
+        ASSERT( !result.getValue()->matchesBSON( BSON( "x" << 3 ) ) );
     }
 
-    TEST( ExpressionParserTest, Multiple1 ) {
+    TEST( MatchExpressionParserTest, Multiple1 ) {
         BSONObj query = BSON( "x" << 5 << "y" << BSON( "$gt" << 5 << "$lt" << 8 ) );
-        StatusWithExpression result = ExpressionParser::parse( query );
+        StatusWithMatchExpression result = MatchExpressionParser::parse( query );
         ASSERT_TRUE( result.isOK() );
 
-        ASSERT( result.getValue()->matches( BSON( "x" << 5 << "y" << 7 ) ) );
-        ASSERT( result.getValue()->matches( BSON( "x" << 5 << "y" << 6 ) ) );
-        ASSERT( !result.getValue()->matches( BSON( "x" << 6 << "y" << 7 ) ) );
-        ASSERT( !result.getValue()->matches( BSON( "x" << 5 << "y" << 9 ) ) );
-        ASSERT( !result.getValue()->matches( BSON( "x" << 5 << "y" << 4 ) ) );
+        ASSERT( result.getValue()->matchesBSON( BSON( "x" << 5 << "y" << 7 ) ) );
+        ASSERT( result.getValue()->matchesBSON( BSON( "x" << 5 << "y" << 6 ) ) );
+        ASSERT( !result.getValue()->matchesBSON( BSON( "x" << 6 << "y" << 7 ) ) );
+        ASSERT( !result.getValue()->matchesBSON( BSON( "x" << 5 << "y" << 9 ) ) );
+        ASSERT( !result.getValue()->matchesBSON( BSON( "x" << 5 << "y" << 4 ) ) );
+    }
+
+    TEST( AtomicMatchExpressionTest, Simple1 ) {
+        BSONObj query = BSON( "x" << 5 << "$atomic" << BSON( "$gt" << 5 << "$lt" << 8 ) );
+        StatusWithMatchExpression result = MatchExpressionParser::parse( query );
+        ASSERT_TRUE( result.isOK() );
     }
 
     StatusWith<int> fib( int n ) {

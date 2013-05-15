@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include <boost/function.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/matcher/expression.h"
@@ -26,13 +28,16 @@
 
 namespace mongo {
 
-    typedef StatusWith<Expression*> StatusWithExpression;
+    typedef StatusWith<MatchExpression*> StatusWithMatchExpression;
 
-    class ExpressionParser {
+    class MatchExpressionParser {
     public:
-        static StatusWithExpression parse( const BSONObj& obj );
+        static StatusWithMatchExpression parse( const BSONObj& obj ) {
+            return _parse( obj, true );
+        }
 
     private:
+        static StatusWithMatchExpression _parse( const BSONObj& obj, bool topLevel );
 
         /**
          * parses a field in a sub expression
@@ -41,27 +46,31 @@ namespace mongo {
          */
         static Status _parseSub( const char* name,
                                  const BSONObj& obj,
-                                 AndExpression* root );
+                                 AndMatchExpression* root );
 
         /**
          * parses a single field in a sub expression
          * if the query is { x : { $gt : 5, $lt : 8 } }
          * e is $gt : 5
          */
-        static StatusWithExpression _parseSubField( const char* name,
-                                                    const BSONElement& e );
+        static StatusWithMatchExpression _parseSubField( const BSONObj& context,
+                                                         const AndMatchExpression* andSoFar,
+                                                         const char* name,
+                                                         const BSONElement& e,
+                                                         int position,
+                                                         bool* stop );
 
-        static StatusWithExpression _parseComparison( const char* name,
-                                                      ComparisonExpression::Type cmp,
-                                                      const BSONElement& e );
+        static StatusWithMatchExpression _parseComparison( const char* name,
+                                                           ComparisonMatchExpression* cmp,
+                                                           const BSONElement& e );
 
-        static StatusWithExpression _parseMOD( const char* name,
+        static StatusWithMatchExpression _parseMOD( const char* name,
                                                const BSONElement& e );
 
-        static StatusWithExpression _parseRegexElement( const char* name,
+        static StatusWithMatchExpression _parseRegexElement( const char* name,
                                                         const BSONElement& e );
 
-        static StatusWithExpression _parseRegexDocument( const char* name,
+        static StatusWithMatchExpression _parseRegexDocument( const char* name,
                                                          const BSONObj& doc );
 
 
@@ -70,18 +79,24 @@ namespace mongo {
 
         // arrays
 
-        static StatusWithExpression _parseElemMatch( const char* name,
+        static StatusWithMatchExpression _parseElemMatch( const char* name,
                                                      const BSONElement& e );
 
-        static StatusWithExpression _parseAll( const char* name,
+        static StatusWithMatchExpression _parseAll( const char* name,
                                                const BSONElement& e );
 
         // tree
 
-        static Status _parseTreeList( const BSONObj& arr, ListOfExpression* out );
+        static Status _parseTreeList( const BSONObj& arr, ListOfMatchExpression* out );
 
-        static StatusWithExpression _parseNot( const char* name, const BSONElement& e );
+        static StatusWithMatchExpression _parseNot( const char* name, const BSONElement& e );
 
     };
+
+    typedef boost::function<StatusWithMatchExpression(const char* name, const BSONObj& section)> MatchExpressionParserGeoCallback;
+    extern MatchExpressionParserGeoCallback expressionParserGeoCallback;
+
+    typedef boost::function<StatusWithMatchExpression(const BSONElement& where)> MatchExpressionParserWhereCallback;
+    extern MatchExpressionParserWhereCallback expressionParserWhereCallback;
 
 }

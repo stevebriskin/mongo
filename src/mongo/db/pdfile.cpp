@@ -45,6 +45,8 @@ _ disallow system* manipulations from the database.
 #include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/extsort.h"
+#include "mongo/db/index_legacy.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/index_update.h"
 #include "mongo/db/index/catalog_hack.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -1530,12 +1532,7 @@ namespace mongo {
             tableToIndex->addIndex(tabletoidxns.c_str());
             getDur().writingInt(tableToIndex->indexBuildsInProgress) -= 1;
 
-            IndexType* indexType = idx.getSpec().getType();
-            const IndexPlugin *plugin = indexType ? indexType->getPlugin() : NULL;
-            if (plugin) {
-                plugin->postBuildHook( idx.getSpec() );
-            }
-
+            IndexLegacy::postBuildHook(tableToIndex, idx);
         }
         catch (...) {
             // Generally, this will be called as an exception from building the index bubbles up.

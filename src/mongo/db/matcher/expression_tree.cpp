@@ -21,33 +21,49 @@
 #include "mongo/bson/bsonobjiterator.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/db/matcher.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    ListOfExpression::~ListOfExpression() {
+    ListOfMatchExpression::~ListOfMatchExpression() {
         for ( unsigned i = 0; i < _expressions.size(); i++ )
             delete _expressions[i];
         _expressions.clear();
     }
 
-    void ListOfExpression::add( Expression* e ) {
+    void ListOfMatchExpression::add( MatchExpression* e ) {
         verify( e );
         _expressions.push_back( e );
     }
 
 
-    void ListOfExpression::_debugList( StringBuilder& debug, int level ) const {
+    void ListOfMatchExpression::_debugList( StringBuilder& debug, int level ) const {
         for ( unsigned i = 0; i < _expressions.size(); i++ )
             _expressions[i]->debugString( debug, level + 1 );
     }
 
+    bool ListOfMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const ListOfMatchExpression* realOther = static_cast<const ListOfMatchExpression*>( other );
+
+        if ( _expressions.size() != realOther->_expressions.size() )
+            return false;
+
+        // TOOD: order doesn't matter
+        for ( unsigned i = 0; i < _expressions.size(); i++ )
+            if ( !_expressions[i]->equivalent( realOther->_expressions[i] ) )
+                return false;
+
+        return true;
+    }
+
     // -----
 
-    bool AndExpression::matches( const BSONObj& doc, MatchDetails* details ) const {
-        for ( size_t i = 0; i < size(); i++ ) {
-            if ( !get(i)->matches( doc, details ) ) {
+    bool AndMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
+        for ( size_t i = 0; i < numChildren(); i++ ) {
+            if ( !getChild(i)->matches( doc, details ) ) {
                 if ( details )
                     details->resetOutput();
                 return false;
@@ -56,9 +72,9 @@ namespace mongo {
         return true;
     }
 
-    bool AndExpression::matchesSingleElement( const BSONElement& e ) const {
-        for ( size_t i = 0; i < size(); i++ ) {
-            if ( !get(i)->matchesSingleElement( e ) ) {
+    bool AndMatchExpression::matchesSingleElement( const BSONElement& e ) const {
+        for ( size_t i = 0; i < numChildren(); i++ ) {
+            if ( !getChild(i)->matchesSingleElement( e ) ) {
                 return false;
             }
         }
@@ -66,7 +82,7 @@ namespace mongo {
     }
 
 
-    void AndExpression::debugString( StringBuilder& debug, int level ) const {
+    void AndMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << "$and\n";
         _debugList( debug, level );
@@ -74,18 +90,18 @@ namespace mongo {
 
     // -----
 
-    bool OrExpression::matches( const BSONObj& doc, MatchDetails* details ) const {
-        for ( size_t i = 0; i < size(); i++ ) {
-            if ( get(i)->matches( doc, NULL ) ) {
+    bool OrMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
+        for ( size_t i = 0; i < numChildren(); i++ ) {
+            if ( getChild(i)->matches( doc, NULL ) ) {
                 return true;
             }
         }
         return false;
     }
 
-    bool OrExpression::matchesSingleElement( const BSONElement& e ) const {
-        for ( size_t i = 0; i < size(); i++ ) {
-            if ( get(i)->matchesSingleElement( e ) ) {
+    bool OrMatchExpression::matchesSingleElement( const BSONElement& e ) const {
+        for ( size_t i = 0; i < numChildren(); i++ ) {
+            if ( getChild(i)->matchesSingleElement( e ) ) {
                 return true;
             }
         }
@@ -93,7 +109,7 @@ namespace mongo {
     }
 
 
-    void OrExpression::debugString( StringBuilder& debug, int level ) const {
+    void OrMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << "$or\n";
         _debugList( debug, level );
@@ -101,25 +117,25 @@ namespace mongo {
 
     // ----
 
-    bool NorExpression::matches( const BSONObj& doc, MatchDetails* details ) const {
-        for ( size_t i = 0; i < size(); i++ ) {
-            if ( get(i)->matches( doc, NULL ) ) {
+    bool NorMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
+        for ( size_t i = 0; i < numChildren(); i++ ) {
+            if ( getChild(i)->matches( doc, NULL ) ) {
                 return false;
             }
         }
         return true;
     }
 
-    bool NorExpression::matchesSingleElement( const BSONElement& e ) const {
-        for ( size_t i = 0; i < size(); i++ ) {
-            if ( get(i)->matchesSingleElement( e ) ) {
+    bool NorMatchExpression::matchesSingleElement( const BSONElement& e ) const {
+        for ( size_t i = 0; i < numChildren(); i++ ) {
+            if ( getChild(i)->matchesSingleElement( e ) ) {
                 return false;
             }
         }
         return true;
     }
 
-    void NorExpression::debugString( StringBuilder& debug, int level ) const {
+    void NorMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << "$nor\n";
         _debugList( debug, level );
@@ -127,10 +143,17 @@ namespace mongo {
 
     // -------
 
-    void NotExpression::debugString( StringBuilder& debug, int level ) const {
+    void NotMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << "$not\n";
         _exp->debugString( debug, level + 1 );
+    }
+
+    bool NotMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        return _exp->equivalent( other->getChild(0) );
     }
 
 }

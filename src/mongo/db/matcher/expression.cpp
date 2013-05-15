@@ -21,20 +21,35 @@
 #include "mongo/bson/bsonobjiterator.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/db/matcher.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    string Expression::toString() const {
+    MatchExpression::MatchExpression( MatchType type )
+        : _matchType( type ){
+    }
+
+
+    string MatchExpression::toString() const {
         StringBuilder buf;
         debugString( buf, 0 );
         return buf.str();
     }
 
-    void Expression::_debugAddSpace( StringBuilder& debug, int level ) const {
+    void MatchExpression::_debugAddSpace( StringBuilder& debug, int level ) const {
         for ( int i = 0; i < level; i++ )
             debug << "    ";
+    }
+
+    bool MatchExpression::matchesBSON( const BSONObj& doc, MatchDetails* details ) const {
+        BSONMatchableDocument mydoc( doc );
+        return matches( &mydoc, details );
+    }
+
+
+    void AtomicMatchExpression::debugString( StringBuilder& debug, int level ) const {
+        _debugAddSpace( debug, level );
+        debug << "$atomic\n";
     }
 
 }

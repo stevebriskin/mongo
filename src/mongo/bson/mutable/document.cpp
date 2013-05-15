@@ -802,10 +802,11 @@ namespace mutablebson {
         // field name.
         int32_t insertFieldName(const StringData& fieldName) {
             const uint32_t id = _fieldNames.size();
-            _fieldNames.insert(
-                _fieldNames.end(),
-                &fieldName.rawData()[0],
-                &fieldName.rawData()[fieldName.size()]);
+            if (!fieldName.empty())
+                _fieldNames.insert(
+                    _fieldNames.end(),
+                    fieldName.rawData(),
+                    fieldName.rawData() + fieldName.size());
             _fieldNames.push_back('\0');
             if (debug) {
                 // Force names to new addresses to catch invalidation errors.
@@ -1121,6 +1122,25 @@ namespace mutablebson {
         return impl.hasValue(thisRep);
     }
 
+    bool Element::isNumeric() const {
+        verify(ok());
+        const Document::Impl& impl = getDocument().getImpl();
+        const ElementRep& thisRep = impl.getElementRep(_repIdx);
+        const BSONType type = impl.getType(thisRep);
+        return ((type == mongo::NumberLong) ||
+                (type == mongo::NumberInt) ||
+                (type == mongo::NumberDouble));
+    }
+
+    bool Element::isIntegral() const {
+        verify(ok());
+        const Document::Impl& impl = getDocument().getImpl();
+        const ElementRep& thisRep = impl.getElementRep(_repIdx);
+        const BSONType type = impl.getType(thisRep);
+        return ((type == mongo::NumberLong) ||
+                (type == mongo::NumberInt));
+    }
+
     const BSONElement Element::getValue() const {
         const Document::Impl& impl = getDocument().getImpl();
         const ElementRep& thisRep = impl.getElementRep(_repIdx);
@@ -1191,13 +1211,17 @@ namespace mutablebson {
         ConstElement thisIter = leftChild();
         ConstElement otherIter = other.leftChild();
 
+        const bool considerChildFieldNames =
+            (impl.getType(thisRep) != mongo::Array) &&
+            (impl.getType(otherRep) != mongo::Array);
+
         while (true) {
             if (!thisIter.ok())
                 return !otherIter.ok() ? 0 : -1;
             if (!otherIter.ok())
                 return 1;
 
-            const int result = thisIter.compareWithElement(otherIter, considerFieldName);
+            const int result = thisIter.compareWithElement(otherIter, considerChildFieldNames);
             if (result != 0)
                 return result;
 
@@ -1239,7 +1263,11 @@ namespace mutablebson {
                 return fnamesComp;
         }
 
-        return compareWithBSONObj(other.Obj(), considerFieldName);
+        const bool considerChildFieldNames =
+            (impl.getType(thisRep) != mongo::Array) &&
+            (other.type() != mongo::Array);
+
+        return compareWithBSONObj(other.Obj(), considerChildFieldNames);
     }
 
     int Element::compareWithBSONObj(const BSONObj& other, bool considerFieldName) const {
@@ -1526,22 +1554,15 @@ namespace mutablebson {
                 ErrorCodes::IllegalOperation,
                 "Attempt to add a child element to a non-object element");
 
-        // If we have no children, then the new element becomes both the right and left
-        // child. Otherwise, it becomes a right sibling to our right child.
-        if ((thisRep.child.left == kInvalidRepIdx) && (thisRep.child.right == kInvalidRepIdx)) {
-            thisRep.child.left = thisRep.child.right = e._repIdx;
-            newRep.parent = _repIdx;
-            impl.deserialize(_repIdx);
-            return Status::OK();
-        }
-
         // TODO: In both of the following cases, we call two public API methods each. We can
         // probably do better by writing this explicitly here and drying it with the public
         // addSiblingLeft and addSiblingRight implementations.
         if (front) {
             // TODO: It is cheap to get the left child. However, it still means creating a rep
             // for it. Can we do better?
-            return leftChild().addSiblingLeft(e);
+            Element lc = leftChild();
+            if (lc.ok())
+                return lc.addSiblingLeft(e);
         } else {
             // TODO: It is expensive to get the right child, since we have to build reps for
             // all of the opaque children. But in principle, we don't really need them. Could
@@ -1549,8 +1570,18 @@ namespace mutablebson {
             // opaque? We would at minimum need to update leftSibling, which currently assumes
             // that your left sibling is never opaque. But adding new Elements to the end is a
             // quite common operation, so it would be nice if we could do this efficiently.
-            return rightChild().addSiblingRight(e);
+            Element rc = rightChild();
+            if (rc.ok())
+                return rc.addSiblingRight(e);
         }
+
+        // It must be the case that we have no children, so the new element becomes both the
+        // right and left child of this node.
+        dassert((thisRep.child.left == kInvalidRepIdx) && (thisRep.child.right == kInvalidRepIdx));
+        thisRep.child.left = thisRep.child.right = e._repIdx;
+        newRep.parent = _repIdx;
+        impl.deserialize(_repIdx);
+        return Status::OK();
     }
 
     Status Element::setValue(Element* value) {

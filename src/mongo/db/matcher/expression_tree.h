@@ -28,14 +28,15 @@
  */
 namespace mongo {
 
-    class ListOfExpression : public Expression {
+    class ListOfMatchExpression : public MatchExpression {
     public:
-        virtual ~ListOfExpression();
+        ListOfMatchExpression( MatchType type ) : MatchExpression( type ){}
+        virtual ~ListOfMatchExpression();
 
         /**
          * @param e - I take ownership
          */
-        void add( Expression* e );
+        void add( MatchExpression* e );
 
         /**
          * clears all the thingsd we own, and does NOT delete
@@ -43,57 +44,63 @@ namespace mongo {
          */
         void clearAndRelease() { _expressions.clear(); }
 
-        size_t size() const { return _expressions.size(); }
-        Expression* get( size_t i ) const { return _expressions[i]; }
+        virtual size_t numChildren() const { return _expressions.size(); }
+        virtual const MatchExpression* getChild( size_t i ) const { return _expressions[i]; }
+
+        bool equivalent( const MatchExpression* other ) const;
 
     protected:
         void _debugList( StringBuilder& debug, int level ) const;
 
     private:
-        std::vector< Expression* > _expressions;
+        std::vector< MatchExpression* > _expressions;
     };
 
-    class AndExpression : public ListOfExpression {
+    class AndMatchExpression : public ListOfMatchExpression {
     public:
-        virtual ~AndExpression(){}
+        AndMatchExpression() : ListOfMatchExpression( AND ){}
+        virtual ~AndMatchExpression(){}
 
-        virtual bool matches( const BSONObj& doc, MatchDetails* details = 0 ) const;
+        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
         virtual bool matchesSingleElement( const BSONElement& e ) const;
 
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
     };
 
-    class OrExpression : public ListOfExpression {
+    class OrMatchExpression : public ListOfMatchExpression {
     public:
-        virtual ~OrExpression(){}
+        OrMatchExpression() : ListOfMatchExpression( OR ){}
+        virtual ~OrMatchExpression(){}
 
-        virtual bool matches( const BSONObj& doc, MatchDetails* details = 0 ) const;
+        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
         virtual bool matchesSingleElement( const BSONElement& e ) const;
 
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
     };
 
-    class NorExpression : public ListOfExpression {
+    class NorMatchExpression : public ListOfMatchExpression {
     public:
-        virtual ~NorExpression(){}
+        NorMatchExpression() : ListOfMatchExpression( NOR ){}
+        virtual ~NorMatchExpression(){}
 
-        virtual bool matches( const BSONObj& doc, MatchDetails* details = 0 ) const;
+        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
         virtual bool matchesSingleElement( const BSONElement& e ) const;
 
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
     };
 
-    class NotExpression : public Expression {
+    class NotMatchExpression : public MatchExpression {
     public:
+        NotMatchExpression() : MatchExpression( NOT ){}
         /**
          * @param exp - I own it, and will delete
          */
-        virtual Status init( Expression* exp ) {
+        virtual Status init( MatchExpression* exp ) {
             _exp.reset( exp );
             return Status::OK();
         }
 
-        virtual bool matches( const BSONObj& doc, MatchDetails* details = 0 ) const {
+        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const {
             return !_exp->matches( doc, NULL );
         }
 
@@ -102,8 +109,15 @@ namespace mongo {
         }
 
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
+
+        bool equivalent( const MatchExpression* other ) const;
+
+        virtual size_t numChildren() const { return 1; }
+        virtual MatchExpression* getChild( size_t i ) const { return _exp.get(); }
+
+
     private:
-        boost::scoped_ptr<Expression> _exp;
+        boost::scoped_ptr<MatchExpression> _exp;
     };
 
 }

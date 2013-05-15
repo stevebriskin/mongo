@@ -22,23 +22,21 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/matcher.h"
 #include "mongo/db/matcher/expression_internal.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-    bool LeafExpression::matches( const BSONObj& doc, MatchDetails* details ) const {
-        //log() << "e doc: " << doc << " path: " << _path << std::endl;
+    void LeafMatchExpression::initPath( const StringData& path ) {
+        _path = path;
+        _fieldRef.parse( _path );
+    }
 
-        FieldRef path;
-        path.parse(_path);
 
+    bool LeafMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
         bool traversedArray = false;
-        int32_t idxPath = 0;
-        BSONElement e = getFieldDottedOrArray( doc, path, &idxPath, &traversedArray );
-
-        string rest = pathToString( path, idxPath+1 );
+        size_t idxPath = 0;
+        BSONElement e = doc->getFieldDottedOrArray( _fieldRef, &idxPath, &traversedArray );
 
         if ( e.type() != Array || traversedArray ) {
             return matchesSingleElement( e );
@@ -48,12 +46,27 @@ namespace mongo {
         while ( i.more() ) {
             BSONElement x = i.next();
             bool found = false;
-            if ( rest.size() == 0 ) {
+            if ( idxPath + 1 == _fieldRef.numParts() ) {
                 found = matchesSingleElement( x );
             }
             else if ( x.isABSONObj() ) {
-                BSONElement y = x.Obj().getField( rest );
-                found = matchesSingleElement( y );
+                string rest = _fieldRef.dottedField( idxPath+1 );
+                BSONElement y = x.Obj().getFieldDotted( rest );
+
+                if ( !y.eoo() )
+                    found = matchesSingleElement( y );
+
+                if ( !found && y.type() == Array ) {
+                    // we iterate this array as well it seems
+                    BSONObjIterator j( y.Obj() );
+                    while( j.more() ) {
+                        BSONElement sub = j.next();
+                        found = matchesSingleElement( sub );
+                        if ( found )
+                            break;
+                    }
+                }
+
             }
 
             if ( found ) {
@@ -76,41 +89,78 @@ namespace mongo {
 
     // -------------
 
-    Status ComparisonExpression::init( const StringData& path, Type type, const BSONElement& rhs ) {
-        _path = path;
-        _type = type;
+    bool ComparisonMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( other->matchType() != matchType() )
+            return false;
+        const ComparisonMatchExpression* realOther =
+            static_cast<const ComparisonMatchExpression*>( other );
+
+        return
+            path() == realOther->path() &&
+            _rhs.valuesEqual( realOther->_rhs );
+    }
+
+
+    Status ComparisonMatchExpression::init( const StringData& path, const BSONElement& rhs ) {
+        initPath( path );
         _rhs = rhs;
+
         if ( rhs.eoo() ) {
             return Status( ErrorCodes::BadValue, "need a real operand" );
         }
 
-        _allHaveToMatch = _type == NE;
+        if ( rhs.type() == Undefined ) {
+            return Status( ErrorCodes::BadValue, "cannot compare to undefined" );
+        }
+
+        switch ( matchType() ) {
+        case NE:
+            _allHaveToMatch = true;
+            break;
+        case LT:
+        case LTE:
+        case EQ:
+        case GT:
+        case GTE:
+            _allHaveToMatch = false;
+            break;
+        default:
+            return Status( ErrorCodes::BadValue, "bad match type for ComparisonMatchExpression" );
+        }
 
         return Status::OK();
     }
 
 
-    bool ComparisonExpression::matchesSingleElement( const BSONElement& e ) const {
-        //log() << "\t ComparisonExpression e: " << e << " _rhs: " << _rhs << std::endl;
+    bool ComparisonMatchExpression::matchesSingleElement( const BSONElement& e ) const {
+        //log() << "\t ComparisonMatchExpression e: " << e << " _rhs: " << _rhs << "\n"
+        //<< toString() << std::endl;
 
         if ( e.canonicalType() != _rhs.canonicalType() ) {
             // some special cases
             //  jstNULL and undefined are treated the same
             if ( e.canonicalType() + _rhs.canonicalType() == 5 ) {
-                return _type == EQ || _type == LTE || _type == GTE;
+                return matchType() == EQ || matchType() == LTE || matchType() == GTE;
             }
+
+            if ( _rhs.type() == MaxKey || _rhs.type() == MinKey ) {
+                return matchType() != EQ;
+            }
+
             return _invertForNE( false );
         }
 
         if ( _rhs.type() == Array ) {
-            if ( _type != EQ && _type != NE ) {
+            if ( matchType() != EQ && matchType() != NE ) {
                 return false;
             }
         }
 
         int x = compareElementValues( e, _rhs );
 
-        switch ( _type ) {
+        //log() << "\t\t" << x << endl;
+
+        switch ( matchType() ) {
         case LT:
             return x < 0;
         case LTE:
@@ -123,26 +173,29 @@ namespace mongo {
             return x >= 0;
         case NE:
             return x != 0;
+        default:
+            throw 1;
         }
         throw 1;
     }
 
-    bool ComparisonExpression::_invertForNE( bool normal ) const {
-        if ( _type == NE )
+    bool ComparisonMatchExpression::_invertForNE( bool normal ) const {
+        if ( matchType() == NE )
             return !normal;
         return normal;
     }
 
-    void ComparisonExpression::debugString( StringBuilder& debug, int level ) const {
+    void ComparisonMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " ";
-        switch ( _type ) {
+        debug << path() << " ";
+        switch ( matchType() ) {
         case LT: debug << "$lt"; break;
         case LTE: debug << "$lte"; break;
         case EQ: debug << "=="; break;
         case GT: debug << "$gt"; break;
         case GTE: debug << "$gte"; break;
         case NE: debug << "$ne"; break;
+        default: debug << " UNKNOWN - should be impossible"; break;
         }
         debug << " " << _rhs.toString( false ) << "\n";
     }
@@ -167,17 +220,29 @@ namespace mongo {
         return options;
     }
 
-    Status RegexExpression::init( const StringData& path, const BSONElement& e ) {
+    bool RegexMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const RegexMatchExpression* realOther = static_cast<const RegexMatchExpression*>( other );
+        return
+            path() == realOther->path() &&
+            _regex == realOther->_regex
+            && _flags == realOther->_flags;
+    }
+
+
+    Status RegexMatchExpression::init( const StringData& path, const BSONElement& e ) {
         if ( e.type() != RegEx )
             return Status( ErrorCodes::BadValue, "regex not a regex" );
         return init( path, e.regex(), e.regexFlags() );
     }
 
 
-    Status RegexExpression::init( const StringData& path, const StringData& regex, const StringData& options ) {
-        _path = path;
+    Status RegexMatchExpression::init( const StringData& path, const StringData& regex, const StringData& options ) {
+        initPath( path );
 
-        if ( regex.size() > RegexMatcher::MaxPatternSize ) {
+        if ( regex.size() > MaxPatternSize ) {
             return Status( ErrorCodes::BadValue, "Regular expression is too long" );
         }
 
@@ -187,11 +252,12 @@ namespace mongo {
         return Status::OK();
     }
 
-    bool RegexExpression::matchesSingleElement( const BSONElement& e ) const {
-        //log() << "RegexExpression::matchesSingleElement _regex: " << _regex << " e: " << e << std::endl;
+    bool RegexMatchExpression::matchesSingleElement( const BSONElement& e ) const {
+        //log() << "RegexMatchExpression::matchesSingleElement _regex: " << _regex << " e: " << e << std::endl;
         switch (e.type()) {
         case String:
         case Symbol:
+            // TODO
             //if (rm._prefix.empty())
                 return _re->PartialMatch(e.valuestr());
                 //else
@@ -203,15 +269,15 @@ namespace mongo {
         }
     }
 
-    void RegexExpression::debugString( StringBuilder& debug, int level ) const {
+    void RegexMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " regex /" << _regex << "/" << _flags << "\n";
+        debug << path() << " regex /" << _regex << "/" << _flags << "\n";
     }
 
     // ---------
 
-    Status ModExpression::init( const StringData& path, int divisor, int remainder ) {
-        _path = path;
+    Status ModMatchExpression::init( const StringData& path, int divisor, int remainder ) {
+        initPath( path );
         if ( divisor == 0 )
             return Status( ErrorCodes::BadValue, "divisor cannot be 0" );
         _divisor = divisor;
@@ -219,64 +285,86 @@ namespace mongo {
         return Status::OK();
     }
 
-    bool ModExpression::matchesSingleElement( const BSONElement& e ) const {
+    bool ModMatchExpression::matchesSingleElement( const BSONElement& e ) const {
         if ( !e.isNumber() )
             return false;
         return e.numberLong() % _divisor == _remainder;
     }
 
-    void ModExpression::debugString( StringBuilder& debug, int level ) const {
+    void ModMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " mod " << _divisor << " % x == "  << _remainder << "\n";
+        debug << path() << " mod " << _divisor << " % x == "  << _remainder << "\n";
+    }
+
+    bool ModMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const ModMatchExpression* realOther = static_cast<const ModMatchExpression*>( other );
+        return
+            path() == realOther->path() &&
+            _divisor == realOther->_divisor &&
+            _remainder == realOther->_remainder;
     }
 
 
     // ------------------
 
-    Status ExistsExpression::init( const StringData& path, bool exists ) {
-        _path = path;
+    Status ExistsMatchExpression::init( const StringData& path, bool exists ) {
+        initPath( path );
         _exists = exists;
         return Status::OK();
     }
 
-    bool ExistsExpression::matchesSingleElement( const BSONElement& e ) const {
+    bool ExistsMatchExpression::matchesSingleElement( const BSONElement& e ) const {
         if ( e.eoo() ) {
             return !_exists;
         }
         return _exists;
     }
 
-    void ExistsExpression::debugString( StringBuilder& debug, int level ) const {
+    void ExistsMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " exists: " << _exists << "\n";
+        debug << path() << " exists: " << _exists << "\n";
     }
+
+    bool ExistsMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const ExistsMatchExpression* realOther = static_cast<const ExistsMatchExpression*>( other );
+        return path() == realOther->path() && _exists == realOther->_exists;
+    }
+
 
     // ----
 
-    Status TypeExpression::init( const StringData& path, int type ) {
+    Status TypeMatchExpression::init( const StringData& path, int type ) {
         _path = path;
         _type = type;
         return Status::OK();
     }
 
-    bool TypeExpression::matchesSingleElement( const BSONElement& e ) const {
+    bool TypeMatchExpression::matchesSingleElement( const BSONElement& e ) const {
         return e.type() == _type;
     }
 
-    bool TypeExpression::matches( const BSONObj& doc, MatchDetails* details ) const {
+    bool TypeMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
         return _matches( _path, doc, details );
     }
 
-    bool TypeExpression::_matches( const StringData& path, const BSONObj& doc, MatchDetails* details ) const {
+    bool TypeMatchExpression::_matches( const StringData& path,
+                                        const MatchableDocument* doc,
+                                        MatchDetails* details ) const {
 
-        FieldRef pathRef;
-        pathRef.parse(path);
+        FieldRef fieldRef;
+        fieldRef.parse( path );
 
         bool traversedArray = false;
-        int32_t idxPath = 0;
-        BSONElement e = getFieldDottedOrArray( doc, pathRef, &idxPath, &traversedArray );
+        size_t idxPath = 0;
+        BSONElement e = doc->getFieldDottedOrArray( fieldRef, &idxPath, &traversedArray );
 
-        string rest = pathToString( pathRef, idxPath+1 );
+        string rest = fieldRef.dottedField( idxPath + 1 );
 
         if ( e.type() != Array ) {
             return matchesSingleElement( e );
@@ -290,7 +378,8 @@ namespace mongo {
                 found = matchesSingleElement( x );
             }
             else if ( x.isABSONObj() ) {
-                found = _matches( rest, x.Obj(), details );
+                BSONMatchableDocument doc( x.Obj() );
+                found = _matches( rest, &doc, details );
             }
 
             if ( found ) {
@@ -306,9 +395,18 @@ namespace mongo {
         return false;
     }
 
-    void TypeExpression::debugString( StringBuilder& debug, int level ) const {
+    void TypeMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << _path << " type: " << _type << "\n";
+    }
+
+
+    bool TypeMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const TypeMatchExpression* realOther = static_cast<const TypeMatchExpression*>( other );
+        return _path == realOther->_path && _type == realOther->_type;
     }
 
 
@@ -316,6 +414,7 @@ namespace mongo {
 
     ArrayFilterEntries::ArrayFilterEntries(){
         _hasNull = false;
+        _hasEmptyArray = false;
     }
 
     ArrayFilterEntries::~ArrayFilterEntries() {
@@ -337,24 +436,49 @@ namespace mongo {
             _hasNull = true;
         }
 
+        if ( e.type() == Array && e.Obj().isEmpty() )
+            _hasEmptyArray = true;
+
         _equalities.insert( e );
         return Status::OK();
     }
 
-    Status ArrayFilterEntries::addRegex( RegexExpression* expr ) {
+    Status ArrayFilterEntries::addRegex( RegexMatchExpression* expr ) {
         _regexes.push_back( expr );
         return Status::OK();
     }
 
+    bool ArrayFilterEntries::equivalent( const ArrayFilterEntries& other ) const {
+        if ( _hasNull != other._hasNull )
+            return false;
+
+        if ( _regexes.size() != other._regexes.size() )
+            return false;
+        for ( unsigned i = 0; i < _regexes.size(); i++ )
+            if ( !_regexes[i]->equivalent( other._regexes[i] ) )
+                return false;
+
+        return _equalities == other._equalities;
+    }
+
+    void ArrayFilterEntries::copyTo( ArrayFilterEntries& toFillIn ) const {
+        toFillIn._hasNull = _hasNull;
+        toFillIn._hasEmptyArray = _hasEmptyArray;
+        toFillIn._equalities = _equalities;
+        for ( unsigned i = 0; i < _regexes.size(); i++ )
+            toFillIn._regexes.push_back( static_cast<RegexMatchExpression*>(_regexes[i]->shallowClone()) );
+    }
+
+
     // -----------
 
-    void InExpression::init( const StringData& path ) {
-        _path = path;
+    void InMatchExpression::init( const StringData& path ) {
+        initPath( path );
         _allHaveToMatch = false;
     }
 
 
-    bool InExpression::matchesSingleElement( const BSONElement& e ) const {
+    bool InMatchExpression::matchesSingleElement( const BSONElement& e ) const {
         if ( _arrayEntries.hasNull() && e.eoo() )
             return true;
 
@@ -369,29 +493,67 @@ namespace mongo {
         return false;
     }
 
-    void InExpression::debugString( StringBuilder& debug, int level ) const {
+    void InMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " $in: TODO\n";
+        debug << path() << " $in: TODO\n";
     }
+
+    bool InMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+        const InMatchExpression* realOther = static_cast<const InMatchExpression*>( other );
+        return
+            path() == realOther->path() &&
+            _arrayEntries.equivalent( realOther->_arrayEntries );
+    }
+
+    LeafMatchExpression* InMatchExpression::shallowClone() const {
+        InMatchExpression* next = new InMatchExpression();
+        copyTo( next );
+        return next;
+    }
+
+    void InMatchExpression::copyTo( InMatchExpression* toFillIn ) const {
+        toFillIn->init( path() );
+        _arrayEntries.copyTo( toFillIn->_arrayEntries );
+    }
+
 
 
     // ----------
 
-    void NinExpression::init( const StringData& path ) {
-        _path = path;
+    void NinMatchExpression::init( const StringData& path ) {
+        initPath( path );
         _allHaveToMatch = true;
+        _in.init( path );
     }
 
 
-    bool NinExpression::matchesSingleElement( const BSONElement& e ) const {
+    bool NinMatchExpression::matchesSingleElement( const BSONElement& e ) const {
         return !_in.matchesSingleElement( e );
     }
 
 
-    void NinExpression::debugString( StringBuilder& debug, int level ) const {
+    void NinMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " $nin: TODO\n";
+        debug << path() << " $nin: TODO\n";
     }
+
+    bool NinMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        return _in.equivalent( &(static_cast<const NinMatchExpression*>(other)->_in) );
+
+    }
+
+    LeafMatchExpression* NinMatchExpression::shallowClone() const {
+        NinMatchExpression* next = new NinMatchExpression();
+        next->init( path() );
+        _in.copyTo( &next->_in );
+        return next;
+    }
+
 
 }
 

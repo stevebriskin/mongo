@@ -110,10 +110,14 @@ namespace mongo {
          * When this function returns, further communication on this
          * MessagingPort will be encrypted.
          */
-        void secure( SSLManager * ssl ) {
+        void secure( SSLManagerInterface* ssl ) {
             psock->secure( ssl );
         }
 #endif
+
+        bool isStillConnected() {
+            return psock->isStillConnected();
+        }
 
         uint64_t getSockCreationMicroSec() const {
             return psock->getSockCreationMicroSec();

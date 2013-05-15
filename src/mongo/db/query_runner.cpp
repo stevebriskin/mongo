@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2013 10gen Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -14,10 +14,24 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "mongo/db/query_runner.h"
+
+#include "mongo/db/btree.h"
+#include "mongo/db/index.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/pdfile.h"
+
 namespace mongo {
-    // We need cmdObj and parsedArgs so we can print a useful error msg
-    // and pull other args out.
-    bool run2DGeoNear(const IndexDetails &id, const BSONObj& cmdObj,
-                      const GeoNearArguments &parsedArgs, string& errmsg,
-                      BSONObjBuilder& result);
+
+    // static
+    DiskLoc QueryRunner::fastFindSingle(const IndexDetails &indexdetails, const BSONObj& key) {
+        const int version = indexdetails.version();
+        if (0 == version) {
+            return indexdetails.head.btree<V0>()->findSingle(indexdetails, indexdetails.head, key);
+        } else {
+            verify(1 == version);
+            return indexdetails.head.btree<V1>()->findSingle(indexdetails, indexdetails.head, key);
+        }
+    }
+
 }  // namespace mongo
