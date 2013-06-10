@@ -213,7 +213,32 @@ namespace mongo {
     void Helpers::putSingletonGod(const char *ns, BSONObj obj, bool logTheOp) {
         OpDebug debug;
         Client::Context context(ns);
-        _updateObjects(/*god=*/true, ns, obj, /*pattern=*/BSONObj(), /*upsert=*/true, /*multi=*/false , logTheOp , debug );
+
+        if (isNewUpdateFrameworkEnabled()) {
+
+            _updateObjectsNEW(/*god=*/true,
+                              ns,
+                              obj,
+                              /*pattern=*/BSONObj(),
+                              /*upsert=*/true,
+                              /*multi=*/false,
+                              logTheOp,
+                              debug );
+
+        }
+        else {
+
+            _updateObjects(/*god=*/true,
+                           ns,
+                           obj,
+                           /*pattern=*/BSONObj(),
+                           /*upsert=*/true,
+                           /*multi=*/false,
+                           logTheOp,
+                           debug );
+
+        }
+
         context.getClient()->curop()->done();
     }
 
@@ -233,6 +258,29 @@ namespace mongo {
         return kpBuilder.obj();
     }
 
+    bool findShardKeyIndexPattern_inlock( const string& ns,
+                                          const BSONObj& shardKeyPattern,
+                                          BSONObj* indexPattern ) {
+        verify( Lock::isLocked() );
+        NamespaceDetails* nsd = nsdetails( ns );
+        if ( !nsd )
+            return false;
+        const IndexDetails* idx =
+                nsd->findIndexByPrefix(shardKeyPattern, true /* require single key */);
+
+        if ( !idx )
+            return false;
+        *indexPattern = idx->keyPattern().getOwned();
+        return true;
+    }
+
+    bool findShardKeyIndexPattern( const string& ns,
+                                   const BSONObj& shardKeyPattern,
+                                   BSONObj* indexPattern ) {
+        Client::ReadContext context( ns );
+        return findShardKeyIndexPattern_inlock( ns, shardKeyPattern, indexPattern );
+    }
+
     long long Helpers::removeRange( const KeyRange& range,
                                     bool maxInclusive,
                                     bool secondaryThrottle,
@@ -242,8 +290,31 @@ namespace mongo {
     {
         Timer rangeRemoveTimer;
         const string& ns = range.ns;
-        const BSONObj& min = range.minKey;
-        const BSONObj& max = range.maxKey;
+
+        // The IndexChunk has a keyPattern that may apply to more than one index - we need to
+        // select the index and get the full index keyPattern here.
+        BSONObj indexKeyPatternDoc;
+        if ( !findShardKeyIndexPattern( ns,
+                                        range.keyPattern,
+                                        &indexKeyPatternDoc ) )
+        {
+            warning() << "no index found to clean data over range of type "
+                      << range.keyPattern << " in " << ns << endl;
+            return -1;
+        }
+
+        KeyPattern indexKeyPattern( indexKeyPatternDoc );
+
+        // Extend bounds to match the index we found
+
+        // Extend min to get (min, MinKey, MinKey, ....)
+        const BSONObj& min =
+                Helpers::toKeyFormat(indexKeyPattern.extendRangeBound(range.minKey,
+                                                                                   false));
+        // If upper bound is included, extend max to get (max, MaxKey, MaxKey, ...)
+        // If not included, extend max to get (max, MinKey, MinKey, ....)
+        const BSONObj& max =
+                Helpers::toKeyFormat( indexKeyPattern.extendRangeBound(range.maxKey,maxInclusive));
 
         LOG(1) << "begin removal of " << min << " to " << max << " in " << ns
                << (secondaryThrottle ? " (waiting for secondaries)" : "" ) << endl;
@@ -266,23 +337,13 @@ namespace mongo {
                     NamespaceDetails* nsd = nsdetails( ns );
                     if ( ! nsd )
                         break;
-                    
-                    const KeyPattern& keyPattern( range.keyPattern );
 
-                    int ii = nsd->findIndexByKeyPattern( range.keyPattern );
+                    int ii = nsd->findIndexByKeyPattern( indexKeyPattern.toBSON() );
                     verify( ii >= 0 );
                     
                     IndexDetails& i = nsd->idx( ii );
-
-                    // Extend min to get (min, MinKey, MinKey, ....)
-                    BSONObj newMin =
-                            Helpers::toKeyFormat( keyPattern.extendRangeBound( min, false ) );
-                    // If upper bound is included, extend max to get (max, MaxKey, MaxKey, ...)
-                    // If not included, extend max to get (max, MinKey, MinKey, ....)
-                    BSONObj newMax =
-                            Helpers::toKeyFormat( keyPattern.extendRangeBound(max, maxInclusive) );
                     
-                    c.reset( BtreeCursor::make( nsd, i, newMin, newMax, maxInclusive, 1 ) );
+                    c.reset( BtreeCursor::make( nsd, i, min, max, maxInclusive, 1 ) );
                 }
                 
                 if ( ! c->ok() ) {
@@ -307,15 +368,23 @@ namespace mongo {
                     verify(shardingState.enabled());
 
                     // In write lock, so will be the most up-to-date version
-                    ShardChunkManagerPtr managerNow = shardingState.getShardChunkManager(ns);
+                    // TODO: This is not quite correct, we may be transferring docs in the same
+                    // range.  Right now we're protected since we can't transfer docs in while we
+                    // delete.
+                    ShardChunkManagerPtr managerNow = shardingState.getShardChunkManager( ns );
+                    bool docIsOrphan = true;
+                    if ( managerNow ) {
+                        KeyPattern kp( managerNow->getKeyPattern() );
+                        docIsOrphan = !managerNow->keyBelongsToMe( kp.extractSingleKey( obj ) );
+                    }
+                    else {
+                        docIsOrphan = false;
+                    }
 
-                    if (!managerNow || managerNow->belongsToMe(obj)) {
-
-                        warning() << "aborting migration cleanup for chunk "
-                                  << min << " to " << max
-                                  << (managerNow ? (string)" at document " + obj.toString() : "")
+                    if ( !docIsOrphan ) {
+                        warning() << "aborting migration cleanup for chunk " << min << " to " << max
+                                  << ( managerNow ? (string) " at document " + obj.toString() : "" )
                                   << ", collection " << ns << " has changed " << endl;
-
                         break;
                     }
                 }

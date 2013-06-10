@@ -33,7 +33,7 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
@@ -578,7 +578,11 @@ namespace mongo {
                     // This sleep helps reader threads yield to writer threads.
                     // Without this, the underlying reader/writer lock implementations
                     // are not sufficiently writer-greedy.
+#ifdef _WIN32
+                    SwitchToThread();
+#else
                     sleepmicros(1);
+#endif
                 }
                 else {
                     if ( micros == -1 )
@@ -889,7 +893,7 @@ namespace mongo {
         }
 
         // Can't be in a lock when checking authorization
-        if (!cc().getAuthorizationManager()->checkAuthorization(ns, ActionType::killCursors)) {
+        if (!cc().getAuthorizationSession()->checkAuthorization(ns, ActionType::killCursors)) {
             return false;
         }
 

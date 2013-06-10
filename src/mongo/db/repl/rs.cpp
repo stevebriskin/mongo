@@ -19,6 +19,7 @@
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/principal.h"
 #include "mongo/db/client.h"
 #include "mongo/db/cmdline.h"
@@ -146,6 +147,7 @@ namespace mongo {
             log() << "leaving maintenance mode (" << _maintenanceMode << " other tasks)" << rsLog;
         }
 
+        fassert(16844, _maintenanceMode >= 0);
         return true;
     }
 
@@ -245,7 +247,16 @@ namespace mongo {
     void ReplSetImpl::msgUpdateHBInfo(HeartbeatInfo h) {
         for( Member *m = _members.head(); m; m=m->next() ) {
             if( m->id() == h.id() ) {
-                m->_hbinfo = h;
+                m->_hbinfo.updateFromLastPoll(h);
+                return;
+            }
+        }
+    }
+
+    void ReplSetImpl::msgUpdateHBRecv(unsigned id, time_t newTime) {
+        for (Member *m = _members.head(); m; m = m->next()) {
+            if (m->id() == id) {
+                m->_hbinfo.lastHeartbeatRecv = newTime;
                 return;
             }
         }
@@ -286,6 +297,7 @@ namespace mongo {
         const StateBox::SP sp = box.get();
         bool isp = sp.state.primary();
         b.append("setName", name());
+        b.append("setVersion", version());
         b.append("ismaster", isp);
         b.append("secondary", sp.state.secondary());
         {
@@ -866,7 +878,7 @@ namespace mongo {
     void replLocalAuth() {
         if (!AuthorizationManager::isAuthEnabled())
             return;
-        cc().getAuthorizationManager()->grantInternalAuthorization("_repl");
+        cc().getAuthorizationSession()->grantInternalAuthorization("_repl");
     }
 
     const char* ReplSetImpl::_initialSyncFlagString = "doingInitialSync";

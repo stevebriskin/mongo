@@ -36,6 +36,7 @@ _ disallow system* manipulations from the database.
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/db/auth/auth_index_d.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/pdfile_private.h"
 #include "mongo/db/background.h"
 #include "mongo/db/btree.h"
@@ -694,7 +695,7 @@ namespace mongo {
         LOG(3) << "_reuse extent was:" << nsDiagnostic.toString() << " now:" << nsname << endl;
         if (magic != extentSignature) {
             StringBuilder sb;
-            sb << "bad extent signature " << toHex(&magic, 4)
+            sb << "bad extent signature " << integerToHex(magic)
                << " for namespace '" << nsDiagnostic.toString()
                << "' found in Extent::_reuse";
             msgasserted(10360, sb.str());
@@ -741,7 +742,7 @@ namespace mongo {
         if (magic != extentSignature) {
             if (errors) {
                 StringBuilder sb;
-                sb << "bad extent signature " << toHex(&magic, 4)
+                sb << "bad extent signature " << integerToHex(magic)
                     << " in extent " << diskLoc.toString();
                 *errors << sb.str();
             }
@@ -1174,7 +1175,8 @@ namespace mongo {
 
         NamespaceString nsstring(ns);
         if (nsstring.coll == "system.users") {
-            uassertStatusOK(AuthorizationManager::checkValidPrivilegeDocument(nsstring.db, objNew));
+            uassertStatusOK(getGlobalAuthorizationManager()->checkValidPrivilegeDocument(
+                    nsstring.db, objNew));
         }
 
         uassert( 13596 , str::stream() << "cannot change _id of a document old:" << objOld << " new:" << objNew,
@@ -1413,7 +1415,7 @@ namespace mongo {
             else if ( legalClientSystemNS( ns , true ) ) {
                 if ( obuf && strstr( ns , ".system.users" ) ) {
                     BSONObj t( reinterpret_cast<const char *>( obuf ) );
-                    uassertStatusOK(AuthorizationManager::checkValidPrivilegeDocument(
+                    uassertStatusOK(getGlobalAuthorizationManager()->checkValidPrivilegeDocument(
                                             nsToDatabaseSubstring(ns), t));
                 }
             }

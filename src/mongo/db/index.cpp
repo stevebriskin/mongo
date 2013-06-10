@@ -23,7 +23,6 @@
 #include <boost/checked_delete.hpp>
 
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/background.h"
 #include "mongo/db/btree.h"
 #include "mongo/db/index_legacy.h"
@@ -181,6 +180,10 @@ namespace mongo {
         // logical name of the index.  todo: get rid of the name, we don't need it!
         const char *name = io.getStringField("name");
         uassert(12523, "no index name specified", *name);
+        string indexNamespace = IndexDetails::indexNamespaceFromObj(io);
+        uassert(16829, str::stream() << "namespace name generated from index name \"" <<
+                                     indexNamespace << "\" is too long (128 char max)",
+                indexNamespace.length() <= 128);
 
         BSONObj key = io.getObjectField("key");
         uassert(12524, "index key pattern too large", key.objsize() <= 2048);
@@ -209,11 +212,14 @@ namespace mongo {
             verify( sourceCollection );
         }
 
-        if ( sourceCollection->findIndexByName(name) >= 0 ) {
+        // Check both existing and in-progress indexes (2nd param = true)
+        if ( sourceCollection->findIndexByName(name, true) >= 0 ) {
             // index already exists.
             return false;
         }
-        if( sourceCollection->findIndexByKeyPattern(key) >= 0 ) {
+
+        // Check both existing and in-progress indexes (2nd param = true)
+        if( sourceCollection->findIndexByKeyPattern(key, true) >= 0 ) {
             LOG(2) << "index already exists with diff name " << name << ' ' << key.toString() << endl;
             return false;
         }

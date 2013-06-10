@@ -363,7 +363,7 @@ namespace mutablebson {
         Status setValueUndefined();
 
         /** Set the value of this Element to the given OID. */
-        Status setValueOID(const OID& value);
+        Status setValueOID(OID value);
 
         /** Set the value of this Element to the given boolean. */
         Status setValueBool(bool value);
@@ -378,7 +378,7 @@ namespace mutablebson {
         Status setValueRegex(const StringData& re, const StringData& flags);
 
         /** Set the value of this Element to the given db ref parameters. */
-        Status setValueDBRef(const StringData& ns, const OID& oid);
+        Status setValueDBRef(const StringData& ns, OID oid);
 
         /** Set the value of this Element to the given code data. */
         Status setValueCode(const StringData& value);
@@ -434,7 +434,7 @@ namespace mutablebson {
         /** Set the value of this Element to a numeric type appropriate to hold the given
          *  SafeNum value.
          */
-        Status setValueSafeNum(const SafeNum& value);
+        Status setValueSafeNum(const SafeNum value);
 
 
         //
@@ -499,7 +499,7 @@ namespace mutablebson {
         Status appendUndefined(const StringData& fieldName);
 
         /** Append the provided OID as a new field with the provided name. */
-        Status appendOID(const StringData& fieldName, const mongo::OID& value);
+        Status appendOID(const StringData& fieldName, mongo::OID value);
 
         /** Append the provided bool as a new field with the provided name. */
         Status appendBool(const StringData& fieldName, bool value);
@@ -516,7 +516,7 @@ namespace mutablebson {
 
         /** Append the provided DBRef data as a new field with the provided name. */
         Status appendDBRef(const StringData& fieldName,
-                           const StringData& ns, const mongo::OID& oid);
+                           const StringData& ns, mongo::OID oid);
 
         /** Append the provided code data as a new field with the iven name. */
         Status appendCode(const StringData& fieldName, const StringData& value);
@@ -551,8 +551,13 @@ namespace mutablebson {
          */
         Status appendSafeNum(const StringData& fieldName, SafeNum value);
 
+        /** Convert this element to its JSON representation */
+        std::string toString() const;
+
     private:
         friend class Document;
+        friend class ConstElement;
+
         friend bool operator==(const Element&, const Element&);
 
         inline Element(Document* doc, RepIdx repIdx);
@@ -564,7 +569,7 @@ namespace mutablebson {
         Status setValue(Element* newValue);
 
         template<typename Builder>
-        inline void writeElement(Builder* builder) const;
+        inline void writeElement(Builder* builder, const StringData* fieldName = NULL) const;
 
         template<typename Builder>
         inline void writeChildren(Builder* builder) const;

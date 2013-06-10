@@ -18,8 +18,11 @@
 #include <string>
 #include <vector>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/matcher.h"
@@ -40,7 +43,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             // applyOps can do pretty much anything, so require all privileges.
             out->push_back(Privilege(PrivilegeSet::WILDCARD_RESOURCE,
-                                     AuthorizationManager::getAllUserActions()));
+                                     getGlobalAuthorizationManager()->getAllUserActions()));
         }
         virtual bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
 

@@ -39,13 +39,13 @@ namespace mongo {
             ALL, ELEM_MATCH_OBJECT, ELEM_MATCH_VALUE, SIZE,
 
             // leaf types
-            LTE, LT, EQ, GT, GTE, NE, REGEX, MOD, EXISTS, MATCH_IN, NIN,
+            LTE, LT, EQ, GT, GTE, REGEX, MOD, EXISTS, MATCH_IN, NIN,
 
             // special types
             TYPE_OPERATOR, GEO, WHERE,
 
             // things that maybe shouldn't even be nodes
-            ATOMIC
+            ATOMIC, ALWAYS_FALSE
         };
 
         MatchExpression( MatchType type );
@@ -101,6 +101,26 @@ namespace mongo {
 
         virtual bool equivalent( const MatchExpression* other ) const {
             return other->matchType() == ATOMIC;
+        }
+
+    };
+
+    class FalseMatchExpression : public MatchExpression {
+    public:
+        FalseMatchExpression() : MatchExpression( ALWAYS_FALSE ){}
+
+        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const {
+            return false;
+        }
+
+        virtual bool matchesSingleElement( const BSONElement& e ) const {
+            return false;
+        }
+
+        virtual void debugString( StringBuilder& debug, int level = 0 ) const;
+
+        virtual bool equivalent( const MatchExpression* other ) const {
+            return other->matchType() == ALWAYS_FALSE;
         }
 
     };

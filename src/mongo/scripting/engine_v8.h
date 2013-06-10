@@ -290,6 +290,11 @@ namespace mongo {
          */
         v8::Persistent<v8::Context> getContext() { return _context; }
 
+        /**
+         * Get the global JS object
+         */
+        v8::Persistent<v8::Object> getGlobal() { return _global; }
+
         ObjTracker<BSONHolder> bsonHolderTracker;
         ObjTracker<DBClientWithCommands> dbClientWithCommandsTracker;
         ObjTracker<DBClientBase> dbClientBaseTracker;
@@ -496,7 +501,7 @@ namespace mongo {
 
         if (try_catch.HasCaught() && try_catch.CanContinue()) {
             // normal JS exception
-            _error = string("JavaScript execution failed: ") + v8ExceptionToSTLString(&try_catch);
+            _error = v8ExceptionToSTLString(&try_catch);
             haveError = true;
         }
         else if (hasOutOfMemoryException()) {

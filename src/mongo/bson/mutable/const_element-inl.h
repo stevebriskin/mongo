@@ -172,6 +172,15 @@ namespace mutablebson {
         return _basis.getIdx();
     }
 
+    inline std::string ConstElement::toString() const {
+        return _basis.toString();
+    }
+
+    template<typename Builder>
+    inline void ConstElement::writeElement(Builder* builder, const StringData* fieldName) const {
+        return _basis.writeElement(builder, fieldName);
+    }
+
     inline bool operator==(const ConstElement& l, const ConstElement& r) {
         return l._basis == r._basis;
     }
@@ -195,6 +204,7 @@ namespace mutablebson {
     inline bool operator!=(const ConstElement& l, const Element& r) {
         return !(l == r);
     }
+
 
 } // namespace mutablebson
 } // namespace mongo

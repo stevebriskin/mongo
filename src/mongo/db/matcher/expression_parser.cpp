@@ -46,11 +46,7 @@ namespace mongo {
     StatusWithMatchExpression MatchExpressionParser::_parseSubField( const BSONObj& context,
                                                                      const AndMatchExpression* andSoFar,
                                                                      const char* name,
-                                                                     const BSONElement& e,
-                                                                     int position,
-                                                                     bool* stop ) {
-
-        *stop = false;
+                                                                     const BSONElement& e ) {
 
         // TODO: these should move to getGtLtOp, or its replacement
 
@@ -61,13 +57,16 @@ namespace mongo {
             return _parseNot( name, e );
         }
 
+        if ( mongoutils::str::equals( "$geoIntersects", e.fieldName() ) ) {
+            return expressionParserGeoCallback( name, context );
+        }
 
         int x = e.getGtLtOp(-1);
         switch ( x ) {
         case -1:
             return StatusWithMatchExpression( ErrorCodes::BadValue,
-                                         mongoutils::str::stream() << "unknown operator: "
-                                         << e.fieldName() );
+                                              mongoutils::str::stream() << "unknown operator: "
+                                              << e.fieldName() );
         case BSONObj::LT:
             return _parseComparison( name, new LTMatchExpression(), e );
         case BSONObj::LTE:
@@ -76,8 +75,16 @@ namespace mongo {
             return _parseComparison( name, new GTMatchExpression(), e );
         case BSONObj::GTE:
             return _parseComparison( name, new GTEMatchExpression(), e );
-        case BSONObj::NE:
-            return _parseComparison( name, new NEMatchExpression(), e );
+        case BSONObj::NE: {
+            StatusWithMatchExpression s = _parseComparison( name, new EqualityMatchExpression(), e );
+            if ( !s.isOK() )
+                return s;
+            std::auto_ptr<NotMatchExpression> n( new NotMatchExpression() );
+            Status s2 = n->init( s.getValue() );
+            if ( !s2.isOK() )
+                return StatusWithMatchExpression( s2 );
+            return StatusWithMatchExpression( n.release() );
+        }
         case BSONObj::Equality:
             return _parseComparison( name, new EqualityMatchExpression(), e );
 
@@ -85,8 +92,10 @@ namespace mongo {
             if ( e.type() != Array )
                 return StatusWithMatchExpression( ErrorCodes::BadValue, "$in needs an array" );
             std::auto_ptr<InMatchExpression> temp( new InMatchExpression() );
-            temp->init( name );
-            Status s = _parseArrayFilterEntries( temp->getArrayFilterEntries(), e.Obj() );
+            Status s = temp->init( name );
+            if ( !s.isOK() )
+                return StatusWithMatchExpression( s );
+            s = _parseArrayFilterEntries( temp->getArrayFilterEntries(), e.Obj() );
             if ( !s.isOK() )
                 return StatusWithMatchExpression( s );
             return StatusWithMatchExpression( temp.release() );
@@ -95,12 +104,20 @@ namespace mongo {
         case BSONObj::NIN: {
             if ( e.type() != Array )
                 return StatusWithMatchExpression( ErrorCodes::BadValue, "$nin needs an array" );
-            std::auto_ptr<NinMatchExpression> temp( new NinMatchExpression() );
-            temp->init( name );
-            Status s = _parseArrayFilterEntries( temp->getArrayFilterEntries(), e.Obj() );
+            std::auto_ptr<InMatchExpression> temp( new InMatchExpression() );
+            Status s = temp->init( name );
             if ( !s.isOK() )
                 return StatusWithMatchExpression( s );
-            return StatusWithMatchExpression( temp.release() );
+            s = _parseArrayFilterEntries( temp->getArrayFilterEntries(), e.Obj() );
+            if ( !s.isOK() )
+                return StatusWithMatchExpression( s );
+
+            std::auto_ptr<NotMatchExpression> temp2( new NotMatchExpression() );
+            s = temp2->init( temp.release() );
+            if ( !s.isOK() )
+                return StatusWithMatchExpression( s );
+
+            return StatusWithMatchExpression( temp2.release() );
         }
 
         case BSONObj::opSIZE: {
@@ -137,10 +154,16 @@ namespace mongo {
             if ( e.eoo() )
                 return StatusWithMatchExpression( ErrorCodes::BadValue, "$exists can't be eoo" );
             std::auto_ptr<ExistsMatchExpression> temp( new ExistsMatchExpression() );
-            Status s = temp->init( name, e.trueValue() );
+            Status s = temp->init( name );
             if ( !s.isOK() )
                 return StatusWithMatchExpression( s );
-            return StatusWithMatchExpression( temp.release() );
+            if ( e.trueValue() )
+                return StatusWithMatchExpression( temp.release() );
+            std::auto_ptr<NotMatchExpression> temp2( new NotMatchExpression() );
+            s = temp2->init( temp.release() );
+            if ( !s.isOK() )
+                return StatusWithMatchExpression( s );
+            return StatusWithMatchExpression( temp2.release() );
         }
 
         case BSONObj::opTYPE: {
@@ -161,18 +184,20 @@ namespace mongo {
             return _parseMOD( name, e );
 
         case BSONObj::opOPTIONS: {
-            for ( size_t i = 0; i < andSoFar->numChildren(); i++ ) {
-                if ( andSoFar->getChild( i )->matchType() == MatchExpression::REGEX )
+            // TODO: try to optimize this
+            // we have to do this since $options can be before or after a $regex
+            // but we validate here
+            BSONObjIterator i( context );
+            while ( i.more() ) {
+                BSONElement temp = i.next();
+                if ( temp.getGtLtOp( -1 ) == BSONObj::opREGEX )
                     return StatusWithMatchExpression( NULL );
             }
-            return StatusWithMatchExpression( ErrorCodes::BadValue, "$options must follow a $regex" );
+
+            return StatusWithMatchExpression( ErrorCodes::BadValue, "$options needs a $regex" );
         }
 
         case BSONObj::opREGEX: {
-            if ( position != 0 )
-                return StatusWithMatchExpression( ErrorCodes::BadValue, "$regex has to be first" );
-
-            //*stop = true;
             return _parseRegexDocument( name, context );
         }
 
@@ -185,10 +210,10 @@ namespace mongo {
         case BSONObj::opWITHIN:
             return expressionParserGeoCallback( name, context );
 
-        default:
-            return StatusWithMatchExpression( ErrorCodes::BadValue, "not done" );
         }
 
+        return StatusWithMatchExpression( ErrorCodes::BadValue,
+                                          mongoutils::str::stream() << "not handled: " << e.fieldName() );
     }
 
     StatusWithMatchExpression MatchExpressionParser::_parse( const BSONObj& obj, bool topLevel ) {
@@ -263,7 +288,7 @@ namespace mongo {
                 continue;
             }
 
-            if ( e.type() == Object && e.Obj().firstElement().fieldName()[0] == '$' ) {
+            if ( _isExpressionDocument( e ) ) {
                 Status s = _parseSub( e.fieldName(), e.Obj(), root.get() );
                 if ( !s.isOK() )
                     return StatusWithMatchExpression( s );
@@ -296,29 +321,39 @@ namespace mongo {
     }
 
     Status MatchExpressionParser::_parseSub( const char* name,
-                                        const BSONObj& sub,
-                                        AndMatchExpression* root ) {
-
-        int position = 0;
-
+                                             const BSONObj& sub,
+                                             AndMatchExpression* root ) {
         BSONObjIterator j( sub );
         while ( j.more() ) {
             BSONElement deep = j.next();
 
-            bool stop = false;
-            StatusWithMatchExpression s = _parseSubField( sub, root, name, deep, position, &stop );
+            StatusWithMatchExpression s = _parseSubField( sub, root, name, deep );
             if ( !s.isOK() )
                 return s.getStatus();
 
             if ( s.getValue() )
                 root->add( s.getValue() );
-
-            if ( stop )
-                break;
-            position++;
         }
 
         return Status::OK();
+    }
+
+    bool MatchExpressionParser::_isExpressionDocument( const BSONElement& e ) {
+        if ( e.type() != Object )
+            return false;
+
+        BSONObj o = e.Obj();
+        if ( o.isEmpty() )
+            return false;
+
+        const char* name = o.firstElement().fieldName();
+        if ( name[0] != '$' )
+            return false;
+
+        if ( mongoutils::str::equals( "$ref", name ) )
+            return false;
+
+        return true;
     }
 
 
@@ -375,15 +410,22 @@ namespace mongo {
             BSONElement e = i.next();
             switch ( e.getGtLtOp() ) {
             case BSONObj::opREGEX:
-                if ( e.type() != String )
+                if ( e.type() == String ) {
+                    regex = e.String();
+                }
+                else if ( e.type() == RegEx ) {
+                    regex = e.regex();
+                }
+                else {
                     return StatusWithMatchExpression( ErrorCodes::BadValue,
-                                                 "$regex has to be a string" );
-                regex = e.String();
+                                                      "$regex has to be a string" );
+                }
+
                 break;
             case BSONObj::opOPTIONS:
                 if ( e.type() != String )
                     return StatusWithMatchExpression( ErrorCodes::BadValue,
-                                                 "$options has to be a string" );
+                                                      "$options has to be a string" );
                 regexOptions = e.String();
                 break;
             default:
@@ -401,8 +443,7 @@ namespace mongo {
     }
 
     Status MatchExpressionParser::_parseArrayFilterEntries( ArrayFilterEntries* entries,
-                                                       const BSONObj& theArray ) {
-
+                                                            const BSONObj& theArray ) {
 
         BSONObjIterator i( theArray );
         while ( i.more() ) {
@@ -433,7 +474,7 @@ namespace mongo {
             return StatusWithMatchExpression( ErrorCodes::BadValue, "$elemMatch needs an Object" );
 
         BSONObj obj = e.Obj();
-        if ( obj.firstElement().fieldName()[0] == '$' ) {
+        if ( _isExpressionDocument( e ) ) {
             // value case
 
             AndMatchExpression theAnd;
@@ -511,16 +552,35 @@ namespace mongo {
             return StatusWithMatchExpression( temp.release() );
         }
 
-        std::auto_ptr<AllMatchExpression> temp( new AllMatchExpression() );
-        Status s = temp->init( name );
-        if ( !s.isOK() )
-            return StatusWithMatchExpression( s );
+        std::auto_ptr<AndMatchExpression> myAnd( new AndMatchExpression() );
+        BSONObjIterator i( arr );
+        while ( i.more() ) {
+            BSONElement e = i.next();
 
-        s = _parseArrayFilterEntries( temp->getArrayFilterEntries(), arr );
-        if ( !s.isOK() )
-            return StatusWithMatchExpression( s );
+            if ( e.type() == RegEx ) {
+                std::auto_ptr<RegexMatchExpression> r( new RegexMatchExpression() );
+                Status s = r->init( name, e );
+                if ( !s.isOK() )
+                    return StatusWithMatchExpression( s );
+                myAnd->add( r.release() );
+            }
+            else if ( e.type() == Object && e.Obj().firstElement().getGtLtOp(-1) != -1 ) {
+                return StatusWithMatchExpression( ErrorCodes::BadValue, "no $ expressions in $all" );
+            }
+            else {
+                std::auto_ptr<EqualityMatchExpression> x( new EqualityMatchExpression() );
+                Status s = x->init( name, e );
+                if ( !s.isOK() )
+                    return StatusWithMatchExpression( s );
+                myAnd->add( x.release() );
+            }
+        }
 
-        return StatusWithMatchExpression( temp.release() );
+        if ( myAnd->numChildren() == 0 ) {
+            return StatusWithMatchExpression( new FalseMatchExpression() );
+        }
+
+        return StatusWithMatchExpression( myAnd.release() );
     }
 
     StatusWithMatchExpression expressionParserGeoCallbackDefault( const char* name,

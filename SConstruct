@@ -245,7 +245,10 @@ add_option( "use-system-boost", "use system version of boost libraries", 0, True
 add_option( "use-system-snappy", "use system version of snappy library", 0, True )
 
 add_option( "use-system-sm", "use system version of spidermonkey library", 0, True )
+
 add_option( "use-system-v8", "use system version of v8 library", 0, True )
+
+add_option( "use-system-stemmer", "use system version of stemmer", 0, True )
 
 add_option( "use-system-all" , "use all system libraries", 0 , True )
 
@@ -359,7 +362,10 @@ if has_option('build-fast-and-loose'):
 if has_option('mute'):
     env.Append( CCCOMSTR = "Compiling $TARGET" )
     env.Append( CXXCOMSTR = env["CCCOMSTR"] )
+    env.Append( SHCCCOMSTR = "Compiling $TARGET" )
+    env.Append( SHCXXCOMSTR = env["SHCCCOMSTR"] )
     env.Append( LINKCOMSTR = "Linking $TARGET" )
+    env.Append( SHLINKCOMSTR = env["LINKCOMSTR"] )
     env.Append( ARCOMSTR = "Generating library $TARGET" )
 
 if has_option('mongod-concurrency-level'):
@@ -608,11 +614,12 @@ elif "win32" == os.sys.platform:
     env['DIST_ARCHIVE_SUFFIX'] = '.zip'
 
     win_version_min_choices = {
-        'xpsp3'  : ('0501', '0300'),
-        'vista'  : ('0600', '0000'),
-        'ws08r2' : ('0601', '0000'),
-        'win7'   : ('0601', '0000'),
-        'win8'   : ('0602', '0000'),
+        'xpsp3'   : ('0501', '0300'),
+        'ws03sp2' : ('0502', '0200'),
+        'vista'   : ('0600', '0000'),
+        'ws08r2'  : ('0601', '0000'),
+        'win7'    : ('0601', '0000'),
+        'win8'    : ('0602', '0000'),
     }
 
     add_option("win-version-min", "minimum Windows version to support", 1, False,
@@ -726,7 +733,11 @@ if nix:
 
     env.Append( CPPDEFINES=["_FILE_OFFSET_BITS=64"] )
     env.Append( CXXFLAGS=["-Wnon-virtual-dtor", "-Woverloaded-virtual"] )
-    env.Append( LINKFLAGS=["-fPIC", "-pthread",  "-rdynamic"] )
+    env.Append( LINKFLAGS=["-fPIC", "-pthread"] )
+
+    if not darwin:
+        env.Append( LINKFLAGS=["-rdynamic"] )
+
     env.Append( LIBS=[] )
 
     #make scons colorgcc friendly
@@ -735,9 +746,6 @@ if nix:
             env['ENV'][key] = os.environ[key]
         except KeyError:
             pass
-
-    if linux and has_option( "sharedclient" ):
-        env.Append( LINKFLAGS=" -Wl,--as-needed -Wl,-zdefs " )
 
     if linux and has_option( "gcov" ):
         env.Append( CXXFLAGS=" -fprofile-arcs -ftest-coverage " )
@@ -798,7 +806,12 @@ if not use_system_version_of_library("boost"):
                 CPPDEFINES=['BOOST_ALL_NO_LIB'])
 
 env.Prepend(CPPPATH=['$BUILD_DIR/third_party/s2'])
-env.Prepend(CPPPATH=['$BUILD_DIR/third_party/libstemmer_c/include'])
+
+if not use_system_version_of_library("stemmer"):
+    env.Prepend(CPPPATH=['$BUILD_DIR/third_party/libstemmer_c/include'])
+
+if not use_system_version_of_library("snappy"):
+    env.Prepend(CPPPATH=['$BUILD_DIR/third_party/snappy'])
 
 env.Append( CPPPATH=['$EXTRACPPPATH'],
             LIBPATH=['$EXTRALIBPATH'] )
@@ -909,7 +922,7 @@ def doConfigure(myenv):
     if windows:
         win_version_min = None
         default_32_bit_min = 'xpsp3'
-        default_64_bit_min = 'vista'
+        default_64_bit_min = 'ws03sp2'
         if has_option('win-version-min'):
             win_version_min = get_option('win-version-min')
         elif has_option('win2008plus'):
@@ -1082,6 +1095,41 @@ def doConfigure(myenv):
             print( 'libc++ requested, but compiler does not support -stdlib=libc++' )
             Exit(1)
 
+    # Check to see if we are trying to use an outdated libstdc++ in C++11 mode. This is
+    # primarly to help people using clang in C++11 mode on OS X but forgetting to use --libc++.
+    if has_option('c++11') and not has_option('libc++'):
+
+        def CheckModernLibStdCxx(context):
+
+            # See http://gcc.gnu.org/onlinedocs/libstdc++/manual/abi.html for the origin of
+            # these values. Our choice of 4.7.0 is somewhat arbitrary.
+            minSupportedLibStdCxx = ("4.7.0", 20120322)
+
+            test_body = """
+            #include <vector>
+            #if defined(__GLIBCXX__) and (__GLIBCXX__ < %d)
+            #error
+            #endif
+            """ % minSupportedLibStdCxx[1]
+
+            messageText = 'Checking for libstdc++ %s or newer (for C++11 support)... '
+            context.Message(messageText % minSupportedLibStdCxx[0])
+            ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
+            context.Result(ret)
+            return ret
+
+        conf = Configure(myenv, help=False, custom_tests = {
+            'CheckModernLibStdCxx' : CheckModernLibStdCxx,
+        })
+        haveGoodLibStdCxx = conf.CheckModernLibStdCxx()
+        conf.Finish()
+
+        if not haveGoodLibStdCxx:
+            print( 'Detected libstdc++ is too old to support C++11 mode' )
+            if darwin:
+                print( 'Try building with --libc++ and --osx-version-min=10.7 or higher' )
+            Exit(1)
+
     if has_option('sanitize'):
         if not (using_clang() or using_gcc()):
             print( 'sanitize is only supported with clang or gcc')
@@ -1123,6 +1171,24 @@ def doConfigure(myenv):
         AddToCCFLAGSIfSupported(myenv, "-fno-builtin-memcmp")
 
     conf = Configure(myenv)
+
+    if use_system_version_of_library("pcre"):
+        if not conf.CheckLib("pcre"):
+            print( "Can't find pcre library" )
+            Exit(1)
+        if not conf.CheckLib("pcrecpp"):
+            print( "Can't find prcecpp library" )
+            Exit(1)
+
+    if use_system_version_of_library("snappy"):
+        if not conf.CheckLib("snappy"):
+            print( "Can't find snappy library" )
+            Exit(1)
+
+    if use_system_version_of_library("stemmer"):
+        if not conf.CheckLib("stemmer"):
+            print( "Can't find stemmer library" )
+            Exit(1)
 
     if use_system_version_of_library("boost"):
         if not conf.CheckCXXHeader( "boost/filesystem/operations.hpp" ):
@@ -1423,13 +1489,6 @@ if len(COMMAND_LINE_TARGETS) > 0 and 'uninstall' in COMMAND_LINE_TARGETS:
     BUILD_TARGETS.remove("uninstall")
     BUILD_TARGETS.append("install")
 
-clientEnv = env.Clone()
-clientEnv['CPPDEFINES'].remove('MONGO_EXPOSE_MACROS')
-
-if not use_system_version_of_library("boost"):
-    clientEnv.Append(LIBS=['boost_thread', 'boost_filesystem', 'boost_system'])
-    clientEnv.Prepend(LIBPATH=['$BUILD_DIR/third_party/boost/'])
-
 module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 
 # The following symbols are exported for use in subordinate SConscript files.
@@ -1441,7 +1500,6 @@ module_sconscripts = moduleconfig.get_module_sconscripts(mongo_modules)
 # conditional decision making that hasn't been moved up to this SConstruct file,
 # and they are exported here, as well.
 Export("env")
-Export("clientEnv")
 Export("shellEnv")
 Export("testEnv")
 Export("has_option use_system_version_of_library")

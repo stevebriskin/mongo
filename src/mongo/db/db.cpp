@@ -22,7 +22,12 @@
 #include <boost/filesystem/operations.hpp>
 #include <fstream>
 
+#include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
+#include "mongo/db/auth/authz_manager_external_state_d.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/cmdline.h"
@@ -42,6 +47,7 @@
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/module.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/range_deleter_service.h"
 #include "mongo/db/repl/repl_start.h"
 #include "mongo/db/repl/replication_server_status.h"
 #include "mongo/db/repl/rs.h"
@@ -49,6 +55,7 @@
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/snapshots.h"
 #include "mongo/db/ttl.h"
+#include "mongo/platform/process_id.h"
 #include "mongo/s/d_writeback.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/background.h"
@@ -95,7 +102,7 @@ namespace mongo {
 
     CmdLine cmdLine;
     static bool scriptingEnabled = true;
-    static bool noHttpInterface = false;
+    static bool httpInterface = false;
     bool shouldRepairDatabases = 0;
     static bool forceRepair = 0;
     Timer startupSrandTimer;
@@ -251,7 +258,7 @@ namespace mongo {
         toLog.append( "startTimeLocal", buf );
 
         toLog.append( "cmdLine", CmdLine::getParsedOpts() );
-        toLog.append( "pid", getpid() );
+        toLog.append( "pid", ProcessId::getCurrent().asLongLong() );
 
 
         BSONObjBuilder buildinfo( toLog.subobjStart("buildinfo"));
@@ -279,7 +286,7 @@ namespace mongo {
 
         logStartup();
         startReplication();
-        if ( !noHttpInterface )
+        if ( httpInterface )
             boost::thread web( boost::bind(&webServerThread, new RestAdminAccess() /* takes ownership */));
 
 #if(TESTEXHAUST)
@@ -575,11 +582,7 @@ namespace mongo {
         bool is32bit = sizeof(int*) == 4;
 
         {
-#if !defined(_WIN32)
-            pid_t pid = getpid();
-#else
-            DWORD pid=GetCurrentProcessId();
-#endif
+            ProcessId pid = ProcessId::getCurrent();
             Nullstream& l = log();
             l << "MongoDB starting : pid=" << pid << " port=" << cmdLine.port << " dbpath=" << dbpath;
             if( replSettings.master ) l << " master=" << replSettings.master;
@@ -672,6 +675,8 @@ namespace mongo {
             // resolve this.
             Client::WriteContext c("admin", dbpath);
         }
+
+        getDeleter()->startWorkers();
 
         // Starts a background thread that rebuilds all incomplete indices. 
         indexRebuilder.go(); 
@@ -780,7 +785,6 @@ static void buildOptionsDescriptions(po::options_description *pVisible,
     ("journalOptions", po::value<int>(), "journal diagnostic options")
     ("jsonp","allow JSONP access via http (has security implications)")
     ("noauth", "run without security")
-    ("nohttpinterface", "disable http interface")
     ("noIndexBuildRetry", "don't retry any index builds that were interrupted by shutdown")
     ("nojournal", "disable journaling (journaling is on by default for 64 bit)")
     ("noprealloc", "disable data file preallocation - will often hurt performance")
@@ -981,8 +985,12 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
         if (params.count("nopreallocj")) {
             cmdLine.preallocj = false;
         }
-        if (params.count("nohttpinterface")) {
-            noHttpInterface = true;
+        if (params.count("httpinterface")) {
+            if (params.count("nohttpinterface")) {
+                log() << "can't have both --httpinterface and --nohttpinterface" << endl;
+                ::_exit( EXIT_BADOPTIONS );
+            }
+            httpInterface = true;
         }
         if (params.count("rest")) {
             cmdLine.rest = true;
@@ -1260,6 +1268,11 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
         }
 #endif
     }
+}
+
+MONGO_INITIALIZER(CreateAuthorizationManager)(InitializerContext* context) {
+    setGlobalAuthorizationManager(new AuthorizationManager(new AuthzManagerExternalStateMongod()));
+    return Status::OK();
 }
 
 static int mongoDbMain(int argc, char* argv[], char **envp) {

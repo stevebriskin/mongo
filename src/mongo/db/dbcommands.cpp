@@ -32,6 +32,7 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
 #include "mongo/db/btreecursor.h"
@@ -123,6 +124,7 @@ namespace mongo {
                  << "  { fsync:true } - fsync before returning, or wait for journal commit if running with --journal\n"
                  << "  { j:true } - wait for journal commit if running with --journal\n"
                  << "  { w:n } - await replication to n servers (including self) before returning\n"
+                 << "  { w:'majority' } - await replication to majority of set\n"
                  << "  { wtimeout:m} - timeout for w in m milliseconds";
         }
         bool run(const string& dbname, BSONObj& _cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
@@ -210,6 +212,11 @@ namespace mongo {
                         // don't do anything
                         // w=1 and no repl, so this is fine
                     }
+                    else if (e.type() == mongo::String &&
+                             str::equals(e.valuestrsafe(), "majority")) {
+                        // don't do anything
+                        // w=majority and no repl, so this is fine
+                    }
                     else {
                         // w=2 and no repl
                         stringstream errmsg;
@@ -236,6 +243,7 @@ namespace mongo {
                         // this should be in the while loop in case we step down
                         errmsg = "not master";
                         result.append( "wnote", "no longer primary" );
+                        result.append( "code" , 10990 );
                         return false;
                     }
 
@@ -1795,6 +1803,21 @@ namespace mongo {
             out->push_back(Privilege(dbname, actions));
         }
         virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
+            Timer timer;
+
+            set<string> desiredCollections;
+            if ( cmdObj["collections"].type() == Array ) {
+                BSONObjIterator i( cmdObj["collections"].Obj() );
+                while ( i.more() ) {
+                    BSONElement e = i.next();
+                    if ( e.type() != String ) {
+                        errmsg = "collections entries have to be strings";
+                        return false;
+                    }
+                    desiredCollections.insert( e.String() );
+                }
+            }
+
             list<string> colls;
             Database* db = cc().database();
             if ( db )
@@ -1809,20 +1832,26 @@ namespace mongo {
 
             BSONObjBuilder bb( result.subobjStart( "collections" ) );
             for ( list<string>::iterator i=colls.begin(); i != colls.end(); i++ ) {
-                string c = *i;
-                if ( c.find( ".system.profile" ) != string::npos )
+                string fullCollectionName = *i;
+                string shortCollectionName = fullCollectionName.substr( dbname.size() + 1 );
+
+                if ( shortCollectionName.find( "system." ) == 0 )
+                    continue;
+
+                if ( desiredCollections.size() > 0 &&
+                     desiredCollections.count( shortCollectionName ) == 0 )
                     continue;
 
                 shared_ptr<Cursor> cursor;
 
-                NamespaceDetails * nsd = nsdetails( c );
+                NamespaceDetails * nsd = nsdetails( fullCollectionName );
 
                 // debug SERVER-761
                 NamespaceDetails::IndexIterator ii = nsd->ii();
                 while( ii.more() ) {
                     const IndexDetails &idx = ii.next();
                     if ( !idx.head.isValid() || !idx.info.isValid() ) {
-                        log() << "invalid index for ns: " << c << " " << idx.head << " " << idx.info;
+                        log() << "invalid index for ns: " << fullCollectionName << " " << idx.head << " " << idx.info;
                         if ( idx.info.isValid() )
                             log() << " " << idx.info.obj();
                         log() << endl;
@@ -1838,14 +1867,11 @@ namespace mongo {
                                                      false,
                                                      1 ) );
                 }
-                else if ( c.find( ".system." ) != string::npos ) {
-                    continue;
-                }
                 else if ( nsd->isCapped() ) {
-                    cursor = findTableScan( c.c_str() , BSONObj() );
+                    cursor = findTableScan( fullCollectionName.c_str() , BSONObj() );
                 }
                 else {
-                    log() << "can't find _id index for: " << c << endl;
+                    log() << "can't find _id index for: " << fullCollectionName << endl;
                     continue;
                 }
 
@@ -1863,7 +1889,7 @@ namespace mongo {
                 md5_finish(&st, d);
                 string hash = digestToString( d );
 
-                bb.append( c.c_str() + ( dbname.size() + 1 ) , hash );
+                bb.append( shortCollectionName, hash );
 
                 md5_append( &globalState , (const md5_byte_t*)hash.c_str() , hash.size() );
             }
@@ -1874,7 +1900,7 @@ namespace mongo {
             string hash = digestToString( d );
 
             result.append( "md5" , hash );
-
+            result.appendNumber( "timeMillis", timer.millis() );
             return 1;
         }
 
@@ -2030,6 +2056,21 @@ namespace mongo {
         }
     }
 
+    /* Sometimes we cannot set maintenance mode, in which case the call to setMaintenanceMode will
+       return false.  This class does not treat that case as an error which means that anybody 
+       using it is assuming it is ok to continue execution without maintenance mode.  This 
+       assumption needs to be audited and documented. */
+    class MaintenanceModeSetter {
+    public:
+        MaintenanceModeSetter() : maintenanceModeSet(theReplSet->setMaintenanceMode(true)) {}
+        ~MaintenanceModeSetter() {
+            if(maintenanceModeSet)
+                theReplSet->setMaintenanceMode(false);
+        } 
+    private:
+        bool maintenanceModeSet;
+    };
+
     /**
      * this handles
      - auth
@@ -2047,6 +2088,7 @@ namespace mongo {
                               bool fromRepl ) {
 
         std::string dbname = nsToDatabase( cmdns );
+        scoped_ptr<MaintenanceModeSetter> mmSetter;
 
         if (c->adminOnly() &&
                 c->localHostOnlyIfNoAuth(cmdObj) &&
@@ -2069,7 +2111,7 @@ namespace mongo {
         if (AuthorizationManager::isAuthEnabled()) {
             std::vector<Privilege> privileges;
             c->addRequiredPrivileges(dbname, cmdObj, &privileges);
-            Status status = client.getAuthorizationManager()->checkAuthForPrivileges(privileges);
+            Status status = client.getAuthorizationSession()->checkAuthForPrivileges(privileges);
             if (!status.isOK()) {
                 log() << "command denied: " << cmdObj.toString() << endl;
                 appendCommandStatus(result, false, status.reason());
@@ -2109,8 +2151,8 @@ namespace mongo {
         if ( c->adminOnly() )
             LOG( 2 ) << "command: " << cmdObj << endl;
 
-        if (c->maintenanceMode() && theReplSet && theReplSet->isSecondary()) {
-            theReplSet->setMaintenanceMode(true);
+        if (c->maintenanceMode() && theReplSet) {
+            mmSetter.reset(new MaintenanceModeSetter());
         }
 
         std::string errmsg;
@@ -2158,10 +2200,6 @@ namespace mongo {
             if ( retval && c->logTheOp() && ! fromRepl ) {
                 logOp("c", cmdns, cmdObj);
             }
-        }
-
-        if (c->maintenanceMode() && theReplSet) {
-            theReplSet->setMaintenanceMode(false);
         }
 
         appendCommandStatus(result, retval, errmsg);

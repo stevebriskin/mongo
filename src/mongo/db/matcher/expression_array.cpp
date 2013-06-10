@@ -18,155 +18,38 @@
 
 #include "mongo/db/matcher/expression_array.h"
 
-#include "mongo/bson/bsonobjiterator.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/matcher/expression_internal.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
 
-
-    // ----------
-
-    Status AllMatchExpression::init( const StringData& path ) {
+    Status ArrayMatchingMatchExpression::initPath( const StringData& path ) {
         _path = path;
-        _fieldRef.parse( _path );
-        return Status::OK();
+        Status s = _elementPath.init( _path );
+        _elementPath.setTraverseLeafArray( false );
+        return s;
     }
-
-    bool AllMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-
-        bool traversedArray = false;
-        size_t idxPath = 0;
-        BSONElement e = doc->getFieldDottedOrArray( _fieldRef, &idxPath, &traversedArray );
-
-        if ( e.type() != Array || traversedArray || idxPath + 1 == _fieldRef.numParts() ) {
-            return matchesSingleElement( e );
-        }
-
-        string rest = _fieldRef.dottedField( idxPath+1 );
-
-        BSONElementSet all;
-
-        BSONObjIterator i( e.Obj() );
-        while ( i.more() ) {
-            BSONElement e = i.next();
-            if ( ! e.isABSONObj() )
-                continue;
-
-            e.Obj().getFieldsDotted( rest, all );
-        }
-
-        return _match( all );
-    }
-
-    bool AllMatchExpression::matchesSingleElement( const BSONElement& e ) const {
-        if ( _arrayEntries.size() == 0 )
-            return false;
-
-        if ( e.eoo() )
-            return _arrayEntries.singleNull();
-
-        BSONElementSet all;
-
-        if ( e.type() == Array ) {
-            BSONObjIterator i( e.Obj() );
-            while ( i.more() ) {
-                all.insert( i.next() );
-            }
-        }
-        else {
-            // this is the part i want to remove
-            all.insert( e );
-        }
-
-        return _match( all );
-    }
-
-    bool AllMatchExpression::_match( const BSONElementSet& all ) const {
-
-        if ( all.size() == 0 )
-            return _arrayEntries.singleNull();
-
-        const BSONElementSet& equalities = _arrayEntries.equalities();
-        for ( BSONElementSet::const_iterator i = equalities.begin(); i != equalities.end(); ++i ) {
-            BSONElement foo = *i;
-            if ( all.count( foo ) == 0 )
-                return false;
-        }
-
-        for ( size_t i = 0; i < _arrayEntries.numRegexes(); i++ ) {
-
-            bool found = false;
-            for ( BSONElementSet::const_iterator j = all.begin(); j != all.end(); ++j ) {
-                BSONElement bar = *j;
-                if ( _arrayEntries.regex(i)->matchesSingleElement( bar ) ) {
-                    found = true;
-                    break;
-                }
-            }
-            if ( ! found )
-                return false;
-
-        }
-
-        return true;
-    }
-
-    void AllMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace( debug, level );
-        debug << _path << " $all TODO\n";
-    }
-
-    bool AllMatchExpression::equivalent( const MatchExpression* other ) const {
-        if ( matchType() != other->matchType() )
-            return false;
-
-        const AllMatchExpression* realOther = static_cast<const AllMatchExpression*>( other );
-        return _path == realOther->_path && _arrayEntries.equivalent( realOther->_arrayEntries );
-    }
-
-    // -------
 
     bool ArrayMatchingMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
 
-        FieldRef path;
-        path.parse(_path);
+        boost::scoped_ptr<ElementIterator> cursor( doc->getIterator( _elementPath ) );
 
-        bool traversedArray = false;
-        size_t idxPath = 0;
-        BSONElement e = doc->getFieldDottedOrArray( path, &idxPath, &traversedArray );
-
-        string rest = path.dottedField( idxPath+1 );
-
-        if ( rest.size() == 0 ) {
-            if ( e.type() == Array )
-                return matchesArray( e.Obj(), details );
-            return false;
-        }
-
-        if ( e.type() != Array )
-            return false;
-
-        BSONObjIterator i( e.Obj() );
-        while ( i.more() ) {
-            BSONElement x = i.next();
-            if ( ! x.isABSONObj() )
+        while ( cursor->more() ) {
+            ElementIterator::Context e = cursor->next();
+            if ( e.element().type() != Array )
                 continue;
 
-            BSONElement sub = x.Obj().getFieldDotted( rest );
-            if ( sub.type() != Array )
+            bool amIRoot = e.arrayOffset().eoo();
+
+            if ( !matchesArray( e.element().Obj(), amIRoot ? details : NULL ) )
                 continue;
 
-            if ( matchesArray( sub.Obj(), NULL ) ) {
-                if ( details && details->needRecord() ) {
-                    // trying to match crazy semantics??
-                    details->setElemMatchKey( x.fieldName() );
-                }
-                return true;
+            if ( !amIRoot && details && details->needRecord() && !e.arrayOffset().eoo() ) {
+                details->setElemMatchKey( e.arrayOffset().fieldName() );
             }
+            return true;
         }
-
         return false;
     }
 
@@ -200,12 +83,9 @@ namespace mongo {
     // -------
 
     Status ElemMatchObjectMatchExpression::init( const StringData& path, const MatchExpression* sub ) {
-        _path = path;
         _sub.reset( sub );
-        return Status::OK();
+        return initPath( path );
     }
-
-
 
     bool ElemMatchObjectMatchExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
         BSONObjIterator i( anArray );
@@ -225,7 +105,7 @@ namespace mongo {
 
     void ElemMatchObjectMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " $elemMatch\n";
+        debug << path() << " $elemMatch\n";
         _sub->debugString( debug, level + 1 );
     }
 
@@ -245,8 +125,7 @@ namespace mongo {
     }
 
     Status ElemMatchValueMatchExpression::init( const StringData& path ) {
-        _path = path;
-        return Status::OK();
+        return initPath( path );
     }
 
 
@@ -280,7 +159,7 @@ namespace mongo {
 
     void ElemMatchValueMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " $elemMatch\n";
+        debug << path() << " $elemMatch\n";
         for ( unsigned i = 0; i < _subs.size(); i++ ) {
             _subs[i]->debugString( debug, level + 1 );
         }
@@ -297,7 +176,9 @@ namespace mongo {
 
     Status AllElemMatchOp::init( const StringData& path ) {
         _path = path;
-        return Status::OK();
+        Status s = _elementPath.init( _path );
+        _elementPath.setTraverseLeafArray( false );
+        return s;
     }
 
     void AllElemMatchOp::add( const ArrayMatchingMatchExpression* expr ) {
@@ -306,16 +187,13 @@ namespace mongo {
     }
 
     bool AllElemMatchOp::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        BSONElementSet all;
-        doc->getFieldsDotted( _path, all, false );
-
-        for ( BSONElementSet::const_iterator i = all.begin(); i != all.end(); ++i ) {
-            BSONElement sub = *i;
-            if ( sub.type() != Array )
+        boost::scoped_ptr<ElementIterator> cursor( doc->getIterator( _elementPath ) );
+        while ( cursor->more() ) {
+            ElementIterator::Context e = cursor->next();
+            if ( e.element().type() != Array )
                 continue;
-            if ( _allMatch( sub.Obj() ) ) {
+            if ( _allMatch( e.element().Obj() ) )
                 return true;
-            }
         }
         return false;
     }
@@ -368,9 +246,8 @@ namespace mongo {
     // ---------
 
     Status SizeMatchExpression::init( const StringData& path, int size ) {
-        _path = path;
         _size = size;
-        return Status::OK();
+        return initPath( path );
     }
 
     bool SizeMatchExpression::matchesArray( const BSONObj& anArray, MatchDetails* details ) const {
@@ -381,7 +258,7 @@ namespace mongo {
 
     void SizeMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " $size : " << _size << "\n";
+        debug << path() << " $size : " << _size << "\n";
     }
 
     bool SizeMatchExpression::equivalent( const MatchExpression* other ) const {
@@ -389,7 +266,7 @@ namespace mongo {
             return false;
 
         const SizeMatchExpression* realOther = static_cast<const SizeMatchExpression*>( other );
-        return _path == realOther->_path && _size == realOther->_size;
+        return path() == realOther->path() && _size == realOther->_size;
     }
 
 

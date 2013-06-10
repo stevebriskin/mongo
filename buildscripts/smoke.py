@@ -196,8 +196,9 @@ class mongod(object):
             call(argv)
         utils.ensureDir(dir_name)
         argv = [mongod_executable, "--port", str(self.port), "--dbpath", dir_name]
-        # This should always be set for tests
-        argv += ['--setParameter', 'enableTestCommands=1']
+        # These parameters are alwas set for tests
+        # SERVER-9137 Added httpinterface parameter to keep previous behavior
+        argv += ['--setParameter', 'enableTestCommands=1', '--httpinterface']
         if self.kwargs.get('small_oplog'):
             argv += ["--master", "--oplogSize", "511"]
         if self.kwargs.get('small_oplog_rs'):
@@ -367,9 +368,6 @@ def skipTest(path):
     if small_oplog: # For tests running in parallel
         if basename in ["cursor8.js", "indexh.js", "dropdb.js", "connections_opened.js", "opcounters.js"]:
             return True
-        if os.sys.platform == "sunos5":
-            if basename == "geo_update_btree.js":
-                return True
     if auth or keyFile: # For tests running with auth
         # Skip any tests that run with auth explicitly
         if parentDir == "auth" or "auth" in basename:
@@ -694,6 +692,14 @@ def expand_suites(suites,expandUseDB=True):
             paths = ["firstExample", "secondExample", "whereExample", "authTest", "clientTest", "httpClientTest"]
             if os.sys.platform == "win32":
                 paths = [path + '.exe' for path in paths]
+
+            if not test_path:
+                # If we are testing 'in-tree', then add any files of the same name from the
+                # sharedclient directory. The out of tree client build doesn't have shared clients.
+                scpaths = ["sharedclient/" + path for path in paths]
+                scfiles = glob.glob("sharedclient/*")
+                paths += [scfile for scfile in scfiles if scfile in scpaths]
+
             # hack
             tests += [(test_path and path or os.path.join(mongo_repo, path), False) for path in paths]
         elif suite == 'mongosTest':

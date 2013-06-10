@@ -20,11 +20,17 @@
 
 #include <boost/thread/thread.hpp>
 
+#include "mongo/base/init.h"
 #include "mongo/base/initializer.h"
+#include "mongo/base/status.h"
 #include "mongo/client/connpool.h"
+#include "mongo/db/auth/authz_manager_external_state_s.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/initialize_server_global_state.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/client_info.h"
@@ -71,7 +77,7 @@ namespace mongo {
     string mongosCommand;
     bool dbexitCalled = false;
     static bool scriptingEnabled = true;
-    static bool noHttpInterface = false;
+    static bool httpInterface = false;
     static vector<string> configdbs;
 
     bool inShutdown() {
@@ -242,15 +248,19 @@ namespace mongo {
 
     void printShardingVersionInfo( bool out ) {
         if ( out ) {
-            cout << "MongoS version " << versionString << " starting: pid=" << getpid() << " port=" << cmdLine.port <<
-                    ( sizeof(int*) == 4 ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() << " (--help for usage)" << endl;
+            cout << "MongoS version " << versionString << " starting: pid=" <<
+                ProcessId::getCurrent() << " port=" << cmdLine.port <<
+                ( sizeof(int*) == 4 ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() <<
+                " (--help for usage)" << endl;
             DEV cout << "_DEBUG build" << endl;
             cout << "git version: " << gitVersion() << endl;
             cout <<  "build sys info: " << sysInfo() << endl;
         }
         else {
-            log() << "MongoS version " << versionString << " starting: pid=" << getpid() << " port=" << cmdLine.port <<
-                    ( sizeof( int* ) == 4 ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() << " (--help for usage)" << endl;
+            log() << "MongoS version " << versionString << " starting: pid=" <<
+                ProcessId::getCurrent() << " port=" << cmdLine.port <<
+                ( sizeof( int* ) == 4 ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() <<
+                " (--help for usage)" << endl;
             DEV log() << "_DEBUG build" << endl;
             printGitVersion();
             printSysInfo();
@@ -328,7 +338,7 @@ static bool runMongosServer( bool doUpgrade ) {
     CmdLine::launchOk();
 #endif
 
-    if ( !noHttpInterface )
+    if ( httpInterface )
         boost::thread web( boost::bind(&webServerThread, new NoAdminAccess() /* takes ownership */) );
 
     MessageServer::Options opts;
@@ -357,9 +367,6 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
     po::positional_options_description positional_options;
 
     CmdLine::addGlobalOptions( general_options, hidden_options, ssl_options );
-
-    general_options.add_options()
-    ("nohttpinterface", "disable http interface");
 
     hidden_options.add_options()
     ("noAutoSplit", "do not send split commands with writes");
@@ -454,8 +461,12 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
         scriptingEnabled = false;
     }
 
-    if (params.count("nohttpinterface")) {
-        noHttpInterface = true;
+    if (params.count("httpinterface")) {
+        if (params.count("nohttpinterface")) {
+            out() << "can't have both --httpinterface and --nohttpinterface" << endl;
+            ::_exit(EXIT_FAILURE);
+        }
+        httpInterface = true;
     }
 
     if (params.count("noAutoSplit")) {
@@ -539,6 +550,11 @@ namespace mongo {
     }
 }  // namespace mongo
 #endif
+
+MONGO_INITIALIZER(CreateAuthorizationManager)(InitializerContext* context) {
+    setGlobalAuthorizationManager(new AuthorizationManager(new AuthzManagerExternalStateMongos()));
+    return Status::OK();
+}
 
 int mongoSMain(int argc, char* argv[], char** envp) {
     static StaticObserver staticObserver;

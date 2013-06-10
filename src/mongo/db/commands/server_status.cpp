@@ -20,12 +20,15 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/platform/process_id.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
@@ -82,14 +85,14 @@ namespace mongo {
             BSONObjBuilder timeBuilder(256);
 
             const ClientBasic* myClientBasic = ClientBasic::getCurrent();
-            AuthorizationManager* authManager = myClientBasic->getAuthorizationManager();
+            AuthorizationSession* authSession = myClientBasic->getAuthorizationSession();
             
             // --- basic fields that are global
 
             result.append("host", prettyHostName() );
             result.append("version", versionString);
             result.append("process",cmdLine.binaryName);
-            result.append("pid", (int)getpid());
+            result.append("pid", ProcessId::getCurrent().asLongLong());
             result.append("uptime",(double) (time(0)-cmdLine.started));
             result.append("uptimeMillis", (long long)(curTimeMillis64()-_started));
             result.append("uptimeEstimate",(double) (start/1000));
@@ -104,7 +107,7 @@ namespace mongo {
                 
                 std::vector<Privilege> requiredPrivileges;
                 section->addRequiredPrivileges(&requiredPrivileges);
-                if (!authManager->checkAuthForPrivileges(requiredPrivileges).isOK())
+                if (!authSession->checkAuthForPrivileges(requiredPrivileges).isOK())
                     continue;
 
                 bool include = section->includeByDefault();
