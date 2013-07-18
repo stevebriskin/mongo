@@ -638,6 +638,11 @@ namespace mongo {
          */
         void next();
 
+        /**
+         * Rests the iterator to point to the first element (if there is a tag).
+         */
+        void reset();
+
         //
         // Getters
         //
@@ -664,6 +669,8 @@ namespace mongo {
          */
         bool equals(const TagSet& other) const;
 
+        const BSONArray& getTagBSON() const;
+
     private:
         /**
          * This is purposely undefined as the semantics for assignment can be
@@ -676,7 +683,7 @@ namespace mongo {
 
         // Important: do not re-order _tags & _tagIterator
         BSONArray _tags;
-        BSONArrayIteratorSorted _tagIterator;
+        scoped_ptr<BSONArrayIteratorSorted> _tagIterator;
     };
 
     struct ReadPreferenceSetting {
@@ -694,6 +701,8 @@ namespace mongo {
         inline bool equals(const ReadPreferenceSetting& other) const {
             return pref == other.pref && tags.equals(other.tags);
         }
+
+        BSONObj toBSON() const;
 
         const ReadPreference pref;
         TagSet tags;

@@ -20,9 +20,9 @@
 
 #include "mongo/db/btreecursor.h"
 #include "mongo/db/geo/geoquery.h"
+#include "mongo/db/geo/s2common.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index/s2_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/platform/unordered_set.h"
@@ -39,10 +39,6 @@ namespace mongo {
 
         // Not implemented.
         virtual Status seek(const BSONObj &position);
-        virtual Status seek(const vector<const BSONElement*>& position,
-                            const vector<bool>& inclusive);
-        virtual Status skip(const vector<const BSONElement*>& position,
-                            const vector<bool>& inclusive);
         Status setOptions(const CursorOptions& options);
 
         // Implemented:
@@ -120,6 +116,8 @@ namespace mongo {
         BSONObj _specForFRV;
 
         // Geo-related variables.
+        // At what min distance (arc length) do we start looking for results?
+        double _minDistance;
         // What's the max distance (arc length) we're willing to look for results?
         double _maxDistance;
 

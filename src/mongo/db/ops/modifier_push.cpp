@@ -54,12 +54,22 @@ namespace mongo {
             return true;
         }
 
-        Status parseEachMode(const BSONElement& modExpr,
+        Status parseEachMode(ModifierPush::ModifierPushMode pushMode,
+                             const BSONElement& modExpr,
                              BSONElement* eachElem,
                              BSONElement* sliceElem,
                              BSONElement* sortElem) {
 
             Status status = Status::OK();
+
+            // If in $pushAll mode, all we need is the array.
+            if (pushMode == ModifierPush::PUSH_ALL) {
+                if (modExpr.type() != Array) {
+                    return Status(ErrorCodes::BadValue, "$pushAll requires an array");
+                }
+                *eachElem = modExpr;
+                return Status::OK();
+            }
 
             // The $each clause must be an array.
             *eachElem = modExpr.embeddedObject()["$each"];
@@ -117,6 +127,18 @@ namespace mongo {
                 }
             }
 
+            if (seenSort) {
+                BSONObjIterator itEach(eachElem->embeddedObject());
+                while (itEach.more()) {
+                    BSONElement eachItem = itEach.next();
+                    if (eachItem.type() != Object) {
+                        return Status(
+                            ErrorCodes::BadValue,
+                            "$push like modifiers using $sort require all elements to be objects");
+                    }
+                }
+            }
+
             return Status::OK();
         }
 
@@ -145,7 +167,7 @@ namespace mongo {
 
     };
 
-    ModifierPush::ModifierPush()
+    ModifierPush::ModifierPush(ModifierPush::ModifierPushMode pushMode)
         : _fieldRef()
         , _posDollar(0)
         , _eachMode(false)
@@ -154,6 +176,7 @@ namespace mongo {
         , _slice(0)
         , _sortPresent(false)
         , _sort()
+        , _pushMode(pushMode)
         , _val() {
     }
 
@@ -174,8 +197,13 @@ namespace mongo {
             return status;
         }
 
-        // If a $-positional operator was used, get the index in which it occurred.
-        fieldchecker::isPositional(_fieldRef, &_posDollar);
+        // If a $-positional operator was used, get the index in which it occurred
+        // and ensure only one occurrence.
+        size_t foundCount;
+        bool foundDollar = fieldchecker::isPositional(_fieldRef, &_posDollar, &foundCount);
+        if (foundDollar && foundCount > 1) {
+            return Status(ErrorCodes::BadValue, "too many positional($) elements found.");
+        }
 
         //
         // value analysis
@@ -190,15 +218,37 @@ namespace mongo {
             if (! modExpr.Obj().okForStorage()) {
                 return Status(ErrorCodes::BadValue, "cannot use '$' or '.' as values");
             }
-            _val = modExpr;
+
+            if (_pushMode == PUSH_ALL) {
+                _eachMode = true;
+                Status status = parseEachMode(PUSH_ALL,
+                                              modExpr,
+                                              &_eachElem,
+                                              &sliceElem,
+                                              &sortElem);
+                if (!status.isOK()) {
+                    return status;
+                }
+            }
+            else {
+                _val = modExpr;
+            }
             break;
 
         case Object:
+            if (_pushMode == PUSH_ALL) {
+                return Status(ErrorCodes::BadValue, "$pushAll requires an array of values");
+            }
+
             // If any known clause ($each, $slice, or $sort) is present, we'd assume
             // we're using the $each variation of push and would parse accodingly.
             _eachMode = inEachMode(modExpr);
             if (_eachMode) {
-                Status status = parseEachMode(modExpr, &_eachElem, &sliceElem, &sortElem);
+                Status status = parseEachMode(PUSH_NORMAL,
+                                              modExpr,
+                                              &_eachElem,
+                                              &sliceElem,
+                                              &sortElem);
                 if (!status.isOK()) {
                     return status;
                 }
@@ -212,12 +262,20 @@ namespace mongo {
             break;
 
         default:
+            if (_pushMode == PUSH_ALL) {
+                return Status(ErrorCodes::BadValue, "$pushAll requires an array of values");
+            }
+
             _val = modExpr;
             break;
         }
 
         // Is slice present and correct?
         if (sliceElem.type() != EOO) {
+            if (_pushMode == PUSH_ALL) {
+                return Status(ErrorCodes::BadValue, "cannot use $slice in $pushAll");
+            }
+
             if (!sliceElem.isNumber()) {
                 return Status(ErrorCodes::BadValue, "$slice must be a numeric value");
             }
@@ -238,6 +296,10 @@ namespace mongo {
 
         // Is sort present and correct?
         if (sortElem.type() != EOO) {
+            if (_pushMode == PUSH_ALL) {
+                return Status(ErrorCodes::BadValue, "cannot use $sort in $pushAll");
+            }
+
             if (!_slicePresent) {
                 return Status(ErrorCodes::BadValue, "$sort requires $slice to be present");
             }
@@ -315,16 +377,18 @@ namespace mongo {
         }
         else if (status.isOK()) {
 
+            const bool destExists = (_preparedState->idxFound ==
+                                            static_cast<int32_t>(_fieldRef.numParts()-1));
             // If the path exists, we require the target field to be already an
             // array.
-            if (_preparedState->elemFound.getType() != Array) {
+            if (destExists && _preparedState->elemFound.getType() != Array) {
                 return Status(ErrorCodes::BadValue, "can only $push into arrays");
             }
 
             // If the $sort clause is being used, we require all the items in the array to be
             // objects themselves (as opposed to base types). This is a temporary restriction
             // that can be lifted once we support full sort semantics in $push.
-            if (_sortPresent) {
+            if (_sortPresent && destExists) {
                 mutablebson::Element curr = _preparedState->elemFound.leftChild();
                 while (curr.ok()) {
                     if (curr.getType() != Object) {
@@ -404,7 +468,7 @@ namespace mongo {
         // 2. Concatenate the two arrays together, either by going over the $each array or by
         // appending the (old style $push) element. Note that if we're the latter case, we
         // won't need to proceed to the $sort and $slice phases of the apply.
-        if (_eachMode) {
+        if (_eachMode || _pushMode == PUSH_ALL) {
             BSONObjIterator itEach(_eachElem.embeddedObject());
             while (itEach.more()) {
                 BSONElement eachItem = itEach.next();
@@ -463,28 +527,12 @@ namespace mongo {
             return Status(ErrorCodes::InternalError, "cannot create log entry for $push mod");
         }
 
-        // Then we create the {<fieldname>:[]} Element, that is, an empty array.
-        mutablebson::Element logElement = doc.makeElementArray(_fieldRef.dottedField());
+        // value for the logElement ("field.path.name": <value>)
+        mutablebson::Element logElement = logRoot.getDocument().makeElementWithNewFieldName(
+                                                            _fieldRef.dottedField(),
+                                                            _preparedState->elemFound);
         if (!logElement.ok()) {
             return Status(ErrorCodes::InternalError, "cannot create details for $push mod");
-        }
-
-        // Fill up the empty array.
-        mutablebson::Element curr = _preparedState->elemFound.leftChild();
-        while (curr.ok()) {
-
-            // We need to copy each array entry from the resulting document to the log
-            // document.
-            mutablebson::Element currCopy = doc.makeElementWithNewFieldName(StringData(),
-                                                                            curr.getValue());
-            if (!currCopy.ok()) {
-                return Status(ErrorCodes::InternalError, "could create copy element");
-            }
-            Status status = logElement.pushBack(currCopy);
-            if (!status.isOK()) {
-                return Status(ErrorCodes::BadValue, "could not append entry for $push log");
-            }
-            curr = curr.rightSibling();
         }
 
         // Now, we attach the {<fieldname>: [<filled array>]} Element under the {$set: ...}

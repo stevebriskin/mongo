@@ -1,7 +1,22 @@
 // Tests to see what validity checks are done for 10gen specific object construction
 
+// Takes a list of constructors and returns a new list with an extra entry for each constructor with
+// "new" prepended
+function addConstructorsWithNew (constructorList) {
+    function prependNew (constructor) {
+        return "new " + constructor;
+    }
+
+    var valid = constructorList.valid;
+    var invalid = constructorList.invalid;
+    // We use slice(0) here to make a copy of our lists
+    var validWithNew = valid.concat(valid.slice(0).map(prependNew));
+    var invalidWithNew = invalid.concat(invalid.slice(0).map(prependNew));
+    return { "valid" : validWithNew, "invalid" : invalidWithNew };
+}
+
 function clientEvalConstructorTest (constructorList) {
-    var i;
+    constructorList = addConstructorsWithNew(constructorList);
     constructorList.valid.forEach(function (constructor) {
         try {
             eval(constructor);
@@ -17,7 +32,7 @@ function clientEvalConstructorTest (constructorList) {
 }
 
 function dbEvalConstructorTest (constructorList) {
-    var i;
+    constructorList = addConstructorsWithNew(constructorList);
     constructorList.valid.forEach(function (constructor) {
         try {
             db.eval(constructor);
@@ -33,6 +48,7 @@ function dbEvalConstructorTest (constructorList) {
 }
 
 function mapReduceConstructorTest (constructorList) {
+    constructorList = addConstructorsWithNew(constructorList);
     t = db.mr_constructors;
     t.drop();
 
@@ -70,6 +86,7 @@ function mapReduceConstructorTest (constructorList) {
 }
 
 function whereConstructorTest (constructorList) {
+    constructorList = addConstructorsWithNew(constructorList);
     t = db.where_constructors;
     t.drop();
     t.insert({ x : 1 });
@@ -91,33 +108,31 @@ function whereConstructorTest (constructorList) {
 
 var dbrefConstructors = {
     "valid" : [
-            // SERVER-8961
-            //"DBRef()",
             "DBRef(\"namespace\", 0)",
             "DBRef(\"namespace\", \"test\")",
             "DBRef(\"namespace\", ObjectId())",
             "DBRef(\"namespace\", ObjectId(\"000000000000000000000000\"))",
-            "DBRef(true, ObjectId())"
         ],
     "invalid" : [
+            "DBRef()",
+            "DBRef(true, ObjectId())",
             "DBRef(\"namespace\")",
-            "DBRef(\"namespace\", ObjectId(), true)"
+            "DBRef(\"namespace\", ObjectId(), true)",
         ]
 }
 
 var dbpointerConstructors = {
     "valid" : [
-            // SERVER-8961
-            //"DBPointer(\"namespace\", 0)",
-            //"DBPointer(\"namespace\", \"test\")",
             "DBPointer(\"namespace\", ObjectId())",
             "DBPointer(\"namespace\", ObjectId(\"000000000000000000000000\"))",
-            "DBPointer(true, ObjectId())"
         ],
     "invalid" : [
             "DBPointer()",
+            "DBPointer(true, ObjectId())",
+            "DBPointer(\"namespace\", 0)",
+            "DBPointer(\"namespace\", \"test\")",
             "DBPointer(\"namespace\")",
-            "DBPointer(\"namespace\", ObjectId(), true)"
+            "DBPointer(\"namespace\", ObjectId(), true)",
         ]
 }
 
@@ -126,14 +141,10 @@ var objectidConstructors = {
     "valid" : [
         'ObjectId()',
         'ObjectId("FFFFFFFFFFFFFFFFFFFFFFFF")',
-        'new ObjectId()',
-        'new ObjectId("FFFFFFFFFFFFFFFFFFFFFFFF")'
         ],
     "invalid" : [
         'ObjectId(5)',
         'ObjectId("FFFFFFFFFFFFFFFFFFFFFFFQ")',
-        'new ObjectId(5)',
-        'new ObjectId("FFFFFFFFFFFFFFFFFFFFFFFQ")'
         ]
 }
 
@@ -141,41 +152,106 @@ var timestampConstructors = {
     "valid" : [
         'Timestamp()',
         'Timestamp(0,0)',
-        'new Timestamp()',
-        'new Timestamp(0,0)',
         'Timestamp(1.0,1.0)',
-        'new Timestamp(1.0,1.0)',
         ],
     "invalid" : [
         'Timestamp(0)',
         'Timestamp(0,0,0)',
-        'new Timestamp(0)',
-        'new Timestamp(0,0,0)',
         'Timestamp("test","test")',
         'Timestamp("test",0)',
         'Timestamp(0,"test")',
-        'new Timestamp("test","test")',
-        'new Timestamp("test",0)',
-        'new Timestamp(0,"test")',
         'Timestamp(true,true)',
         'Timestamp(true,0)',
         'Timestamp(0,true)',
-        'new Timestamp(true,true)',
-        'new Timestamp(true,0)',
-        'new Timestamp(0,true)'
         ]
 }
 
 var bindataConstructors = {
     "valid" : [
         'BinData(0,"test")',
-        //'BinData()', SERVER-8961
-        'new BinData(0,"test")',
-        //'new BinData()' SERVER-8961
         ],
     "invalid" : [
         'BinData(0,"test", "test")',
-        'new BinData(0,"test", "test")'
+        'BinData()',
+        'BinData(-1, "")',
+        'BinData(256, "")',
+        'BinData("string","aaaa")',
+        // SERVER-10152
+        //'BinData(0, true)',
+        //'BinData(0, null)',
+        //'BinData(0, undefined)',
+        //'BinData(0, {})',
+        //'BinData(0, [])',
+        //'BinData(0, function () {})',
+        ]
+}
+
+var uuidConstructors = {
+    "valid" : [
+        'UUID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")',
+        ],
+    "invalid" : [
+        'UUID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0)',
+        'UUID()',
+        'UUID("aa")',
+        'UUID("invalidhex")',
+        // SERVER-9686
+        //'UUID("invalidhexbutstilltherequiredlen")',
+        'UUID(true)',
+        'UUID(null)',
+        'UUID(undefined)',
+        'UUID({})',
+        'UUID([])',
+        'UUID(function () {})',
+        ]
+}
+
+var md5Constructors = {
+    "valid" : [
+        'MD5("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")',
+        ],
+    "invalid" : [
+        'MD5("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0)',
+        'MD5()',
+        'MD5("aa")',
+        'MD5("invalidhex")',
+        // SERVER-9686
+        //'MD5("invalidhexbutstilltherequiredlen")',
+        'MD5(true)',
+        'MD5(null)',
+        'MD5(undefined)',
+        'MD5({})',
+        'MD5([])',
+        'MD5(function () {})',
+        ]
+}
+
+var hexdataConstructors = {
+    "valid" : [
+        'HexData(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")',
+        // Numbers as the payload are converted to strings, so HexData(0, 100) == HexData(0, "100")
+        'HexData(0, 100)',
+        'HexData(0, "")',
+        'HexData(0, "aaa")',
+        'HexData(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")',
+        'HexData(0, "000000000000000000000005")', // SERVER-9605
+        ],
+    "invalid" : [
+        'HexData(0, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0)',
+        'HexData()',
+        'HexData(0)',
+        'HexData(-1, "")',
+        'HexData(256, "")',
+        'HexData("string","aaaa")',
+        // SERVER-10152
+        //'HexData(0, true)',
+        //'HexData(0, null)',
+        //'HexData(0, undefined)',
+        //'HexData(0, {})',
+        //'HexData(0, [])',
+        //'HexData(0, function () {})',
+        // SERVER-9686
+        //'HexData(0, "invalidhex")',
         ]
 }
 
@@ -186,12 +262,6 @@ var dateConstructors = {
         'Date(0,0)',
         'Date(0,0,0)',
         'Date("foo")',
-        'new Date()',
-        'new Date(0)',
-        'new Date(0,0)',
-        'new Date(0,0,0)',
-        'new Date(0,0,0,0)',
-        'new Date("foo")'
         ],
     "invalid" : [
         ]
@@ -202,6 +272,9 @@ clientEvalConstructorTest(dbpointerConstructors);
 clientEvalConstructorTest(objectidConstructors);
 clientEvalConstructorTest(timestampConstructors);
 clientEvalConstructorTest(bindataConstructors);
+clientEvalConstructorTest(uuidConstructors);
+clientEvalConstructorTest(md5Constructors);
+clientEvalConstructorTest(hexdataConstructors);
 clientEvalConstructorTest(dateConstructors);
 
 dbEvalConstructorTest(dbrefConstructors);
@@ -209,6 +282,9 @@ dbEvalConstructorTest(dbpointerConstructors);
 dbEvalConstructorTest(objectidConstructors);
 dbEvalConstructorTest(timestampConstructors);
 dbEvalConstructorTest(bindataConstructors);
+dbEvalConstructorTest(uuidConstructors);
+dbEvalConstructorTest(md5Constructors);
+dbEvalConstructorTest(hexdataConstructors);
 dbEvalConstructorTest(dateConstructors);
 
 // SERVER-8963
@@ -218,6 +294,9 @@ if (db.runCommand({buildinfo:1}).javascriptEngine == "V8") {
     mapReduceConstructorTest(objectidConstructors);
     mapReduceConstructorTest(timestampConstructors);
     mapReduceConstructorTest(bindataConstructors);
+    mapReduceConstructorTest(uuidConstructors);
+    mapReduceConstructorTest(md5Constructors);
+    mapReduceConstructorTest(hexdataConstructors);
 }
 mapReduceConstructorTest(dateConstructors);
 
@@ -228,5 +307,8 @@ if (db.runCommand({buildinfo:1}).javascriptEngine == "V8") {
     whereConstructorTest(objectidConstructors);
     whereConstructorTest(timestampConstructors);
     whereConstructorTest(bindataConstructors);
+    whereConstructorTest(uuidConstructors);
+    whereConstructorTest(md5Constructors);
+    whereConstructorTest(hexdataConstructors);
 }
 whereConstructorTest(dateConstructors);

@@ -29,7 +29,7 @@
 #include "mongo/db/index_builder.h"
 #include "mongo/db/index_update.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/bgsync.h"
@@ -229,9 +229,7 @@ namespace mongo {
 
         append_O_Obj(r->data(), partial, obj);
 
-        if ( logLevel >= 6 ) {
-            LOG( 6 ) << "logOp:" << BSONObj::make(r) << endl;
-        }
+        LOG( 6 ) << "logOp:" << BSONObj::make(r) << endl;
     }
 
     static void _logOpOld(const char *opstr, const char *ns, const char *logNS, const BSONObj& obj, BSONObj *o2, bool *bb, bool fromMigrate ) {
@@ -393,6 +391,10 @@ namespace mongo {
                 double fivePct = free * 0.05;
                 if ( fivePct > sz )
                     sz = fivePct;
+                // we use 5% of free space up to 50GB (1TB free)
+                double upperBound = 50.0 * 1024 * 1024 * 1024;
+                if (fivePct > upperBound)
+                    sz = upperBound;
 #endif
             }
         }
@@ -552,10 +554,10 @@ namespace mongo {
                 verify( opType[1] == 'b' ); // "db" advertisement
         }
         else if ( *opType == 'c' ) {
-            opCounters->gotCommand();
             BufBuilder bb;
             BSONObjBuilder ob;
             _runCommands(ns, o, bb, ob, true, 0);
+            // _runCommands takes care of adjusting opcounters for command counting.
         }
         else if ( *opType == 'n' ) {
             // no op

@@ -23,7 +23,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/principal_set.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/databaseholder.h"
+#include "mongo/db/database_holder.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pdfile.h"
@@ -68,7 +68,7 @@ namespace {
     static void _profile(const Client& c, CurOp& currentOp, BufBuilder& profileBufBuilder) {
         Database *db = c.database();
         DEV verify( db );
-        const char *ns = db->profileName.c_str();
+        const char *ns = db->getProfilingNS();
 
         // build object
         BSONObjBuilder b(profileBufBuilder);
@@ -140,21 +140,21 @@ namespace {
 
     NamespaceDetails* getOrCreateProfileCollection(Database *db, bool force, string* errmsg ) {
         fassert(16372, db);
-        const char* profileName = db->profileName.c_str();
-        NamespaceDetails* details = db->namespaceIndex.details(profileName);
+        const char* profileName = db->getProfilingNS();
+        NamespaceDetails* details = db->namespaceIndex().details(profileName);
         if (!details && (cmdLine.defaultProfile || force)) {
             // system.profile namespace doesn't exist; create it
             log() << "creating profile collection: " << profileName << endl;
             string myerrmsg;
-            if (!userCreateNS(db->profileName.c_str(),
+            if (!userCreateNS(profileName,
                               BSON("capped" << true << "size" << 1024 * 1024), myerrmsg , false)) {
-                myerrmsg = str::stream() << "could not create ns " << db->profileName << ": " << myerrmsg;
+                myerrmsg = str::stream() << "could not create ns " << profileName << ": " << myerrmsg;
                 log() << myerrmsg << endl;
                 if ( errmsg )
                     *errmsg = myerrmsg;
                 return NULL;
             }
-            details = db->namespaceIndex.details(profileName);
+            details = db->namespaceIndex().details(profileName);
         }
         else if ( details && !details->isCapped() ) {
             string myerrmsg = str::stream() << profileName << " exists but isn't capped";

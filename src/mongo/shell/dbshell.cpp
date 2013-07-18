@@ -28,6 +28,9 @@
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/cmdline.h"
 #include "mongo/db/repl/rs_member.h"
+#include "mongo/logger/console_appender.h"
+#include "mongo/logger/logger.h"
+#include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/shell/linenoise.h"
 #include "mongo/shell/shell_utils.h"
@@ -126,11 +129,16 @@ void shellHistoryAdd( const char * line ) {
         return;
     lastLine = line;
 
-    // We don't want any .auth() or .addUser() commands added, but we want to
+    // We don't want any .auth() or .addUser() shell helpers added, but we want to
     // be able to add things like `.author`, so be smart about how this is
     // detected by using regular expresions.
-    static pcrecpp::RE hiddenCommands("\\.(auth|addUser)\\s*\\(");
-    if (!hiddenCommands.PartialMatch(line))
+    static pcrecpp::RE hiddenHelpers(
+            "\\.(auth|addUser|updateUser|changeUserPassword)\\s*\\(");
+    // Also don't want the raw user management commands to show in the shell when run directly
+    // via runCommand.
+    static pcrecpp::RE hiddenCommands(
+                "(run|admin)Command\\s*\\(\\s*{\\s*(createUser|updateUser)\\s*:");
+    if (!hiddenHelpers.PartialMatch(line) && !hiddenCommands.PartialMatch(line))
     {
         linenoiseHistoryAdd( line );
     }
@@ -674,6 +682,7 @@ int _main( int argc, char* argv[], char **envp ) {
     std::string sslPEMKeyFile;
     std::string sslPEMKeyPassword;
     std::string sslCAFile;
+    std::string sslCRLFile;
 
     bool runShell = false;
     bool nodb = false;
@@ -712,6 +721,9 @@ int _main( int argc, char* argv[], char **envp ) {
     ( "sslPEMKeyFile", po::value<std::string>(&sslPEMKeyFile), "PEM certificate/key file for SSL" )
     ( "sslPEMKeyPassword", po::value<std::string>(&sslPEMKeyFile), 
       "password for key in PEM file for SSL" )
+    ( "sslCRLFile", po::value<std::string>(&sslCRLFile),
+      "Certificate Revocation List file for SSL")
+    ( "sslFIPSMode", "activate FIPS 140-2 mode at startup")
 #endif
     ;
 
@@ -794,6 +806,12 @@ int _main( int argc, char* argv[], char **envp ) {
     if (params.count("sslCAFile")) {
         mongo::cmdLine.sslCAFile = params["sslCAFile"].as<std::string>();
     }
+    if (params.count("sslCRLFile")) {
+        mongo::cmdLine.sslCRLFile = params["sslCRLFile"].as<std::string>();
+    }
+    if (params.count( "sslFIPSMode")) {
+        mongo::cmdLine.sslFIPSMode = true;
+    }
 #endif
     if ( params.count( "nokillop" ) ) {
         mongo::shell_utils::_nokillop = true;
@@ -829,7 +847,7 @@ int _main( int argc, char* argv[], char **envp ) {
         mongo::enableIPv6();
     }
     if ( params.count( "verbose" ) ) {
-        logLevel = 1;
+        logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
     }
 
     if ( url == "*" ) {
@@ -843,6 +861,11 @@ int _main( int argc, char* argv[], char **envp ) {
 
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     mongo::StartupTest::runTests();
+
+    logger::globalLogManager()->getNamedDomain("javascriptOutput")->attachAppender(
+            logger::MessageLogDomain::AppenderAutoPtr(
+                    new logger::ConsoleAppender<logger::MessageEventEphemeral>(
+                            new logger::MessageEventUnadornedEncoder)));
 
     if ( !nodb ) { // connect to db
         //if ( ! mongo::cmdLine.quiet ) cout << "url: " << url << endl;
@@ -907,8 +930,8 @@ int _main( int argc, char* argv[], char **envp ) {
 #ifndef _WIN32
     rcGlobalLocation = "/etc/mongorc.js" ;
 #else
-	wchar_t programDataPath[MAX_PATH];
-	if ( S_OK == SHGetFolderPathW(NULL,
+    wchar_t programDataPath[MAX_PATH];
+    if ( S_OK == SHGetFolderPathW(NULL,
                                 CSIDL_COMMON_APPDATA,
                                 NULL,
                                 0,
@@ -935,7 +958,7 @@ int _main( int argc, char* argv[], char **envp ) {
         if ( files.size() > 1 )
             cout << "loading file: " << files[i] << endl;
 
-        if ( ! scope->execFile( files[i] , false , true , false ) ) {
+        if ( ! scope->execFile( files[i] , false , true ) ) {
             cout << "failed to load: " << files[i] << endl;
             return -3;
         }

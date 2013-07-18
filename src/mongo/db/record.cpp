@@ -19,7 +19,7 @@
 #include "pch.h"
 #include "mongo/base/init.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/databaseholder.h"
+#include "mongo/db/database_holder.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/record.h"
@@ -190,7 +190,7 @@ namespace mongo {
                 if ( rarely_count++ % ( 2048 / BigHashSize ) == 0 ) {
                     long long now = Listener::getElapsedTimeMillis();
                     RARELY if ( now == 0 ) {
-                        tlog() << "warning Listener::getElapsedTimeMillis returning 0ms" << endl;
+                        MONGO_TLOG(0) << "warning Listener::getElapsedTimeMillis returning 0ms" << endl;
                     }
                     
                     if ( now - _lastRotate > ( 1000 * RotateTimeSecs ) ) {

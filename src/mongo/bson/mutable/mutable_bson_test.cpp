@@ -21,11 +21,9 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
+#include "mongo/bson/mutable/damage_vector.h"
 #include "mongo/db/json.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/timer.h"
-
-#include "mongo/client/dbclientinterface.h"
 
 namespace {
 
@@ -324,6 +322,113 @@ namespace {
         ASSERT_EQUALS("e5", e3.rightChild().getFieldName());
     }
 
+    TEST(TopologyBuilding, CantAddAttachedAsLeftSibling) {
+        mmb::Document doc;
+        ASSERT_OK(doc.root().appendString("foo", "foo"));
+        mmb::Element foo = doc.root().rightChild();
+        ASSERT_TRUE(foo.ok());
+        ASSERT_OK(doc.root().appendString("bar", "bar"));
+        mmb::Element bar = doc.root().rightChild();
+        ASSERT_TRUE(bar.ok());
+        ASSERT_NOT_OK(foo.addSiblingLeft(bar));
+    }
+
+    TEST(TopologyBuilding, CantAddAttachedAsRightSibling) {
+        mmb::Document doc;
+        ASSERT_OK(doc.root().appendString("foo", "foo"));
+        mmb::Element foo = doc.root().rightChild();
+        ASSERT_TRUE(foo.ok());
+        ASSERT_OK(doc.root().appendString("bar", "bar"));
+        mmb::Element bar = doc.root().rightChild();
+        ASSERT_TRUE(bar.ok());
+        ASSERT_NOT_OK(foo.addSiblingRight(bar));
+    }
+
+    TEST(TopologyBuilding, CantAddAttachedAsChild) {
+        mmb::Document doc;
+        mmb::Element foo = doc.makeElementObject("foo");
+        ASSERT_TRUE(foo.ok());
+        ASSERT_OK(doc.root().pushBack(foo));
+        ASSERT_OK(doc.root().appendString("bar", "bar"));
+        mmb::Element bar = doc.root().rightChild();
+        ASSERT_TRUE(bar.ok());
+        ASSERT_NOT_OK(foo.pushFront(bar));
+        ASSERT_NOT_OK(foo.pushBack(bar));
+    }
+
+    TEST(TopologyBuilding, CantAddChildrenToNonObject) {
+        mmb::Document doc;
+        ASSERT_OK(doc.root().appendString("foo", "bar"));
+        mmb::Element foo = doc.root().rightChild();
+        ASSERT_TRUE(foo.ok());
+        mmb::Element bar = doc.makeElementString("bar", "bar");
+        ASSERT_TRUE(bar.ok());
+        ASSERT_NOT_OK(foo.pushFront(bar));
+        ASSERT_NOT_OK(foo.pushBack(bar));
+    }
+
+    TEST(TopologyBuilding, CantAddLeftSiblingToDetached) {
+        mmb::Document doc;
+        ASSERT_OK(doc.root().appendString("foo", "foo"));
+        mmb::Element foo = doc.root().rightChild();
+        ASSERT_TRUE(foo.ok());
+        ASSERT_OK(foo.remove());
+        ASSERT_FALSE(foo.parent().ok());
+        mmb::Element bar = doc.makeElementString("bar", "bar");
+        ASSERT_TRUE(bar.ok());
+        ASSERT_NOT_OK(foo.addSiblingLeft(bar));
+    }
+
+    TEST(TopologyBuilding, CantAddRightSiblingToDetached) {
+        mmb::Document doc;
+        ASSERT_OK(doc.root().appendString("foo", "foo"));
+        mmb::Element foo = doc.root().rightChild();
+        ASSERT_TRUE(foo.ok());
+        ASSERT_OK(foo.remove());
+        ASSERT_FALSE(foo.parent().ok());
+        mmb::Element bar = doc.makeElementString("bar", "bar");
+        ASSERT_TRUE(bar.ok());
+        ASSERT_NOT_OK(foo.addSiblingRight(bar));
+    }
+
+    TEST(TopologyBuilding, AddSiblingLeftIntrusion) {
+        mmb::Document doc;
+        ASSERT_OK(doc.root().appendString("first", "first"));
+        mmb::Element first = doc.root().rightChild();
+        ASSERT_TRUE(first.ok());
+        ASSERT_OK(doc.root().appendString("last", "last"));
+        mmb::Element last = doc.root().rightChild();
+        ASSERT_TRUE(last.ok());
+
+        ASSERT_EQUALS(first, last.leftSibling());
+        ASSERT_EQUALS(last, first.rightSibling());
+
+        mmb::Element middle = doc.makeElementString("middle", "middle");
+        ASSERT_TRUE(middle.ok());
+        ASSERT_OK(last.addSiblingLeft(middle));
+
+        ASSERT_EQUALS(middle, first.rightSibling());
+        ASSERT_EQUALS(middle, last.leftSibling());
+
+        ASSERT_EQUALS(first, middle.leftSibling());
+        ASSERT_EQUALS(last, middle.rightSibling());
+    }
+
+    TEST(TopologyBuilding, AddSiblingRightIntrusion) {
+        mmb::Document doc;
+        ASSERT_OK(doc.root().appendString("first", "first"));
+        mmb::Element first = doc.root().rightChild();
+        ASSERT_TRUE(first.ok());
+        ASSERT_OK(doc.root().appendString("last", "last"));
+        mmb::Element last = doc.root().rightChild();
+        ASSERT_TRUE(last.ok());
+        mmb::Element middle = doc.makeElementString("middle", "middle");
+        ASSERT_TRUE(middle.ok());
+        ASSERT_OK(first.addSiblingRight(middle));
+        ASSERT_EQUALS(first, middle.leftSibling());
+        ASSERT_EQUALS(last, middle.rightSibling());
+    }
+
     TEST(ArrayAPI, SimpleNumericArray) {
         /*
                 { a : [] }                  create
@@ -411,10 +516,7 @@ namespace {
         ASSERT_EQUALS(size_t(1), mmb::countChildren(e1));
         ASSERT_EQUALS(20, e1[0].getValueInt());
 
-        mmb::Element e8 = doc.makeElementInt("", 100);
-        ASSERT_EQUALS(100, e8.getValueInt());
-        ASSERT_EQUALS(e1[0].setValueElement(&e8), mongo::Status::OK());
-        ASSERT_EQUALS(100, e8.getValueInt());
+        ASSERT_EQUALS(e1[0].setValueInt(100), mongo::Status::OK());
         ASSERT_EQUALS(100, e1[0].getValueInt());
         ASSERT_EQUALS(100, e1.leftChild().getValueInt());
         ASSERT_EQUALS(size_t(1), mmb::countChildren(e1));
@@ -478,7 +580,7 @@ namespace {
         docChild = docChild.rightSibling();
         ASSERT_TRUE(docChild.ok());
         ASSERT_TRUE(iter.more());
-        ASSERT_EQUALS(iter.next().toString(), docChild.toString());
+        ASSERT_EQUALS(iter.next().toString(), mmb::ConstElement(docChild).toString());
 
         // 'c'
         docChild = docChild.rightSibling();
@@ -696,12 +798,12 @@ namespace {
 
         static const char inJson[] =
             "{"
-            "  'whale': { 'alive': true, 'dv': -9.8, 'height': 50, attrs : [ 'big' ] },"
-            "  'petunias': { 'alive': true, 'dv': -9.8, 'height': 50 } "
+            "  'whale': { 'alive': true, 'dv': -9.8, 'height': 50.0, attrs : [ 'big' ] },"
+            "  'petunias': { 'alive': true, 'dv': -9.8, 'height': 50.0 } "
             "}";
         mongo::BSONObj obj = mongo::fromjson(inJson);
 
-        // Create a new document representing bacBSONObj with the above contents.
+        // Create a new document representing BSONObj with the above contents.
         mmb::Document doc(obj);
 
         // The whale hits the planet and dies.
@@ -711,26 +813,26 @@ namespace {
         mmb::Element whale_deltav = mmb::findFirstChildNamed(whale, "dv");
         ASSERT_TRUE(whale_deltav.ok());
         // Set the dv field to zero.
-        whale_deltav.setValueDouble(0.0);
+        ASSERT_OK(whale_deltav.setValueDouble(0.0));
         // Find the 'height' field in the whale.
         mmb::Element whale_height = mmb::findFirstChildNamed(whale, "height");
         ASSERT_TRUE(whale_height.ok());
         // Set the height field to zero.
-        whale_deltav.setValueDouble(0);
+        ASSERT_OK(whale_height.setValueDouble(0));
         // Find the 'alive' field, and set it to false.
         mmb::Element whale_alive = mmb::findFirstChildNamed(whale, "alive");
         ASSERT_TRUE(whale_alive.ok());
-        whale_alive.setValueBool(false);
+        ASSERT_OK(whale_alive.setValueBool(false));
 
         // The petunias survive, update its fields much like we did above.
         mmb::Element petunias = mmb::findFirstChildNamed(doc.root(), "petunias");
         ASSERT_TRUE(petunias.ok());
         mmb::Element petunias_deltav = mmb::findFirstChildNamed(petunias, "dv");
         ASSERT_TRUE(petunias_deltav.ok());
-        petunias_deltav.setValueDouble(0.0);
+        ASSERT_OK(petunias_deltav.setValueDouble(0.0));
         mmb::Element petunias_height = mmb::findFirstChildNamed(petunias, "height");
         ASSERT_TRUE(petunias_height.ok());
-        petunias_deltav.setValueDouble(0);
+        ASSERT_OK(petunias_height.setValueDouble(0));
 
         // Replace the whale by its wreckage, saving only its attributes:
         // Construct a new mongo::Object element for the ex-whale.
@@ -739,17 +841,113 @@ namespace {
         // Find the attributes of the old 'whale' element.
         mmb::Element whale_attrs = mmb::findFirstChildNamed(whale, "attrs");
         // Remove the attributes from the whale (they remain valid, but detached).
-        whale_attrs.remove();
+        ASSERT_OK(whale_attrs.remove());
         // Insert the attributes into the ex-whale.
-        ex_whale.pushBack(whale_attrs);
+        ASSERT_OK(ex_whale.pushBack(whale_attrs));
         // Remove the whale object.
-        whale.remove();
+        ASSERT_OK(whale.remove());
 
         static const char outJson[] =
             "{"
-            "    'petunias': { 'alive': true, 'dv': 0.0, 'height': 50 },"
+            "    'petunias': { 'alive': true, 'dv': 0.0, 'height': 0 },"
             "    'ex-whale': { 'attrs': [ 'big' ] } })"
             "}";
+
+        mongo::BSONObjBuilder builder;
+        doc.writeTo(&builder);
+        ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    }
+
+    namespace {
+        void apply(mongo::BSONObj* obj, const mmb::DamageVector& damages, const char* source) {
+            const mmb::DamageVector::const_iterator end = damages.end();
+            mmb::DamageVector::const_iterator where = damages.begin();
+            char* const target = const_cast<char *>(obj->objdata());
+            for ( ; where != end; ++where ) {
+                std::memcpy(
+                    target + where->targetOffset,
+                    source + where->sourceOffset,
+                    where->size);
+            }
+        }
+    } // namespace
+
+    TEST(Documentation, Example2InPlaceWithDamageVector) {
+
+        static const char inJson[] =
+            "{"
+            "  'whale': { 'alive': true, 'dv': -9.8, 'height': 50.0, attrs : [ 'big' ] },"
+            "  'petunias': { 'alive': true, 'dv': -9.8, 'height': 50.0 } "
+            "}";
+
+        // Make the object, and make a copy for reference.
+        mongo::BSONObj obj = mongo::fromjson(inJson);
+        const mongo::BSONObj copyOfObj = obj.getOwned();
+        ASSERT_EQUALS(obj, copyOfObj);
+
+        // Create a new document representing BSONObj with the above contents.
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_EQUALS(obj, doc);
+        ASSERT_EQUALS(copyOfObj, doc);
+
+        // Enable in-place mutation for this document
+        ASSERT_EQUALS(mmb::Document::kInPlaceEnabled, doc.getCurrentInPlaceMode());
+
+        // The whale hits the planet and dies.
+        mmb::Element whale = mmb::findFirstChildNamed(doc.root(), "whale");
+        ASSERT_TRUE(whale.ok());
+        // Find the 'dv' field in the whale.
+        mmb::Element whale_deltav = mmb::findFirstChildNamed(whale, "dv");
+        ASSERT_TRUE(whale_deltav.ok());
+        // Set the dv field to zero.
+        ASSERT_OK(whale_deltav.setValueDouble(0.0));
+        // Find the 'height' field in the whale.
+        mmb::Element whale_height = mmb::findFirstChildNamed(whale, "height");
+        ASSERT_TRUE(whale_height.ok());
+        // Set the height field to zero.
+        ASSERT_OK(whale_height.setValueDouble(0));
+        // Find the 'alive' field, and set it to false.
+        mmb::Element whale_alive = mmb::findFirstChildNamed(whale, "alive");
+        ASSERT_TRUE(whale_alive.ok());
+        ASSERT_OK(whale_alive.setValueBool(false));
+
+        // The petunias survive, update its fields much like we did above.
+        mmb::Element petunias = mmb::findFirstChildNamed(doc.root(), "petunias");
+        ASSERT_TRUE(petunias.ok());
+        mmb::Element petunias_deltav = mmb::findFirstChildNamed(petunias, "dv");
+        ASSERT_TRUE(petunias_deltav.ok());
+        ASSERT_OK(petunias_deltav.setValueDouble(0.0));
+        mmb::Element petunias_height = mmb::findFirstChildNamed(petunias, "height");
+        ASSERT_TRUE(petunias_height.ok());
+        ASSERT_OK(petunias_height.setValueDouble(0));
+
+        // Demonstrate that while the document has changed, the underlying BSONObj has not yet
+        // changed.
+        ASSERT_FALSE(obj == doc);
+        ASSERT_EQUALS(copyOfObj, obj);
+
+        // Ensure that in-place updates are still enabled.
+        ASSERT_EQUALS(mmb::Document::kInPlaceEnabled, doc.getCurrentInPlaceMode());
+
+        // Extract the damage events
+        mmb::DamageVector damages;
+        const char* source = NULL;
+        size_t size = 0;
+        ASSERT_EQUALS(true, doc.getInPlaceUpdates(&damages, &source, &size));
+        ASSERT_NOT_EQUALS(0U, damages.size());
+        ASSERT_NOT_EQUALS(static_cast<const char*>(NULL), source);
+        ASSERT_NOT_EQUALS(0U, size);
+
+        apply(&obj, damages, source);
+
+        static const char outJson[] =
+            "{"
+            "  'whale': { 'alive': false, 'dv': 0, 'height': 0, attrs : [ 'big' ] },"
+            "  'petunias': { 'alive': true, 'dv': 0, 'height': 0 } "
+            "}";
+        mongo::BSONObj outObj = mongo::fromjson(outJson);
+
+        ASSERT_EQUALS(outObj, doc);
 
         mongo::BSONObjBuilder builder;
         doc.writeTo(&builder);
@@ -1206,6 +1404,28 @@ namespace {
         ASSERT_EQUALS(obj.toString(), doc.toString());
     }
 
+    TEST(Document, toStringEphemeralObject) {
+        mmb::Document doc;
+        mmb::Element e = doc.makeElementObject("foo");
+        ASSERT_OK(doc.root().pushBack(e));
+        ASSERT_OK(e.appendDouble("d", 1.0));
+        ASSERT_OK(e.appendString("s", "str"));
+        ASSERT_EQUALS(
+            mongo::fromjson("{ foo: { d : 1.0, s : 'str' } }").firstElement().toString(),
+            e.toString());
+    }
+
+    TEST(Document, toStringEphemeralArray) {
+        mmb::Document doc;
+        mmb::Element e = doc.makeElementArray("foo");
+        ASSERT_OK(doc.root().pushBack(e));
+        ASSERT_OK(e.appendDouble(mongo::StringData(), 1.0));
+        ASSERT_OK(e.appendString(mongo::StringData(), "str"));
+        ASSERT_EQUALS(
+            mongo::fromjson("{ foo: [ 1.0, 'str' ] }").firstElement().toString(),
+            e.toString());
+    }
+
     TEST(Document, ElementCloningToDifferentDocument) {
 
         const char initial[] = "{ a : 1, b : [ 1, 2, 3 ], c : { 'c' : 'c' }, d : [ 4, 5, 6 ] }";
@@ -1329,6 +1549,1233 @@ namespace {
         ASSERT_EQUALS(mongo::fromjson(expected), doc);
     }
 
+    TEST(Element, PopOpsOnEmpty) {
+        mmb::Document doc;
+        mmb::Element root = doc.root();
+        ASSERT_NOT_OK(root.popFront());
+        ASSERT_NOT_OK(root.popBack());
+    }
 
-} // namespacem
+    TEST(Document, NameOfRootElementIsEmpty) {
+        mmb::Document doc;
+        // NOTE: You really shouldn't rely on this behavior; this test is mostly for coverage.
+        ASSERT_EQUALS(mongo::StringData(), doc.root().getFieldName());
+    }
 
+    TEST(Document, SetValueOnRootFails) {
+        mmb::Document doc;
+        ASSERT_NOT_OK(doc.root().setValueInt(5));
+    }
+
+    TEST(Document, ValueOfEphemeralObjectElementIsEmpty) {
+        mmb::Document doc;
+        mmb::Element root = doc.root();
+        mmb::Element ephemeralObject = doc.makeElementObject("foo");
+        ASSERT_OK(root.pushBack(ephemeralObject));
+        ASSERT_FALSE(ephemeralObject.hasValue());
+        // NOTE: You really shouldn't rely on this behavior; this test is mostly for coverage.
+        ASSERT_EQUALS(mongo::BSONElement(), ephemeralObject.getValue());
+    }
+
+    TEST(Element, RemovingRemovedElementFails) {
+        // Once an Element is removed, you can't remove it again until you re-attach it
+        // somewhere. However, its children are still manipulable.
+        mmb::Document doc(mongo::fromjson("{ a : { b : 'c' } }"));
+        mmb::Element a = doc.root().leftChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_OK(a.remove());
+        ASSERT_NOT_OK(a.remove());
+        mmb::Element b = a.leftChild();
+        ASSERT_OK(b.remove());
+        ASSERT_NOT_OK(b.remove());
+        ASSERT_OK(a.pushBack(b));
+        ASSERT_OK(b.remove());
+    }
+
+    namespace {
+        // Checks that two BSONElements are byte-for-byte identical.
+        bool identical(const mongo::BSONElement& lhs, const mongo::BSONElement& rhs) {
+            if (lhs.size() != rhs.size())
+                return false;
+            return std::memcmp(lhs.rawdata(), rhs.rawdata(), lhs.size()) == 0;
+        }
+    } // namespace
+
+    TEST(TypeSupport, EncodingEquivalenceDouble) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const double value1 = 3.1415926;
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::NumberDouble);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendDouble(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::NumberDouble);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueDouble());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::NumberDouble);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueDouble(value1);
+        ASSERT_EQUALS(c.getType(), mongo::NumberDouble);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceString) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const std::string value1 = "value1";
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::String);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendString(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::String);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueString());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::String);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueString(value1);
+        ASSERT_EQUALS(c.getType(), mongo::String);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceObject) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const mongo::BSONObj value1 = mongo::fromjson("{ a : 1, b : 2.0, c : 'hello' }");
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::Object);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendObject(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::Object);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueObject());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::Object);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueObject(value1);
+        ASSERT_EQUALS(c.getType(), mongo::Object);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceArray) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const mongo::BSONObj dummy = (mongo::fromjson("{ x : [ 1, 2.0, 'hello' ] } "));
+        const mongo::BSONArray value1(dummy.firstElement().embeddedObject());
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::Array);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendArray(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::Array);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueArray());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::Array);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueArray(value1);
+        ASSERT_EQUALS(c.getType(), mongo::Array);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceBinary) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const mongo::BinDataType value1 = mongo::newUUID;
+        const unsigned char value2[] = {
+            0x00, 0x9D, 0x15, 0xA3,
+            0x3B, 0xCC, 0x46, 0x60,
+            0x90, 0x45, 0xEF, 0x54,
+            0x77, 0x8A, 0x87, 0x0C
+        };
+        builder.appendBinData(name, sizeof(value2), value1, &value2[0]);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::BinData);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendBinary(name, sizeof(value2), value1, &value2[0]));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::BinData);
+        ASSERT_TRUE(a.hasValue());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::BinData);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueBinary(sizeof(value2), value1, &value2[0]);
+        ASSERT_EQUALS(c.getType(), mongo::BinData);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceUndefined) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        builder.appendUndefined(name);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::Undefined);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendUndefined(name));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::Undefined);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_TRUE(mmb::ConstElement(a).isValueUndefined());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::Undefined);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueUndefined();
+        ASSERT_EQUALS(c.getType(), mongo::Undefined);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceOID) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const mongo::OID value1 = mongo::OID::gen();
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::jstOID);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendOID(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::jstOID);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueOID());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::jstOID);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueOID(value1);
+        ASSERT_EQUALS(c.getType(), mongo::jstOID);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceBoolean) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const bool value1 = true;
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::Bool);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendBool(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::Bool);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueBool());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::Bool);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueBool(value1);
+        ASSERT_EQUALS(c.getType(), mongo::Bool);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceDate) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const mongo::Date_t value1 = mongo::jsTime();
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::Date);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendDate(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::Date);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueDate());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::Date);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueDate(value1);
+        ASSERT_EQUALS(c.getType(), mongo::Date);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceNull) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        builder.appendNull(name);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::jstNULL);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::jstNULL);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_TRUE(mmb::ConstElement(a).isValueNull());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::jstNULL);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendUndefined(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueNull();
+        ASSERT_EQUALS(c.getType(), mongo::jstNULL);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceRegex) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const std::string value1 = "some_regex_data";
+        const std::string value2 = "flags";
+        builder.appendRegex(name, value1, value2);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::RegEx);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendRegex(name, value1, value2));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::RegEx);
+        ASSERT_TRUE(a.hasValue());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::RegEx);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueRegex(value1, value2);
+        ASSERT_EQUALS(c.getType(), mongo::RegEx);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceDBRef) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const std::string value1 = "some_ns";
+        const mongo::OID value2 = mongo::OID::gen();
+        builder.appendDBRef(name, value1, value2);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::DBRef);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendDBRef(name, value1, value2));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::DBRef);
+        ASSERT_TRUE(a.hasValue());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::DBRef);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueDBRef(value1, value2);
+        ASSERT_EQUALS(c.getType(), mongo::DBRef);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceCode) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const std::string value1 = "{ print 4; }";
+        builder.appendCode(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::Code);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendCode(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::Code);
+        ASSERT_TRUE(a.hasValue());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::Code);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueCode(value1);
+        ASSERT_EQUALS(c.getType(), mongo::Code);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceSymbol) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const std::string value1 = "#symbol";
+        builder.appendSymbol(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::Symbol);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendSymbol(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::Symbol);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueSymbol());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::Symbol);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueSymbol(value1);
+        ASSERT_EQUALS(c.getType(), mongo::Symbol);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceCodeWithScope) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const std::string value1 = "print x;";
+        const mongo::BSONObj value2 = mongo::fromjson("{ x : 4 }");
+        builder.appendCodeWScope(name, value1, value2);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::CodeWScope);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendCodeWithScope(name, value1, value2));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::CodeWScope);
+        ASSERT_TRUE(a.hasValue());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::CodeWScope);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueCodeWithScope(value1, value2);
+        ASSERT_EQUALS(c.getType(), mongo::CodeWScope);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceInt) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const int value1 = true;
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::NumberInt);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendInt(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::NumberInt);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueInt());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::NumberInt);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueInt(value1);
+        ASSERT_EQUALS(c.getType(), mongo::NumberInt);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceTimestamp) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const mongo::OpTime value1 = mongo::OpTime(mongo::jsTime());
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::Timestamp);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendTimestamp(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::Timestamp);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_TRUE(value1 == mmb::ConstElement(a).getValueTimestamp());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::Timestamp);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueTimestamp(value1);
+        ASSERT_EQUALS(c.getType(), mongo::Timestamp);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceLong) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        const long long value1 = 420000000000000LL;
+        builder.append(name, value1);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::NumberLong);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendLong(name, value1));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::NumberLong);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_EQUALS(value1, mmb::ConstElement(a).getValueLong());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::NumberLong);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueLong(value1);
+        ASSERT_EQUALS(c.getType(), mongo::NumberLong);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceMinKey) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        builder.appendMinKey(name);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::MinKey);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendMinKey(name));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::MinKey);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_TRUE(mmb::ConstElement(a).isValueMinKey());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::MinKey);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueMinKey();
+        ASSERT_EQUALS(c.getType(), mongo::MinKey);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(TypeSupport, EncodingEquivalenceMaxKey) {
+        mongo::BSONObjBuilder builder;
+        const char name[] = "thing";
+        builder.appendMaxKey(name);
+        mongo::BSONObj source = builder.done();
+        const mongo::BSONElement thing = source.firstElement();
+        ASSERT_TRUE(thing.type() == mongo::MaxKey);
+
+        mmb::Document doc;
+
+        // Construct via direct call to append/make
+        ASSERT_OK(doc.root().appendMaxKey(name));
+        mmb::Element a = doc.root().rightChild();
+        ASSERT_TRUE(a.ok());
+        ASSERT_EQUALS(a.getType(), mongo::MaxKey);
+        ASSERT_TRUE(a.hasValue());
+        ASSERT_TRUE(mmb::ConstElement(a).isValueMaxKey());
+
+        // Construct via call passing BSON element
+        ASSERT_OK(doc.root().appendElement(thing));
+        mmb::Element b = doc.root().rightChild();
+        ASSERT_TRUE(b.ok());
+        ASSERT_EQUALS(b.getType(), mongo::MaxKey);
+        ASSERT_TRUE(b.hasValue());
+
+        // Construct via setValue call.
+        ASSERT_OK(doc.root().appendNull(name));
+        mmb::Element c = doc.root().rightChild();
+        ASSERT_TRUE(c.ok());
+        c.setValueMaxKey();
+        ASSERT_EQUALS(c.getType(), mongo::MaxKey);
+        ASSERT_TRUE(c.hasValue());
+
+        // Ensure identity:
+        ASSERT_TRUE(identical(thing, mmb::ConstElement(a).getValue()));
+        ASSERT_TRUE(identical(a.getValue(), b.getValue()));
+        ASSERT_TRUE(identical(b.getValue(), c.getValue()));
+    }
+
+    TEST(Document, ManipulateComplexObjInLeafHeap) {
+        // Test that an object with complex substructure that lives in the leaf builder can be
+        // manipulated in the same way as an object with complex substructure that lives
+        // freely.
+        mmb::Document doc;
+        static const char inJson[] = "{ a: 1, b: 2, d : ['w', 'x', 'y', 'z'] }";
+        mmb::Element embedded = doc.makeElementObject("embedded", mongo::fromjson(inJson));
+        ASSERT_OK(doc.root().pushBack(embedded));
+        mmb::Element free = doc.makeElementObject("free");
+        ASSERT_OK(doc.root().pushBack(free));
+
+        mmb::Element e_a = embedded.leftChild();
+        ASSERT_TRUE(e_a.ok());
+        ASSERT_EQUALS("a", e_a.getFieldName());
+        mmb::Element e_b = e_a.rightSibling();
+        ASSERT_TRUE(e_b.ok());
+        ASSERT_EQUALS("b", e_b.getFieldName());
+
+        mmb::Element new_c = doc.makeElementDouble("c", 2.0);
+        ASSERT_TRUE(new_c.ok());
+        ASSERT_OK(e_b.addSiblingRight(new_c));
+
+        mmb::Element e_d = new_c.rightSibling();
+        ASSERT_TRUE(e_d.ok());
+        ASSERT_EQUALS("d", e_d.getFieldName());
+
+        mmb::Element e_d_0 = e_d.leftChild();
+        ASSERT_TRUE(e_d_0.ok());
+
+        mmb::Element e_d_1 = e_d_0.rightSibling();
+        ASSERT_TRUE(e_d_1.ok());
+
+        mmb::Element e_d_2 = e_d_1.rightSibling();
+        ASSERT_TRUE(e_d_2.ok());
+
+        ASSERT_OK(e_d_1.remove());
+
+        static const char outJson[] =
+            "{ embedded: { a: 1, b: 2, c: 2.0, d : ['w', 'y', 'z'] }, free: {} }";
+        ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    }
+
+    TEST(DocumentInPlace, EphemeralDocumentsDoNotUseInPlaceMode) {
+        mmb::Document doc;
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsHonored1) {
+        mongo::BSONObj obj;
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        doc.disableInPlaceUpdates();
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsHonored2) {
+        mongo::BSONObj obj;
+        mmb::Document doc(obj, mmb::Document::kInPlaceDisabled);
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+        doc.disableInPlaceUpdates();
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeWorksWithNoMutations) {
+        mongo::BSONObj obj;
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        const char* source = NULL;
+        mmb::DamageVector damages;
+        ASSERT_TRUE(damages.empty());
+        doc.getInPlaceUpdates(&damages, &source);
+        ASSERT_TRUE(damages.empty());
+        ASSERT_NOT_EQUALS(static_cast<const char*>(NULL), source);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByAddSiblingLeft) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        mmb::Element newElt = doc.makeElementInt("bar", 42);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        ASSERT_OK(doc.root().leftChild().addSiblingLeft(newElt));
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByAddSiblingRight) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        mmb::Element newElt = doc.makeElementInt("bar", 42);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        ASSERT_OK(doc.root().leftChild().addSiblingRight(newElt));
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByRemove) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        ASSERT_OK(doc.root().leftChild().remove());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    // NOTE: Someday, we may do in-place renames, but renaming 'foo' to 'foobar' will never
+    // work because the sizes don't match. Validate that this disables in-place updates.
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByRename) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        ASSERT_OK(doc.root().leftChild().rename("foobar"));
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByPushFront) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        mmb::Element newElt = doc.makeElementInt("bar", 42);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        ASSERT_OK(doc.root().pushFront(newElt));
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByPushBack) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        mmb::Element newElt = doc.makeElementInt("bar", 42);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        ASSERT_OK(doc.root().pushBack(newElt));
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByPopFront) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        ASSERT_OK(doc.root().popFront());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByPopBack) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        ASSERT_OK(doc.root().popBack());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    // This isn't a great test since we aren't testing all possible combinations of compatible
+    // and incompatible sets, but since all setValueX calls decay to the internal setValue, we
+    // can be pretty sure that this will at least check the logic somewhat.
+    TEST(DocumentInPlace, InPlaceModeIsDisabledByIncompatibleSetValue) {
+        mongo::BSONObj obj(mongo::fromjson("{ foo : false }"));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        mmb::Element foo = doc.root().leftChild();
+        ASSERT_TRUE(foo.ok());
+        ASSERT_OK(foo.setValueString("foo"));
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+    }
+
+    TEST(DocumentInPlace, DisablingInPlaceDoesNotDiscardUpdates) {
+        mongo::BSONObj obj(mongo::fromjson("{ foo : false, bar : true }"));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+        mmb::Element foo = doc.root().leftChild();
+        ASSERT_TRUE(foo.ok());
+        ASSERT_OK(foo.setValueBool(true));
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+        mmb::Element bar = doc.root().rightChild();
+        ASSERT_TRUE(bar.ok());
+        ASSERT_OK(bar.setValueBool(false));
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+
+        ASSERT_OK(doc.root().appendString("baz", "baz"));
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+        static const char outJson[] =
+            "{ foo : true, bar : false, baz : 'baz' }";
+        ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
+    }
+
+    TEST(DocumentInPlace, BooleanLifecycle) {
+        mongo::BSONObj obj(mongo::fromjson("{ x : false }"));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueBool(false);
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::Bool));
+        ASSERT_EQUALS(false, x.getValueBool());
+
+        // TODO: Re-enable when in-place updates to leaf elements is supported
+        // x.setValueBool(true);
+        // ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        // apply(&obj, damages, source);
+        // ASSERT_TRUE(x.hasValue());
+        // ASSERT_TRUE(x.isType(mongo::Bool));
+        // ASSERT_EQUALS(true, x.getValueBool());
+    }
+
+    TEST(DocumentInPlace, NumberIntLifecycle) {
+        const int value1 = 42;
+        const int value2 = 3;
+        mongo::BSONObj obj(BSON("x" << value1));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueInt(value2);
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::NumberInt));
+        ASSERT_EQUALS(value2, x.getValueInt());
+
+        // TODO: Re-enable when in-place updates to leaf elements is supported
+        // x.setValueInt(value1);
+        // ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        // apply(&obj, damages, source);
+        // ASSERT_TRUE(x.hasValue());
+        // ASSERT_TRUE(x.isType(mongo::NumberInt));
+        // ASSERT_EQUALS(value1, x.getValueInt());
+    }
+
+    TEST(DocumentInPlace, NumberLongLifecycle) {
+        const long long value1 = 42;
+        const long long value2 = 3;
+
+        mongo::BSONObj obj(BSON("x" << value1));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueLong(value2);
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::NumberLong));
+        ASSERT_EQUALS(value2, x.getValueLong());
+
+        // TODO: Re-enable when in-place updates to leaf elements is supported
+        // x.setValueLong(value1);
+        // ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        // apply(&obj, damages, source);
+        // ASSERT_TRUE(x.hasValue());
+        // ASSERT_TRUE(x.isType(mongo::NumberLong));
+        // ASSERT_EQUALS(value1, x.getValueLong());
+    }
+
+    TEST(DocumentInPlace, NumberDoubleLifecycle) {
+        const double value1 = 32.0;
+        const double value2 = 2.0;
+
+        mongo::BSONObj obj(BSON("x" << value1));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueDouble(value2);
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::NumberDouble));
+        ASSERT_EQUALS(value2, x.getValueDouble());
+
+        // TODO: Re-enable when in-place updates to leaf elements is supported
+        // x.setValueDouble(value1);
+        // ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        // apply(&obj, damages, source);
+        // ASSERT_TRUE(x.hasValue());
+        // ASSERT_TRUE(x.isType(mongo::NumberDouble));
+        // ASSERT_EQUALS(value1, x.getValueDouble());
+    }
+
+    // Doubles and longs are the same size, 8 bytes, so we should be able to do in-place
+    // updates between them.
+    TEST(DocumentInPlace, DoubleToLongAndBack) {
+        const double value1 = 32.0;
+        const long long value2 = 42;
+
+        mongo::BSONObj obj(BSON("x" << value1));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueLong(value2);
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::NumberLong));
+        ASSERT_EQUALS(value2, x.getValueLong());
+
+        // TODO: Re-enable when in-place updates to leaf elements is supported
+        // x.setValueDouble(value1);
+        // ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        // apply(&obj, damages, source);
+        // ASSERT_TRUE(x.hasValue());
+        // ASSERT_TRUE(x.isType(mongo::NumberDouble));
+        // ASSERT_EQUALS(value1, x.getValueDouble());
+    }
+
+    TEST(DocumentComparison, SimpleComparison) {
+        const mongo::BSONObj obj =
+            mongo::fromjson("{ a : 'a', b : ['b', 'b', 'b'], c : { one : 1.0 } }");
+
+        const mmb::Document doc1(obj.getOwned());
+        ASSERT_EQUALS(0, doc1.compareWithBSONObj(obj));
+        const mmb::Document doc2(obj.getOwned());
+        ASSERT_EQUALS(0, doc1.compareWith(doc2));
+        ASSERT_EQUALS(0, doc2.compareWith(doc1));
+    }
+
+    TEST(DocumentComparison, SimpleComparisonWithDeserializedElements) {
+        const mongo::BSONObj obj =
+            mongo::fromjson("{ a : 'a', b : ['b', 'b', 'b'], c : { one : 1.0 } }");
+
+        // Perform an operation on 'b' that doesn't change the serialized value, but
+        // deserializes the node.
+        mmb::Document doc1(obj.getOwned());
+        const mmb::Document doc1Copy(obj.getOwned());
+        mmb::Element b = doc1.root()["b"];
+        ASSERT_TRUE(b.ok());
+        mmb::Element b0 = b[0];
+        ASSERT_TRUE(b0.ok());
+        ASSERT_OK(b0.remove());
+        ASSERT_OK(b.pushBack(b0));
+        // Ensure that it compares correctly against the source object.
+        ASSERT_EQUALS(0, doc1.compareWithBSONObj(obj));
+        // Ensure that it compares correctly against a pristine document.
+        ASSERT_EQUALS(0, doc1.compareWith(doc1Copy));
+        ASSERT_EQUALS(0, doc1Copy.compareWith(doc1));
+
+        // Perform an operation on 'c' that doesn't change the serialized value, but
+        // deserializeds the node.
+        mmb::Document doc2(obj.getOwned());
+        const mmb::Document doc2Copy(obj.getOwned());
+        mmb::Element c = doc2.root()["c"];
+        ASSERT_TRUE(c.ok());
+        mmb::Element c1 = c.leftChild();
+        ASSERT_TRUE(c1.ok());
+        ASSERT_OK(c1.remove());
+        ASSERT_OK(c.pushBack(c1));
+        // Ensure that it compares correctly against the source object
+        ASSERT_EQUALS(0, doc2.compareWithBSONObj(obj));
+        // Ensure that it compares correctly against a pristine document.
+        ASSERT_EQUALS(0, doc2.compareWith(doc2Copy));
+        ASSERT_EQUALS(0, doc2Copy.compareWith(doc2));
+
+        // Ensure that the two deserialized documents compare with each other correctly.
+        ASSERT_EQUALS(0, doc1.compareWith(doc2));
+        ASSERT_EQUALS(0, doc2.compareWith(doc1));
+    }
+
+} // namespace

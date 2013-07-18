@@ -29,9 +29,10 @@ namespace mongo {
     DocumentSourceProject::~DocumentSourceProject() {
     }
 
-    DocumentSourceProject::DocumentSourceProject(const intrusive_ptr<ExpressionContext> &pExpCtx)
+    DocumentSourceProject::DocumentSourceProject(const intrusive_ptr<ExpressionContext>& pExpCtx,
+                                                 const intrusive_ptr<ExpressionObject>& exprObj)
         : DocumentSource(pExpCtx)
-        , pEO(ExpressionObject::create())
+        , pEO(exprObj)
     { }
 
     const char *DocumentSourceProject::getSourceName() const {
@@ -61,7 +62,7 @@ namespace mongo {
           If we're excluding fields at the top level, leave out the _id if
           it is found, because we took care of it above.
         */
-        pEO->addToDocument(out, pInDocument, /*root=*/pInDocument);
+        pEO->addToDocument(out, pInDocument, Variables(pInDocument));
 
 #if defined(_DEBUG)
         if (!_simpleProjection.getSpec().isEmpty()) {
@@ -95,25 +96,18 @@ namespace mongo {
         pEO = dynamic_pointer_cast<ExpressionObject>(pE);
     }
 
-    void DocumentSourceProject::sourceToBson(
-        BSONObjBuilder *pBuilder, bool explain) const {
-        BSONObjBuilder insides;
-        pEO->documentToBson(&insides, true);
-        pBuilder->append(projectName, insides.done());
+    void DocumentSourceProject::sourceToBson(BSONObjBuilder* pBuilder, bool explain) const {
+        *pBuilder << projectName << pEO->serialize();
     }
 
     intrusive_ptr<DocumentSource> DocumentSourceProject::createFromBson(
-        BSONElement *pBsonElement,
-        const intrusive_ptr<ExpressionContext> &pExpCtx) {
+            BSONElement *pBsonElement,
+            const intrusive_ptr<ExpressionContext> &pExpCtx) {
+
         /* validate */
         uassert(15969, str::stream() << projectName <<
                 " specification must be an object",
                 pBsonElement->type() == Object);
-
-        intrusive_ptr<DocumentSourceProject> pProject(new DocumentSourceProject(pExpCtx));
-
-        BSONObj projectObj(pBsonElement->Obj());
-        pProject->_raw = projectObj.getOwned(); // probably not necessary, but better to be safe
 
         Expression::ObjectCtx objectCtx(
               Expression::ObjectCtx::DOCUMENT_OK
@@ -126,7 +120,10 @@ namespace mongo {
         massert(16402, "parseObject() returned wrong type of Expression", exprObj);
         uassert(16403, "$projection requires at least one output field", exprObj->getFieldCount());
 
-        pProject->pEO = exprObj;
+        intrusive_ptr<DocumentSourceProject> pProject(new DocumentSourceProject(pExpCtx, exprObj));
+
+        BSONObj projectObj = pBsonElement->Obj();
+        pProject->_raw = projectObj.getOwned(); // probably not necessary, but better to be safe
 
 #if defined(_DEBUG)
         if (exprObj->isSimple()) {

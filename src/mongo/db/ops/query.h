@@ -19,17 +19,19 @@
 #pragma once
 
 #include "mongo/pch.h"
-#include "../../util/net/message.h"
-#include "../dbmessage.h"
-#include "../jsobj.h"
-#include "../diskloc.h"
-#include "../explain.h"
-#include "../../s/d_chunk_manager.h"
+
+#include "mongo/db/diskloc.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/explain.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/s/collection_metadata.h"
+#include "mongo/util/net/message.h"
 
 // struct QueryOptions, QueryResult, QueryResultFlags in:
 
 namespace mongo {
 
+    class CurOp;
     class ParsedQuery;
     class QueryOptimizerCursor;
     struct QueryPlanSummary;
@@ -290,14 +292,14 @@ namespace mongo {
          * @return the number of results in the buffer.
          */
         int handoff( Message &result );
-        /** A chunk manager found at the beginning of the query. */
-        ShardChunkManagerPtr chunkManager() const { return _chunkManager; }
+        /** Metadata found at the beginning of the query. */
+        CollectionMetadataPtr collMetadata() const { return _collMetadata; }
 
     private:
         QueryResponseBuilder( const ParsedQuery &parsedQuery, const shared_ptr<Cursor> &cursor );
         void init( const QueryPlanSummary &queryPlan, const BSONObj &oldPlan );
 
-        ShardChunkManagerPtr newChunkManager() const;
+        CollectionMetadataPtr newCollMetadata() const;
         shared_ptr<ExplainRecordingStrategy> newExplainRecordingStrategy
         ( const QueryPlanSummary &queryPlan, const BSONObj &oldPlan ) const;
         shared_ptr<ResponseBuildStrategy> newResponseBuildStrategy
@@ -316,7 +318,7 @@ namespace mongo {
         shared_ptr<Cursor> _cursor;
         shared_ptr<QueryOptimizerCursor> _queryOptimizerCursor;
         BufBuilder _buf;
-        ShardChunkManagerPtr _chunkManager;
+        CollectionMetadataPtr _collMetadata;
         shared_ptr<ExplainRecordingStrategy> _explain;
         shared_ptr<ResponseBuildStrategy> _builder;
     };

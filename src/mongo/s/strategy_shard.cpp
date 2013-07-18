@@ -26,7 +26,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/index.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/chunk.h"
@@ -44,7 +44,7 @@ namespace mongo {
     class ShardStrategy : public Strategy {
 
         bool _isSystemIndexes( const char* ns ) {
-            return NamespaceString(ns).coll == "system.indexes";
+            return nsToCollectionSubstring(ns) == "system.indexes";
         }
 
         virtual void queryOp( Request& r ) {
@@ -55,7 +55,7 @@ namespace mongo {
 
             AuthorizationSession* authSession =
                     ClientBasic::getCurrent()->getAuthorizationSession();
-            Status status = authSession->checkAuthForQuery(q.ns);
+            Status status = authSession->checkAuthForQuery(q.ns, q.query);
             uassert(16549, status.reason(), status.isOK());
 
             LOG(3) << "shard query: " << q.ns << "  " << q.query << endl;
@@ -170,11 +170,6 @@ namespace mongo {
 
             const char *ns = r.getns();
 
-            AuthorizationSession* authSession =
-                    ClientBasic::getCurrent()->getAuthorizationSession();
-            Status status = authSession->checkAuthForGetMore(ns);
-            uassert(16539, status.reason(), status.isOK());
-
             // TODO:  Handle stale config exceptions here from coll being dropped or sharded during op
             // for now has same semantics as legacy request
             ChunkManagerPtr info = r.getChunkManager();
@@ -189,18 +184,18 @@ namespace mongo {
 
                 long long id = r.d().getInt64( 4 );
 
+                AuthorizationSession* authSession =
+                        ClientBasic::getCurrent()->getAuthorizationSession();
+                Status status = authSession->checkAuthForGetMore(ns, id);
+                uassert(16539, status.reason(), status.isOK());
+
                 string host = cursorCache.getRef( id );
 
                 if( host.size() == 0 ){
-
-                    //
-                    // Match legacy behavior here by throwing an exception when we can't find
-                    // the cursor, but make the exception more informative
-                    //
-
-                    uasserted( 16336,
-                               str::stream() << "could not find cursor in cache for id " << id
-                                             << " over collection " << ns );
+                    LOG(3) << "could not find cursor in cache for id " << id
+                           << " over collection " << ns << endl;
+                    replyToQuery( ResultFlag_CursorNotFound , r.p() , r.m() , 0 , 0 , 0 );
+                    return;
                 }
 
                 // we used ScopedDbConnection because we don't get about config versions
@@ -226,11 +221,14 @@ namespace mongo {
                 int ntoreturn = r.d().pullInt();
                 long long id = r.d().pullInt64();
 
-                LOG(6) << "want cursor : " << id << endl;
+                AuthorizationSession* authSession =
+                        ClientBasic::getCurrent()->getAuthorizationSession();
+                Status status = authSession->checkAuthForGetMore(ns, id);
+                uassert(16939, status.reason(), status.isOK());
 
                 ShardedClientCursorPtr cursor = cursorCache.get( id );
                 if ( ! cursor ) {
-                    LOG(6) << "\t invalid cursor :(" << endl;
+                    LOG(3) << "Invalid cursor:" << id << endl;
                     replyToQuery( ResultFlag_CursorNotFound , r.p() , r.m() , 0 , 0 , 0 );
                     return;
                 }
@@ -512,12 +510,6 @@ namespace mongo {
 
             const string& ns = r.getns();
 
-            AuthorizationSession* authSession =
-                    ClientBasic::getCurrent()->getAuthorizationSession();
-            Status status = authSession->checkAuthForInsert(ns);
-            uassert(16540, status.reason(), status.isOK());
-
-
             int flags = 0;
 
             if (d.reservedField() & Reserved_InsertOption_ContinueOnError) flags |=
@@ -565,6 +557,14 @@ namespace mongo {
                 // We should always have a shard if we have any inserts
                 verify(group.inserts.size() == 0 || group.shard.get());
 
+                for (vector<BSONObj>::iterator it = group.inserts.begin();
+                        it != group.inserts.end(); ++it) {
+                    AuthorizationSession* authSession =
+                            ClientBasic::getCurrent()->getAuthorizationSession();
+                    Status status = authSession->checkAuthForInsert(ns, *it);
+                    uassert(16540, status.reason(), status.isOK());
+                }
+
                 if (group.inserts.size() > 0 && group.hasException()) {
                     warning() << "problem preparing batch insert detected, first inserting "
                               << group.inserts.size() << " intermediate documents" << endl;
@@ -587,7 +587,7 @@ namespace mongo {
                                 << "inserting "
                                 << group.inserts.size()
                                 << " documents to shard "
-                                << group.shard
+                                << group.shard->toString()
                                 << " at version "
                                 << (group.manager.get() ?
                                     group.manager->getVersion().toString() :
@@ -979,7 +979,7 @@ namespace mongo {
                     return;
                 }
 
-                if( query.hasField("$atomic") ){
+                if( query.hasField("$atomic") || query.hasField("$isolated") ){
 
                     // We can't run an atomic operation on more than one shard
 
@@ -992,7 +992,7 @@ namespace mongo {
                     _sleepForVerifiedLocalError();
 
                     uasserted( 13506, str::stream()
-                        << "$atomic not supported sharded : " << query );
+                        << "$atomic/$isolated not supported sharded : " << query );
                 }
 
                 return;
@@ -1007,14 +1007,15 @@ namespace mongo {
             const BSONObj query = d.nextJsObj();
 
             bool upsert = flags & UpdateOption_Upsert;
-            AuthorizationSession* authSession =
-                    ClientBasic::getCurrent()->getAuthorizationSession();
-            Status status = authSession->checkAuthForUpdate(ns, upsert);
-            uassert(16537, status.reason(), status.isOK());
 
             uassert( 10201 ,  "invalid update" , d.moreJSObjs() );
 
             const BSONObj toUpdate = d.nextJsObj();
+
+            AuthorizationSession* authzSession =
+                    ClientBasic::getCurrent()->getAuthorizationSession();
+            Status status = authzSession->checkAuthForUpdate(ns, query, toUpdate, upsert);
+            uassert(16537, status.reason(), status.isOK());
 
             if( d.reservedField() & Reserved_FromWriteback ){
                 flags |= WriteOption_FromWriteback;
@@ -1131,7 +1132,7 @@ namespace mongo {
                 return;
             }
 
-            if( query.hasField( "$atomic" ) ){
+            if( query.hasField( "$atomic" ) || query.hasField( "$isolated" ) ){
 
                 // Retry reloading the config data once
                 if( ! reloadConfigData ){
@@ -1143,7 +1144,7 @@ namespace mongo {
                 _sleepForVerifiedLocalError();
 
                 uasserted( 13505, str::stream()
-                    << "$atomic not supported for sharded delete : " << query );
+                    << "$atomic/$isolated not supported for sharded delete : " << query );
             }
             else if( justOne && ! query.hasField( "_id" ) ){
 
@@ -1168,14 +1169,14 @@ namespace mongo {
             const string& ns = r.getns();
             int flags = d.pullInt();
 
-            AuthorizationSession* authSession =
-                    ClientBasic::getCurrent()->getAuthorizationSession();
-            Status status = authSession->checkAuthForDelete(ns);
-            uassert(16541, status.reason(), status.isOK());
-
             uassert( 10203 ,  "bad delete message" , d.moreJSObjs() );
 
             const BSONObj query = d.nextJsObj();
+
+            AuthorizationSession* authSession =
+                    ClientBasic::getCurrent()->getAuthorizationSession();
+            Status status = authSession->checkAuthForDelete(ns, query);
+            uassert(16541, status.reason(), status.isOK());
 
             if( d.reservedField() & Reserved_FromWriteback ){
                 flags |= WriteOption_FromWriteback;
@@ -1237,6 +1238,12 @@ namespace mongo {
                 if (op == dbInsert) {
                     // Insert is the only write op allowed on system.indexes, so it's the only one
                     // we check auth for.
+
+                    // TODO(spencer): this auth check shouldn't be necessary.  We could just call
+                    // checkAuthForInsert with the insert object and it would handle checking for
+                    // index builds, but because of the way this file is structured we don't know
+                    // what the insert object looks like until after we've already special cased
+                    // index building.
                     AuthorizationSession* authSession =
                             ClientBasic::getCurrent()->getAuthorizationSession();
                     uassert(16547,

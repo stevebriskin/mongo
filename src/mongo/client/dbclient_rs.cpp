@@ -154,6 +154,10 @@ namespace mongo {
             }
 
             if (secOnly && !node.okForSecondaryQueries()) {
+                LOG(3) << "dbclient_rs not selecting " << node
+                                  << ", not ok for secondary queries ("
+                                  << ( !node.secondary ? "not secondary" : "hidden" ) << ")"
+                                  << endl;
                 continue;
             }
 
@@ -164,8 +168,8 @@ namespace mongo {
 
                 if (node.isLocalSecondary(localThresholdMillis)) {
                     // found a local node.  return early.
-                    LOG(2) << "dbclient_rs _selectNode found local secondary for queries: "
-                           << nextNodeIndex << ", ping time: " << node.pingTimeMillis << endl;
+                    LOG(2) << "dbclient_rs selecting local secondary " << fallbackHost
+                                      << ", ping time: " << node.pingTimeMillis << endl;
                     *lastHost = fallbackHost;
                     return fallbackHost;
                 }
@@ -174,6 +178,14 @@ namespace mongo {
 
         if (!fallbackHost.empty()) {
             *lastHost = fallbackHost;
+        }
+
+        if ( fallbackHost.empty() ) {
+            LOG(3) << "dbclient_rs no node selected for tag " << readPreferenceTag << endl;
+        }
+        else {
+            LOG(3) << "dbclient_rs node " << fallbackHost << " selected for tag "
+                              << readPreferenceTag << endl;
         }
 
         return fallbackHost;
@@ -1034,9 +1046,14 @@ namespace mongo {
         }
 
         if (candidate.empty()) {
+
+            LOG( 3 ) << "dbclient_rs no compatible nodes found, refreshing view of replica set "
+                                << _name << endl;
+
             // mimic checkMaster behavior, which refreshes the local view of the replica set
             _check();
 
+            tags->reset();
             scoped_lock lk(_lock);
             return ReplicaSetMonitor::selectNode(_nodes, preference, tags, _localThresholdMillis,
                     &_lastReadPrefHost, isPrimarySelected);
@@ -1459,12 +1476,14 @@ namespace mongo {
             try {
                 _lastSlaveOkConn->auth(params);
             }
-            catch (const DBException&) {
-                /* Swallow exception. _lastSlaveOkConn is now in failed state.
-                 * The next time we create a new secondary connection it will
-                 * be authenticated with the credentials from _auths.
-                 */
-                verify(_lastSlaveOkConn->isFailed());
+            catch (const DBException& ex) {
+                LOG(1) << "Failed to authenticate secondary, clearing cached connection: "
+                       << causedBy(ex) << endl;
+                // We need to clear the cached connection because it will not match the set
+                // of cached username/pwd. Anything can be wrong here: user was removed in between
+                // authenticating to primary and secondary, user not yet replicated to secondary,
+                // secondary connection failed, etc.
+                invalidateLastSlaveOkCache();
             }
         }
 
@@ -1519,8 +1538,20 @@ namespace mongo {
                                                        const BSONObj *fieldsToReturn,
                                                        int queryOptions,
                                                        int batchSize) {
-        if (_isQueryOkToSecondary(ns, queryOptions, query.obj)) {
+
+        if ( _isQueryOkToSecondary( ns, queryOptions, query.obj ) ) {
+
             shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(query.obj));
+
+            LOG( 3 ) << "dbclient_rs query using secondary or tagged node selection in "
+                                << _getMonitor()->getName() << ", read pref is "
+                                << readPref->toBSON() << " (primary : "
+                                << ( _master.get() != NULL ?
+                                        _master->getServerAddress() : "[not cached]" )
+                                << ", lastTagged : "
+                                << ( _lastSlaveOkConn.get() != NULL ?
+                                        _lastSlaveOkConn->getServerAddress() : "[not cached]" )
+                                << ")" << endl;
 
             for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                 try {
@@ -1537,15 +1568,18 @@ namespace mongo {
                     return checkSlaveQueryResult(cursor);
                 }
                 catch (const DBException &dbExcep) {
-                    LOG(1) << "can't query replica set slave " << _lastSlaveOkHost
+                    LOG(1) << "can't query replica set node " << _lastSlaveOkHost
                            << ": " << causedBy(dbExcep) << endl;
                     invalidateLastSlaveOkCache();
                 }
             }
 
-            uasserted(16370, str::stream() << "Failed to do query, no good nodes in "
-                        << _getMonitor()->getName());
+            uasserted( 16370,
+                       str::stream() << "Failed to do query, no good nodes in "
+                               << _getMonitor()->getName() );
         }
+
+        LOG( 3 ) << "dbclient_rs query to primary node in " << _getMonitor()->getName() << endl;
 
         return checkMaster()->query(ns, query, nToReturn, nToSkip, fieldsToReturn,
                 queryOptions, batchSize);
@@ -1556,7 +1590,18 @@ namespace mongo {
                                         const BSONObj *fieldsToReturn,
                                         int queryOptions) {
         if (_isQueryOkToSecondary(ns, queryOptions, query.obj)) {
+
             shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(query.obj));
+
+            LOG( 3 ) << "dbclient_rs findOne using secondary or tagged node selection in "
+                                << _getMonitor()->getName() << ", read pref is "
+                                << readPref->toBSON() << " (primary : "
+                                << ( _master.get() != NULL ?
+                                        _master->getServerAddress() : "[not cached]" )
+                                << ", lastTagged : "
+                                << ( _lastSlaveOkConn.get() != NULL ?
+                                        _lastSlaveOkConn->getServerAddress() : "[not cached]" )
+                                << ")" << endl;
 
             for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                 try {
@@ -1568,9 +1613,9 @@ namespace mongo {
 
                     return conn->findOne(ns,query,fieldsToReturn,queryOptions);
                 }
-                catch (const DBException &dbExcep) {
-                    LOG(1) << "can't findone replica set slave " << _lastSlaveOkHost
-                           << ": " << causedBy(dbExcep) << endl;
+                catch ( const DBException &dbExcep ) {
+                    LOG(1) << "can't findone replica set node " << _lastSlaveOkHost << ": "
+                                      << causedBy( dbExcep ) << endl;
                     invalidateLastSlaveOkCache();
                 }
             }
@@ -1578,6 +1623,9 @@ namespace mongo {
             uasserted(16379, str::stream() << "Failed to call findOne, no good nodes in "
                         << _getMonitor()->getName());
         }
+
+        LOG( 3 ) << "dbclient_rs findOne to primary node in " << _getMonitor()->getName()
+                            << endl;
 
         return checkMaster()->findOne(ns,query,fieldsToReturn,queryOptions);
     }
@@ -1631,6 +1679,10 @@ namespace mongo {
     DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
             shared_ptr<ReadPreferenceSetting> readPref) {
         if (checkLastHost(readPref.get())) {
+
+            LOG( 3 ) << "dbclient_rs selecting compatible last used node " << _lastSlaveOkHost
+                                << endl;
+
             return _lastSlaveOkConn.get();
         }
 
@@ -1640,6 +1692,9 @@ namespace mongo {
                 &isPrimarySelected);
 
         if ( _lastSlaveOkHost.empty() ){
+
+            LOG( 3 ) << "dbclient_rs no compatible node found" << endl;
+
             return NULL;
         }
 
@@ -1653,6 +1708,9 @@ namespace mongo {
             checkMaster();
             _lastSlaveOkConn = _master;
             _lastSlaveOkHost = _masterHost; // implied, but still assign just to be safe
+
+            LOG( 3 ) << "dbclient_rs selecting primary node " << _lastSlaveOkHost << endl;
+
             return _master.get();
         }
 
@@ -1666,14 +1724,16 @@ namespace mongo {
 
         // Assert here instead of returning NULL since the contract of this method is such
         // that returning NULL means none of the nodes were good, which is not the case here.
-        uassert(16532, str::stream() << "Failed to connect to "
-                << _lastSlaveOkHost.toString(true),
+        uassert(16532, str::stream() << "Failed to connect to " << _lastSlaveOkHost.toString(),
                 newConn != NULL);
 
         _lastSlaveOkConn.reset(newConn);
         _lastSlaveOkConn->setReplSetClientCallback(this);
 
         _auth(_lastSlaveOkConn.get());
+
+        LOG( 3 ) << "dbclient_rs selecting node " << _lastSlaveOkHost << endl;
+
         return _lastSlaveOkConn.get();
     }
 
@@ -1692,7 +1752,18 @@ namespace mongo {
 
             const bool slaveOk = qm.queryOptions & QueryOption_SlaveOk;
             if (_isQueryOkToSecondary(qm.ns, qm.queryOptions, qm.query)) {
+
                 shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(qm.query));
+
+                LOG( 3 ) << "dbclient_rs say using secondary or tagged node selection in "
+                                    << _getMonitor()->getName() << ", read pref is "
+                                    << readPref->toBSON() << " (primary : "
+                                    << ( _master.get() != NULL ?
+                                            _master->getServerAddress() : "[not cached]" )
+                                    << ", lastTagged : "
+                                    << ( _lastSlaveOkConn.get() != NULL ?
+                                            _lastSlaveOkConn->getServerAddress() : "[not cached]" )
+                                    << ")" << endl;
 
                 for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                     _lazyState._retries = retry;
@@ -1713,9 +1784,9 @@ namespace mongo {
                         _lazyState._slaveOk = slaveOk;
                         _lazyState._lastClient = conn;
                     }
-                    catch (const DBException& DBExcep) {
-                        LOG(1) << "can't callLazy replica set slave " << _lastSlaveOkHost
-                                << ": " << causedBy(DBExcep) << endl;
+                    catch ( const DBException& DBExcep ) {
+                        LOG(1) << "can't callLazy replica set node " << _lastSlaveOkHost << ": "
+                                          << causedBy( DBExcep ) << endl;
                         invalidateLastSlaveOkCache();
                         continue;
                     }
@@ -1727,6 +1798,9 @@ namespace mongo {
                          << _getMonitor()->getName());
             }
         }
+
+        LOG( 3 ) << "dbclient_rs say to primary node in " << _getMonitor()->getName()
+                            << endl;
 
         DBClientConnection* master = checkMaster();
         if (actualServer)
@@ -1751,7 +1825,7 @@ namespace mongo {
             return _lazyState._lastClient->recv( m );
         }
         catch( DBException& e ){
-            log() << "could not receive data from " << _lazyState._lastClient << causedBy( e ) << endl;
+            log() << "could not receive data from " << _lazyState._lastClient->toString() << causedBy( e ) << endl;
             return false;
         }
     }
@@ -1834,7 +1908,18 @@ namespace mongo {
             ns = qm.ns;
 
             if (_isQueryOkToSecondary(ns, qm.queryOptions, qm.query)) {
+
                 shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(qm.query));
+
+                LOG( 3 ) << "dbclient_rs call using secondary or tagged node selection in "
+                                    << _getMonitor()->getName() << ", read pref is "
+                                    << readPref->toBSON() << " (primary : "
+                                    << ( _master.get() != NULL ?
+                                            _master->getServerAddress() : "[not cached]" )
+                                    << ", lastTagged : "
+                                    << ( _lastSlaveOkConn.get() != NULL ?
+                                            _lastSlaveOkConn->getServerAddress() : "[not cached]" )
+                                    << ")" << endl;
 
                 for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                     try {
@@ -1850,12 +1935,11 @@ namespace mongo {
 
                         return conn->call(toSend, response, assertOk);
                     }
-                    catch (const DBException& dbExcep) {
-                        LOG(1) << "can't call replica set slave " << _lastSlaveOkHost
-                               << ": " << causedBy(dbExcep) << endl;
+                    catch ( const DBException& dbExcep ) {
+                        LOG(1) << "can't call replica set node " << _lastSlaveOkHost << ": "
+                                          << causedBy( dbExcep ) << endl;
 
-                        if (actualServer)
-                            *actualServer = "";
+                        if ( actualServer ) *actualServer = "";
 
                         invalidateLastSlaveOkCache();
                     }
@@ -1866,6 +1950,8 @@ namespace mongo {
             }
         }
         
+        LOG( 3 ) << "dbclient_rs call to primary node in " << _getMonitor()->getName() << endl;
+
         DBClientConnection* m = checkMaster();
         if ( actualServer )
             *actualServer = m->getServerAddress();
@@ -1901,32 +1987,40 @@ namespace mongo {
         _lastSlaveOkConn.reset();
     }
 
-    TagSet::TagSet() : _isExhausted(true), _tagIterator(_tags) {
+    TagSet::TagSet():
+            _isExhausted(true),
+            _tagIterator(new BSONArrayIteratorSorted(_tags)) {
     }
 
     TagSet::TagSet(const TagSet& other) :
             _isExhausted(false),
             _tags(other._tags.getOwned()),
-            _tagIterator(_tags) {
+            _tagIterator(new BSONArrayIteratorSorted(_tags)) {
         next();
     }
 
     TagSet::TagSet(const BSONArray& tags) :
             _isExhausted(false),
             _tags(tags.getOwned()),
-            _tagIterator(_tags) {
+            _tagIterator(new BSONArrayIteratorSorted(_tags)) {
         next();
     }
 
     void TagSet::next() {
-        if (_tagIterator.more()) {
-            const BSONElement& nextTag = _tagIterator.next();
+        if (_tagIterator->more()) {
+            const BSONElement& nextTag = _tagIterator->next();
             uassert(16357, "Tags should be a BSON object", nextTag.isABSONObj());
             _currentTag = nextTag.Obj();
         }
         else {
             _isExhausted = true;
         }
+    }
+
+    void TagSet::reset() {
+        _isExhausted = false;
+        _tagIterator.reset(new BSONArrayIteratorSorted(_tags));
+        next();
     }
 
     const BSONObj& TagSet::getCurrentTag() const {
@@ -1944,5 +2038,33 @@ namespace mongo {
 
     bool TagSet::equals(const TagSet& other) const {
         return _tags.equal(other._tags);
+    }
+
+    const BSONArray& TagSet::getTagBSON() const {
+        return _tags;
+    }
+
+    string readPrefToString( ReadPreference pref ) {
+        switch ( pref ) {
+        case ReadPreference_PrimaryOnly:
+            return "primary only";
+        case ReadPreference_PrimaryPreferred:
+            return "primary pref";
+        case ReadPreference_SecondaryOnly:
+            return "secondary only";
+        case ReadPreference_SecondaryPreferred:
+            return "secondary pref";
+        case ReadPreference_Nearest:
+            return "nearest";
+        default:
+            return "Unknown";
+        }
+    }
+
+    BSONObj ReadPreferenceSetting::toBSON() const {
+        BSONObjBuilder bob;
+        bob.append( "pref", readPrefToString( pref ) );
+        bob.append( "tags", tags.getTagBSON() );
+        return bob.obj();
     }
 }

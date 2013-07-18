@@ -23,61 +23,61 @@
 
 namespace mongo {
 
-    const char AccumulatorAvg::subTotalName[] = "subTotal";
-    const char AccumulatorAvg::countName[] = "count";
+namespace {
+    const char subTotalName[] = "subTotal";
+    const char countName[] = "count";
+}
 
-    Value AccumulatorAvg::evaluate(const Document& pDocument) const {
-        if (!pCtx->getDoingMerge()) {
-            Super::evaluate(pDocument);
+    void AccumulatorAvg::processInternal(const Value& input, bool merging) {
+        if (!merging) {
+            Super::processInternal(input, merging);
         }
         else {
-            /*
-              If we're in the router, we expect an object that contains
-              both a subtotal and a count.  This is what getValue() produced
-              below.
-             */
-            Value shardOut = vpOperand[0]->evaluate(pDocument);
-            verify(shardOut.getType() == Object);
+            // We expect an object that contains both a subtotal and a count.
+            // This is what getValue(true) produced below.
+            verify(input.getType() == Object);
 
-            Value subTotal = shardOut[subTotalName];
+            Value subTotal = input[subTotalName];
             verify(!subTotal.missing());
             doubleTotal += subTotal.getDouble();
                 
-            Value subCount = shardOut[countName];
+            Value subCount = input[countName];
             verify(!subCount.missing());
             count += subCount.getLong();
         }
-
-        return Value();
     }
 
-    intrusive_ptr<Accumulator> AccumulatorAvg::create(
-        const intrusive_ptr<ExpressionContext> &pCtx) {
-        intrusive_ptr<AccumulatorAvg> pA(new AccumulatorAvg(pCtx));
-        return pA;
+    intrusive_ptr<Accumulator> AccumulatorAvg::create() {
+        return new AccumulatorAvg();
     }
 
-    Value AccumulatorAvg::getValue() const {
-        if (!pCtx->getInShard()) {
+    Value AccumulatorAvg::getValue(bool toBeMerged) const {
+        if (!toBeMerged) {
             double avg = 0;
             if (count)
                 avg = doubleTotal / static_cast<double>(count);
 
-            return Value::createDouble(avg);
+            return Value(avg);
         }
+        else {
+            MutableDocument out;
+            out.addField(subTotalName, Value(doubleTotal));
+            out.addField(countName, Value(count));
 
-        MutableDocument out;
-        out.addField(subTotalName, Value::createDouble(doubleTotal));
-        out.addField(countName, Value::createLong(count));
-
-        return Value::createDocument(out.freeze());
+            return Value(out.freeze());
+        }
     }
 
-    AccumulatorAvg::AccumulatorAvg(
-        const intrusive_ptr<ExpressionContext> &pTheCtx):
-        AccumulatorSum(),
-        pCtx(pTheCtx) {
+    AccumulatorAvg::AccumulatorAvg() {
+        // This is a fixed size Accumulator so we never need to update this
+        _memUsageBytes = sizeof(*this);
     }
+
+    void AccumulatorAvg::reset() {
+        // All state is in parent
+        Super::reset();
+    }
+
 
     const char *AccumulatorAvg::getOpName() const {
         return "$avg";

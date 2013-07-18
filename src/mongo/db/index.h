@@ -25,7 +25,7 @@
 #include "mongo/db/diskloc.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/key.h"
-#include "mongo/db/namespace.h"
+#include "mongo/db/storage/namespace.h"
 
 namespace mongo {
 
@@ -176,7 +176,8 @@ namespace mongo {
 
     class NamespaceDetails;
     // changedId should be initialized to false
-    void assureSysIndexesEmptied(const char *ns, IndexDetails *exceptForIdIndex);
+    // @return how many things were deleted
+    int assureSysIndexesEmptied(const char *ns, IndexDetails *exceptForIdIndex);
     int removeFromSysIndexes(const char *ns, const char *idxName);
 
     /**

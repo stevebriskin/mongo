@@ -36,7 +36,6 @@ namespace {
     using mongo::ModifierSet;
     using mongo::Status;
     using mongo::StringData;
-    using mongo::mutablebson::checkDoc;
     using mongo::mutablebson::ConstElement;
     using mongo::mutablebson::countChildren;
     using mongo::mutablebson::Document;
@@ -47,9 +46,12 @@ namespace {
     public:
         Mod() : _mod() {}
 
-        explicit Mod(BSONObj modObj) {
+        explicit Mod(BSONObj modObj)
+            : _mod(mongoutils::str::equals(modObj.firstElement().fieldName(), "$setOnInsert") ?
+                   ModifierSet::SET_ON_INSERT : ModifierSet::SET_NORMAL) {
             _modObj = modObj;
-            ASSERT_OK(_mod.init(_modObj["$set"].embeddedObject().firstElement()));
+            const StringData& modName = modObj.firstElement().fieldName();
+            ASSERT_OK(_mod.init(_modObj[modName].embeddedObject().firstElement()));
         }
 
         Status prepare(Element root,
@@ -105,6 +107,19 @@ namespace {
         ASSERT_TRUE(execInfo.noOp);
     }
 
+    TEST(SimpleMod, PrepareSetOnInsert) {
+        Document doc(fromjson("{a: 1}"));
+        Mod setMod(fromjson("{$setOnInsert: {a: 2}}"));
+
+        ModifierInterface::ExecInfo execInfo;
+        ASSERT_OK(setMod.prepare(doc.root(), "", &execInfo));
+
+        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+        ASSERT_TRUE(execInfo.inPlace);
+        ASSERT_FALSE(execInfo.noOp);
+        ASSERT_EQUALS(execInfo.context, ModifierInterface::ExecInfo::INSERT_CONTEXT);
+    }
+
     TEST(SimpleMod, PrepareApplyEmptyDocument) {
         Document doc(fromjson("{}"));
         Mod setMod(fromjson("{$set: {a: 2}}"));
@@ -117,7 +132,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: 2}")));
+        ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     }
 
     TEST(SimpleMod, PrepareApplyInPlace) {
@@ -132,7 +147,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: 2}")));
+        ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     }
 
     TEST(SimpleMod, PrepareApplyOverridePath) {
@@ -147,7 +162,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: 2}")));
+        ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     }
 
     TEST(SimpleMod, PrepareApplyChangeType) {
@@ -162,7 +177,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: 2}")));
+        ASSERT_EQUALS(fromjson("{a: 2}"), doc);
     }
 
     TEST(SimpleMod, PrepareApplyNewPath) {
@@ -177,7 +192,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{b: 1, a: 2}")));
+        ASSERT_EQUALS(fromjson("{b: 1, a: 2}"), doc);
     }
 
     TEST(SimpleMod, LogNormal) {
@@ -191,7 +206,7 @@ namespace {
         Document logDoc;
         ASSERT_OK(setMod.log(logDoc.root()));
         ASSERT_EQUALS(countChildren(logDoc.root()), 1u);
-        ASSERT_TRUE(checkDoc(logDoc, fromjson("{$set: {a: 2}}")));
+        ASSERT_EQUALS(fromjson("{$set: {a: 2}}"), logDoc);
     }
 
     //
@@ -238,7 +253,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson(("{a: {b: 2}}"))));
+        ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     }
 
     TEST(DottedMod, PrepareApplyChangeType) {
@@ -253,7 +268,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson(("{a: {b: 2}}"))));
+        ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     }
 
     TEST(DottedMod, PrepareApplyChangePath) {
@@ -268,7 +283,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson(("{a: {b: 2}}"))));
+        ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     }
 
     TEST(DottedMod, PrepareApplyExtendPath) {
@@ -283,7 +298,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson(("{a: {c: 1, b: 2}}"))));
+        ASSERT_EQUALS(fromjson("{a: {c: 1, b: 2}}"), doc);
     }
 
     TEST(DottedMod, PrepareApplyNewPath) {
@@ -298,7 +313,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{c: 1, a: {b: 2}}")));
+        ASSERT_EQUALS(fromjson("{c: 1, a: {b: 2}}"), doc);
     }
 
     TEST(DottedMod, PrepareApplyEmptyDoc) {
@@ -313,7 +328,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: {b: 2}}")));
+        ASSERT_EQUALS(fromjson("{a: {b: 2}}"), doc);
     }
 
     TEST(DottedMod, PrepareApplyFieldWithDot) {
@@ -328,7 +343,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{'a.b':4, a: {b: 2}}")));
+        ASSERT_EQUALS(fromjson("{'a.b':4, a: {b: 2}}"), doc);
     }
 
     //
@@ -367,7 +382,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: [{b: 0},{b: 1},{b: 2}]}")));
+        ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"), doc);
     }
 
     TEST(IndexedMod, PrepareApplyNormalArray) {
@@ -382,7 +397,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: [{b: 0},{b: 1},{b: 2}]}")));
+        ASSERT_EQUALS(fromjson("{a: [{b: 0},{b: 1},{b: 2}]}"), doc);
     }
 
     TEST(IndexedMod, PrepareApplyPaddingArray) {
@@ -397,7 +412,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: [{b: 0},null,{b: 2}]}")));
+        ASSERT_EQUALS(fromjson("{a: [{b: 0},null,{b: 2}]}"), doc);
     }
 
     TEST(IndexedMod, PrepareApplyNumericObject) {
@@ -412,7 +427,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: {b: 0, '2': {b: 2}}}")));
+        ASSERT_EQUALS(fromjson("{a: {b: 0, '2': {b: 2}}}"), doc);
     }
 
     TEST(IndexedMod, PrepareApplyNumericField) {
@@ -427,7 +442,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: {'2': {b: 2}}}")));
+        ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     }
 
     TEST(IndexedMod, PrepareApplyExtendNumericField) {
@@ -442,7 +457,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: {'2': {c: 1, b: 2}}}")));
+        ASSERT_EQUALS(fromjson("{a: {'2': {c: 1, b: 2}}}"), doc);
     }
 
     TEST(IndexedMod, PrepareApplyEmptyObject) {
@@ -457,7 +472,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: {'2': {b: 2}}}")));
+        ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     }
 
     TEST(IndexedMod, PrepareApplyEmptyArray) {
@@ -472,7 +487,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: [null, null, {b: 2}]}")));
+        ASSERT_EQUALS(fromjson("{a: [null, null, {b: 2}]}"), doc);
     }
 
     TEST(IndexedMod, PrepareApplyInexistent) {
@@ -487,7 +502,7 @@ namespace {
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(setMod.apply());
-        ASSERT_TRUE(checkDoc(doc, fromjson("{a: {'2': {b: 2}}}")));
+        ASSERT_EQUALS(fromjson("{a: {'2': {b: 2}}}"), doc);
     }
 
     TEST(IndexedMod, LogNormal) {
@@ -499,10 +514,9 @@ namespace {
         ASSERT_OK(setMod.prepare(doc.root(), "", &execInfo));
 
         Document logDoc;
-        BSONObj logObj = fromjson("{$set: {'a.2.b': 2}}");
         ASSERT_OK(setMod.log(logDoc.root()));
         ASSERT_EQUALS(countChildren(logDoc.root()), 1u);
-        ASSERT_TRUE(checkDoc(logDoc, logObj));
+        ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), logDoc);
     }
 
     TEST(IndexedMod, LogEmptyArray) {
@@ -514,10 +528,9 @@ namespace {
         ASSERT_OK(setMod.prepare(doc.root(), "", &execInfo));
 
         Document logDoc;
-        BSONObj logObj = fromjson("{$set: {'a.2.b': 2}}");
         ASSERT_OK(setMod.log(logDoc.root()));
         ASSERT_EQUALS(countChildren(logDoc.root()), 1u);
-        ASSERT_TRUE(checkDoc(logDoc, logObj));
+        ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), logDoc);
     }
 
     TEST(IndexedMod, LogEmptyObject) {
@@ -529,10 +542,9 @@ namespace {
         ASSERT_OK(setMod.prepare(doc.root(), "", &execInfo));
 
         Document logDoc;
-        BSONObj logObj = fromjson("{$set: {'a.2.b': 2}}");
         ASSERT_OK(setMod.log(logDoc.root()));
         ASSERT_EQUALS(countChildren(logDoc.root()), 1u);
-        ASSERT_TRUE(checkDoc(logDoc, logObj));
+        ASSERT_EQUALS(fromjson("{$set: {'a.2.b': 2}}"), logDoc);
     }
 
     //

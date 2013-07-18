@@ -432,7 +432,7 @@ namespace mongo {
         vector<shared_ptr<QueryPlan> > plans;
         shared_ptr<QueryPlan> optimalPlan;
         shared_ptr<QueryPlan> specialPlan;
-        for( int i = 0; i < d->nIndexes; ++i ) {
+        for( int i = 0; i < d->getCompletedIndexCount(); ++i ) {
             
             if ( !QueryUtilIndexed::indexUseful( _qps.frsp(), d, i, _qps.order() ) ) {
                 continue;
@@ -946,8 +946,9 @@ namespace mongo {
     shared_ptr<QueryPlanRunner> QueryPlanRunnerQueue::init() {
         massert( 10369, "no plans", _plans.plans().size() > 0 );
         
-        if ( _plans.plans().size() > 1 )
+        if ( _plans.plans().size() > 1 ) {
             LOG(1) << "  running multiple plans" << endl;
+        }
         for( QueryPlanSet::PlanVector::const_iterator i = _plans.plans().begin();
              i != _plans.plans().end(); ++i ) {
             shared_ptr<QueryPlanRunner> runner( _prototypeRunner.createChild() );
@@ -1607,7 +1608,7 @@ namespace mongo {
             }
             else {
                 bool useful = false;
-                for( int j = 0; j < d->nIndexes; ++j ) {
+                for( int j = 0; j < d->getCompletedIndexCount(); ++j ) {
                     if ( indexUseful( *i, d, j, BSONObj() ) ) {
                         useful = true;
                         break;

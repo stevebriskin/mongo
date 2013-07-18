@@ -55,12 +55,12 @@ namespace mongo {
             }
         }
 
-        if( d->nIndexes >= NamespaceDetails::NIndexesMax ) {
+        if( d->getCompletedIndexCount() >= NamespaceDetails::NIndexesMax ) {
             problem() << "Helper::ensureIndex fails, MaxIndexes exceeded " << ns << '\n';
             return;
         }
 
-        string system_indexes = cc().database()->name + ".system.indexes";
+        string system_indexes = cc().database()->name() + ".system.indexes";
 
         BSONObjBuilder b;
         b.append("name", name);
@@ -108,7 +108,7 @@ namespace mongo {
         Lock::assertAtLeastReadLocked(ns);
         Database *database = c.database();
         verify( database );
-        NamespaceDetails *d = database->namespaceIndex.details(ns);
+        NamespaceDetails *d = database->namespaceIndex().details(ns);
         if ( ! d )
             return false;
         if ( nsFound )
@@ -357,7 +357,7 @@ namespace mongo {
                 // this is so that we don't have to handle this cursor in the delete code
                 c.reset(0);
 
-                if (fromMigrate && onlyRemoveOrphanedDocs) {
+                if ( onlyRemoveOrphanedDocs ) {
 
                     // Do a final check in the write lock to make absolutely sure that our
                     // collection hasn't been modified in a way that invalidates our migration
@@ -368,14 +368,14 @@ namespace mongo {
                     verify(shardingState.enabled());
 
                     // In write lock, so will be the most up-to-date version
-                    // TODO: This is not quite correct, we may be transferring docs in the same
-                    // range.  Right now we're protected since we can't transfer docs in while we
-                    // delete.
-                    ShardChunkManagerPtr managerNow = shardingState.getShardChunkManager( ns );
-                    bool docIsOrphan = true;
-                    if ( managerNow ) {
-                        KeyPattern kp( managerNow->getKeyPattern() );
-                        docIsOrphan = !managerNow->keyBelongsToMe( kp.extractSingleKey( obj ) );
+                    CollectionMetadataPtr metadataNow = shardingState.getCollectionMetadata( ns );
+
+                    bool docIsOrphan;
+                    if ( metadataNow ) {
+                        KeyPattern kp( metadataNow->getKeyPattern() );
+                        BSONObj key = kp.extractSingleKey( obj );
+                        docIsOrphan = !metadataNow->keyBelongsToMe( key )
+                            && !metadataNow->keyIsPending( key );
                     }
                     else {
                         docIsOrphan = false;
@@ -383,7 +383,7 @@ namespace mongo {
 
                     if ( !docIsOrphan ) {
                         warning() << "aborting migration cleanup for chunk " << min << " to " << max
-                                  << ( managerNow ? (string) " at document " + obj.toString() : "" )
+                                  << ( metadataNow ? (string) " at document " + obj.toString() : "" )
                                   << ", collection " << ns << " has changed " << endl;
                         break;
                     }
@@ -473,10 +473,10 @@ namespace mongo {
         // sizes will vary
         long long avgDocsWhenFull;
         long long avgDocSizeBytes;
-        const long long totalDocsInNS = details->stats.nrecords;
+        const long long totalDocsInNS = details->numRecords();
         if ( totalDocsInNS > 0 ) {
             // TODO: Figure out what's up here
-            avgDocSizeBytes = details->stats.datasize / totalDocsInNS;
+            avgDocSizeBytes = details->dataSize() / totalDocsInNS;
             avgDocsWhenFull = maxChunkSizeBytes / avgDocSizeBytes;
             avgDocsWhenFull = std::min( kMaxDocsPerChunk + 1,
                                         130 * avgDocsWhenFull / 100 /* slack */);

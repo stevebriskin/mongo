@@ -15,20 +15,21 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authz_session_external_state_s.h"
-#include "mongo/s/shard.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/matcher.h"
+#include "mongo/s/client_info.h"
 #include "mongo/s/grid.h"
-#include "request.h"
-#include "client_info.h"
-#include "../db/dbhelpers.h"
-#include "../db/matcher.h"
-#include "../db/commands.h"
+#include "mongo/s/request.h"
+#include "mongo/s/shard.h"
+#include "mongo/util/concurrency/thread_name.h"
 
 /*
   most a pile of hacks to make linking nicer
@@ -122,39 +123,13 @@ namespace mongo {
                                          BSONObj& cmdObj,
                                          BSONObjBuilder& result,
                                          bool fromRepl ) {
-        verify(c);
-
         std::string dbname = nsToDatabase(ns);
 
-        // Access control checks
-        if (AuthorizationManager::isAuthEnabled()) {
-            std::vector<Privilege> privileges;
-            c->addRequiredPrivileges(dbname, cmdObj, &privileges);
-            AuthorizationSession* authSession = client.getAuthorizationSession();
-            if (!authSession->checkAuthForPrivileges(privileges).isOK()) {
-                result.append("note", str::stream() << "not authorized for command: " <<
-                                    c->name << " on database " << dbname);
-                appendCommandStatus(result, false, "unauthorized");
-                return;
-            }
-        }
-        if (c->adminOnly() &&
-                c->localHostOnlyIfNoAuth(cmdObj) &&
-                !AuthorizationManager::isAuthEnabled() &&
-                !client.getIsLocalHostConnection()) {
-            log() << "command denied: " << cmdObj.toString() << endl;
-            appendCommandStatus(result,
-                               false,
-                               "unauthorized: this command must run from localhost when running db "
-                               "without auth");
+        Status status = _checkAuthorization(c, &client, dbname, cmdObj, fromRepl);
+        if (!status.isOK()) {
+            appendCommandStatus(result, status);
             return;
         }
-        if (c->adminOnly() && !startsWith(ns, "admin.")) {
-            log() << "command denied: " << cmdObj.toString() << endl;
-            appendCommandStatus(result, false, "access denied - use admin db");
-            return;
-        }
-        // End of access control checks
 
         if (cmdObj.getBoolField("help")) {
             stringstream help;

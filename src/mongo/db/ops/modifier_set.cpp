@@ -55,9 +55,10 @@ namespace mongo {
 
     };
 
-    ModifierSet::ModifierSet()
+    ModifierSet::ModifierSet(ModifierSet::ModifierSetMode mode)
         : _fieldRef()
         , _posDollar(0)
+        , _setMode(mode)
         , _val() {
     }
 
@@ -78,8 +79,13 @@ namespace mongo {
             return status;
         }
 
-        // If a $-positional operator was used, get the index in which it occurred.
-        fieldchecker::isPositional(_fieldRef, &_posDollar);
+        // If a $-positional operator was used, get the index in which it occurred
+        // and ensure only one occurrence.
+        size_t foundCount;
+        bool foundDollar = fieldchecker::isPositional(_fieldRef, &_posDollar, &foundCount);
+        if (foundDollar && foundCount > 1) {
+            return Status(ErrorCodes::BadValue, "too many positional($) elements found.");
+        }
 
         //
         // value analysis
@@ -141,6 +147,10 @@ namespace mongo {
             return status;
         }
 
+        if (_setMode == SET_ON_INSERT) {
+            execInfo->context = ModifierInterface::ExecInfo::INSERT_CONTEXT;
+        }
+
         // We register interest in the field name. The driver needs this info to sort out if
         // there is any conflict among mods.
         execInfo->fieldRef[0] = &_fieldRef;
@@ -158,7 +168,9 @@ namespace mongo {
 
         // We may allow this $set to be in place if the value being set and the existing one
         // have the same size.
-        if (_val.isNumber() && (_val.type() == _preparedState->elemFound.getType())) {
+        if (_val.isNumber() &&
+            (_preparedState->elemFound != root.getDocument().end()) &&
+            (_val.type() == _preparedState->elemFound.getType())) {
             execInfo->inPlace = _preparedState->inPlace = true;
         }
 

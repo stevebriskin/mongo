@@ -90,16 +90,6 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status HashIndexCursor::seek(const vector<const BSONElement*>& position,
-                                 const vector<bool>& inclusive) {
-        return Status(ErrorCodes::IllegalOperation, "Unimplemented seek called on Hash index");
-    }
-
-    Status HashIndexCursor::skip(const vector<const BSONElement*>& position,
-                                 const vector<bool>& inclusive) {
-        return Status(ErrorCodes::IllegalOperation, "Unimplemented seek called on Hash index");
-    }
-
     bool HashIndexCursor::isEOF() const { return _oldCursor->eof(); }
     BSONObj HashIndexCursor::getKey() const { return _oldCursor->currKey(); }
     DiskLoc HashIndexCursor::getValue() const { return _oldCursor->currLoc(); }
@@ -108,9 +98,5 @@ namespace mongo {
 
     Status HashIndexCursor::savePosition() { _oldCursor->noteLocation(); return Status::OK(); }
     Status HashIndexCursor::restorePosition() { _oldCursor->checkLocation(); return Status::OK(); }
-
-    void HashIndexCursor::aboutToDeleteBucket(const DiskLoc& bucket) {
-        _oldCursor->aboutToDeleteBucket(bucket);
-    }
 
 }  // namespace mongo

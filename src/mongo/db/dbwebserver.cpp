@@ -26,12 +26,14 @@
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <pcrecpp.h>
 
+#include "mongo/base/init.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/principal.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
+#include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
 #include "mongo/db/instance.h"
@@ -49,8 +51,6 @@ namespace mongo {
 
     using namespace mongoutils::html;
     using namespace bson;
-
-    time_t started = time(0);
 
     struct Timing {
         Timing() {
@@ -75,7 +75,7 @@ namespace mongo {
             ss << mongodVersion() << '\n';
             ss << "git hash: " << gitVersion() << '\n';
             ss << "sys info: " << sysInfo() << '\n';
-            ss << "uptime: " << time(0)-started << " seconds\n";
+            ss << "uptime: " << time(0)-cmdLine.started << " seconds\n";
             ss << "</pre>";
         }
 
@@ -324,20 +324,15 @@ namespace mongo {
 
     vector<WebStatusPlugin*> * WebStatusPlugin::_plugins = 0;
 
-    // -- basic statuc plugins --
+    // -- basic status plugins --
 
     class LogPlugin : public WebStatusPlugin {
     public:
         LogPlugin() : WebStatusPlugin( "Log" , 100 ), _log(0) {
+            _log = RamLog::get( "global" );
         }
 
-        virtual void init() {
-            _log = RamLog::get( "global" );
-            if ( ! _log ) {
-                _log = new RamLog("global");
-                Logstream::get().addGlobalTee( _log );
-            }
-        }
+        virtual void init() {}
 
         virtual void run( stringstream& ss ) {
             _log->toHTML( ss );
@@ -345,7 +340,12 @@ namespace mongo {
         RamLog * _log;
     };
 
-    LogPlugin * logPlugin = new LogPlugin();
+    MONGO_INITIALIZER(WebStatusLogPlugin)(InitializerContext*) {
+        if (cmdLine.isHttpInterfaceEnabled) {
+            new LogPlugin;
+        }
+        return Status::OK();
+    }
 
     // -- handler framework ---
 

@@ -48,9 +48,6 @@ namespace mongo {
         // XXX SHORT TERM HACKS THAT MUST DIE: 2d index
         virtual int getKeyOfs() const { return 0; }
 
-        // XXX SHORT TERM HACKS THAT MUST DIE: btree deletion
-        virtual void aboutToDeleteBucket(const DiskLoc& bucket) { }
-
         /**
          * Set options on the cursor (direction).  See CursorOptions below.
          */
@@ -67,34 +64,6 @@ namespace mongo {
          * 3. Error: can't seek to the position.
          */
         virtual Status seek(const BSONObj& position) = 0;
-
-        /**
-         * Same contract as the seek above.  This method is here because of the historical
-         * super-tight coupling of the BtreeCursor, the Btree access methods, and various query
-         * logic (FieldRangeVector) which expect to be able to seek with the arguments below.
-         *
-         * DEPRECATED.  Only the Btree should implement this.  If/when query processing is cleaned
-         * up, this will likely die.
-         *
-         * Seek to the provided position.
-         * We expect that position.size() == inclusive.size().
-         * If inclusive[i] is true, the i-th field of the key can be equal to position[i].
-         * If inclusive[i] is false, the i-th field of the key cannot be.  Whether or not it
-         * is less than or greater than position[i] depends on the direction of the cursor.
-         */
-        virtual Status seek(const vector<const BSONElement*>& position,
-                            const vector<bool>& inclusive) = 0;
-
-        /**
-         * Seek to a key from our current position, as opposed to the root of the tree.
-         * Aforementioned tight coupling between query and Btree expects to have quick skips from
-         * the current position in the cursor.  See comments for the two argument seek(...) above.
-         *
-         * DEPRECATED.  Only the Btree should implement this.  If/when query processing is cleaned
-         * up, this will die.
-         */
-        virtual Status skip(const vector<const BSONElement*>& position,
-                            const vector<bool>& inclusive) = 0;
 
         //
         // Iteration support

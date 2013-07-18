@@ -88,16 +88,6 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status S2SimpleCursor::seek(const vector<const BSONElement*>& position,
-                                         const vector<bool>& inclusive) {
-        return Status::OK();
-    }
-
-    Status S2SimpleCursor::skip(const vector<const BSONElement*>& position,
-                                         const vector<bool> &inclusive) {
-        return Status::OK();
-    }
-
     Status S2SimpleCursor::setOptions(const CursorOptions& options) {
         return Status::OK();
     }
@@ -105,10 +95,6 @@ namespace mongo {
     bool S2SimpleCursor::isEOF() const { return !_btreeCursor->ok(); }
     BSONObj S2SimpleCursor::getKey() const { return _btreeCursor->currKey(); }
     DiskLoc S2SimpleCursor::getValue() const { return _btreeCursor->currLoc(); }
-
-    void S2SimpleCursor::aboutToDeleteBucket(const DiskLoc& bucket) {
-        _btreeCursor->aboutToDeleteBucket(bucket);
-    }
 
     void S2SimpleCursor::next() {
         for (; _btreeCursor->ok(); _btreeCursor->advance()) {

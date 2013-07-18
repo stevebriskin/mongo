@@ -108,8 +108,6 @@ namespace mongo {
             return false;
         }
 
-        virtual void aboutToDeleteBucket(const DiskLoc& b) { }
-
         /* optional to implement.  if implemented, means 'this' is a prototype */
         virtual Cursor* clone() {
             return 0;
@@ -211,6 +209,12 @@ namespace mongo {
         }
         
         virtual void explainDetails( BSONObjBuilder& b ) { return; }
+
+        /// Should getmore handle locking for you
+        virtual bool requiresLock() { return true; }
+
+        /// Should this cursor be destroyed when it's namespace is deleted
+        virtual bool shouldDestroyOnNSDeletion() { return true; }
     };
 
     // strategy object implementing direction of traversal.

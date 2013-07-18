@@ -21,52 +21,48 @@
 #include "db/pipeline/value.h"
 
 namespace mongo {
-    Value AccumulatorAddToSet::evaluate(const Document& pDocument) const {
-        verify(vpOperand.size() == 1);
-        Value prhs(vpOperand[0]->evaluate(pDocument));
-
-        if (!pCtx->getDoingMerge()) {
-            if (!prhs.missing()) {
-                set.insert(prhs);
+    void AccumulatorAddToSet::processInternal(const Value& input, bool merging) {
+        if (!merging) {
+            if (!input.missing()) {
+                bool inserted = set.insert(input).second;
+                if (inserted) {
+                    _memUsageBytes += input.getApproximateSize();
+                }
             }
-        } else {
-            /*
-              If we're in the router, we need to take apart the arrays we
-              receive and put their elements into the array we are collecting.
-              If we didn't, then we'd get an array of arrays, with one array
-              from each shard that responds.
-             */
-            verify(prhs.getType() == Array);
+        }
+        else {
+            // If we're merging, we need to take apart the arrays we
+            // receive and put their elements into the array we are collecting.
+            // If we didn't, then we'd get an array of arrays, with one array
+            // from each merge source.
+            verify(input.getType() == Array);
             
-            const vector<Value>& array = prhs.getArray();
-            set.insert(array.begin(), array.end());
+            const vector<Value>& array = input.getArray();
+            for (size_t i=0; i < array.size(); i++) {
+                bool inserted = set.insert(array[i]).second;
+                if (inserted) {
+                    _memUsageBytes += array[i].getApproximateSize();
+                }
+            }
         }
-
-        return Value();
     }
 
-    Value AccumulatorAddToSet::getValue() const {
-        vector<Value> valVec;
-
-        for (itr = set.begin(); itr != set.end(); ++itr) {
-            valVec.push_back(*itr);
-        }
-        /* there is no issue of scope since createArray copy constructs */
-        return Value::createArray(valVec);
+    Value AccumulatorAddToSet::getValue(bool toBeMerged) const {
+        vector<Value> valVec(set.begin(), set.end());
+        return Value::consume(valVec);
     }
 
-    AccumulatorAddToSet::AccumulatorAddToSet(
-        const intrusive_ptr<ExpressionContext> &pTheCtx):
-        Accumulator(),
-        set(),
-        pCtx(pTheCtx) {
+    AccumulatorAddToSet::AccumulatorAddToSet() {
+        _memUsageBytes = sizeof(*this);
     }
 
-    intrusive_ptr<Accumulator> AccumulatorAddToSet::create(
-        const intrusive_ptr<ExpressionContext> &pCtx) {
-        intrusive_ptr<AccumulatorAddToSet> pAccumulator(
-            new AccumulatorAddToSet(pCtx));
-        return pAccumulator;
+    void AccumulatorAddToSet::reset() {
+        SetType().swap(set);
+        _memUsageBytes = sizeof(*this);
+    }
+
+    intrusive_ptr<Accumulator> AccumulatorAddToSet::create() {
+        return new AccumulatorAddToSet();
     }
 
     const char *AccumulatorAddToSet::getOpName() const {

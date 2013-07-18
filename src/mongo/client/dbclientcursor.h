@@ -78,8 +78,7 @@ namespace mongo {
             BSONObj o = next();
             if( strcmp(o.firstElementFieldName(), "$err") == 0 ) {
                 string s = "nextSafe(): " + o.toString();
-                if( logLevel >= 5 )
-                    log() << s << endl;
+                LOG(5) << s;
                 uasserted(13106, s);
             }
             return o;
@@ -129,6 +128,9 @@ namespace mongo {
             _assertIfNull();
             return (resultFlags & flag) != 0;
         }
+
+        /// Change batchSize after construction. Can change after requesting first batch.
+        void setBatchSize(int newBatchSize) { batchSize = newBatchSize; }
 
         DBClientCursor( DBClientBase* client, const string &_ns, BSONObj _query, int _nToReturn,
                         int _nToSkip, const BSONObj *_fieldsToReturn, int queryOptions , int bs ) :

@@ -20,7 +20,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/field_ref.h"
-#include "mongo/db/ops/modifier_interface.h"
+#include "mongo/db/field_ref_set.h"
 #include "mongo/db/ops/modifier_object_replace.h"
 #include "mongo/db/ops/modifier_table.h"
 #include "mongo/util/embedded_builder.h"
@@ -38,8 +38,10 @@ namespace mongo {
         clear();
     }
 
-    Status UpdateDriver::parse(const BSONObj& updateExpr) {
+    Status UpdateDriver::parse(const IndexPathSet& indexedFields, const BSONObj& updateExpr) {
         clear();
+
+        _indexedFields = indexedFields;
 
         // Check if the update expression is a full object replacement.
         if (*updateExpr.firstElementFieldName() != '$') {
@@ -61,6 +63,9 @@ namespace mongo {
 
             _mods.push_back(mod.release());
 
+            // Register the fact that this driver will only do full object replacements.
+            _dollarModMode = false;
+
             return Status::OK();
         }
 
@@ -70,9 +75,20 @@ namespace mongo {
         while (outerIter.more()) {
             BSONElement outerModElem = outerIter.next();
 
+            // Check whether this is a valid mod type.
             modifiertable::ModifierType modType = modifiertable::getType(outerModElem.fieldName());
             if (modType == modifiertable::MOD_UNKNOWN) {
-                return Status(ErrorCodes::FailedToParse, "wrong modifier type");
+                return Status(ErrorCodes::FailedToParse, "unknown modifier type");
+            }
+
+            // Check whether there is indeed a list of mods under this modifier.
+            if (outerModElem.type() != Object) {
+                return Status(ErrorCodes::FailedToParse, "List of mods must be an object");
+            }
+
+            // Check whether there are indeed mods under this modifier.
+            if (outerModElem.embeddedObject().isEmpty()) {
+                return Status(ErrorCodes::FailedToParse, "Empty expression after update $mod");
             }
 
             BSONObjIterator innerIter(outerModElem.embeddedObject());
@@ -83,7 +99,8 @@ namespace mongo {
                 dassert(mod.get());
 
                 if (innerModElem.eoo()) {
-                    return Status(ErrorCodes::FailedToParse, "empty mod");
+                    return Status(ErrorCodes::FailedToParse,
+                                  "empty entry in $mod expression list");
                 }
 
                 Status status = mod->init(innerModElem);
@@ -94,6 +111,10 @@ namespace mongo {
                 _mods.push_back(mod.release());
             }
         }
+
+        // Register the fact that there will be only $mod's in this driver -- no object
+        // replacement.
+        _dollarModMode = true;
 
         return Status::OK();
     }
@@ -138,36 +159,73 @@ namespace mongo {
         return true;
     }
 
-    Status UpdateDriver::update(const BSONObj& oldObj,
-                                const StringData& matchedField,
-                                BSONObj* newObj,
+    Status UpdateDriver::update(const StringData& matchedField,
+                                mutablebson::Document* doc,
                                 BSONObj* logOpRec) {
         // TODO: assert that update() is called at most once in a !_multi case.
 
-        mutablebson::Document doc(oldObj);
+        FieldRefSet targetFields;
+        _affectIndices = false;
 
+        // Ask each of the mods to type check whether they can operate over the current document
+        // and, if so, to change that document accordingly.
         for (vector<ModifierInterface*>::iterator it = _mods.begin(); it != _mods.end(); ++it) {
             ModifierInterface::ExecInfo execInfo;
-            Status status = (*it)->prepare(doc.root(), matchedField, &execInfo);
+            Status status = (*it)->prepare(doc->root(), matchedField, &execInfo);
             if (!status.isOK()) {
                 return status;
             }
 
-            // TODO: gather the fields that each mod is interested on and check for conflicts.
-            // for (int i = 0; i < ModifierInterface::ExecInfo::MAX_NUM_FIELDS; i++) {
-            //     if (execInfo.fieldRef[i] == 0) {
-            //         break;
-            //     }
-            // }
+            // If a mod wants to be applied only if this is an upsert (or only if this is a
+            // strict update), we should respect that. If a mod doesn't care, it would state
+            // it is fine with ANY update context.
+            bool validContext = false;
+            if (execInfo.context == ModifierInterface::ExecInfo::ANY_CONTEXT ||
+                execInfo.context == _context) {
+                validContext = true;
+            }
 
-            if (!execInfo.noOp) {
-                status = (*it)->apply();
+            // Gather which fields this mod is interested on and whether these fields were
+            // "taken" by previous mods.  Note that not all mods are multi-field mods. When we
+            // see an empty field, we may stop looking for others.
+            for (int i = 0; i < ModifierInterface::ExecInfo::MAX_NUM_FIELDS; i++) {
+                if (execInfo.fieldRef[i] == 0) {
+                    break;
+                }
+
+                const FieldRef* other;
+                if (!targetFields.insert(execInfo.fieldRef[i], &other)) {
+                    return Status(ErrorCodes::ConflictingUpdateOperators,
+                                  mongoutils::str::stream()
+                                      << "Cannot update '" << other->dottedField()
+                                      << "' and '" << execInfo.fieldRef[i]->dottedField()
+                                      << "' at the same time");
+                }
+
+                // We start with the expectation that a mod will be in-place. But if the mod
+                // touched an indexed field and the mod will indeed be executed -- that is, it
+                // is not a no-op and it is in a valid context -- then we switch back to a
+                // non-in-place mode.
+                //
+                // TODO: make mightBeIndexed and fieldRef like each other.
+                if (!_affectIndices &&
+                    !execInfo.noOp &&
+                    validContext &&
+                    _indexedFields.mightBeIndexed(execInfo.fieldRef[i]->dottedField())) {
+                    _affectIndices = true;
+                    doc->disableInPlaceUpdates();
+                }
+            }
+
+            if (!execInfo.noOp && validContext) {
+                Status status = (*it)->apply();
                 if (!status.isOK()) {
                     return status;
                 }
             }
         }
 
+        // If we require a replication oplog entry for this update, go ahead and generate one.
         if (_logOp && logOpRec) {
             mutablebson::Document logDoc;
             for (vector<ModifierInterface*>::iterator it = _mods.begin(); it != _mods.end(); ++it) {
@@ -179,12 +237,19 @@ namespace mongo {
             *logOpRec = logDoc.getObject();
         }
 
-        *newObj = doc.getObject();
         return Status::OK();
     }
 
     size_t UpdateDriver::numMods() const {
         return _mods.size();
+    }
+
+    bool UpdateDriver::dollarModMode() const {
+        return _dollarModMode;
+    }
+
+    bool UpdateDriver::modsAffectIndices() const {
+        return _affectIndices;
     }
 
     bool UpdateDriver::multi() const {
@@ -211,10 +276,20 @@ namespace mongo {
         _logOp = logOp;
     }
 
+    ModifierInterface::ExecInfo::UpdateContext UpdateDriver::context() const {
+        return _context;
+    }
+
+    void UpdateDriver::setContext(ModifierInterface::ExecInfo::UpdateContext context) {
+        _context = context;
+    }
+
     void UpdateDriver::clear() {
         for (vector<ModifierInterface*>::iterator it = _mods.begin(); it != _mods.end(); ++it) {
             delete *it;
         }
+        _indexedFields.clear();
+        _dollarModMode = false;
     }
 
 } // namespace mongo

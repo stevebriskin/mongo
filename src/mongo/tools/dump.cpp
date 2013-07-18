@@ -25,7 +25,7 @@
 #include "mongo/base/initializer.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/db.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/tools/tool.h"
 #include "mongo/util/text.h"
 
@@ -218,7 +218,7 @@ public:
               continue;
             }
 
-            if (NamespaceString(name).coll == "system.indexes") {
+            if (nsToCollectionSubstring(name) == "system.indexes") {
               // Create system.indexes.bson for compatibility with pre 2.2 mongorestore
               const string filename = name.substr( db.size() + 1 );
               writeCollectionFile( name.c_str() , outdir / ( filename + ".bson" ) );
@@ -267,7 +267,7 @@ public:
         }
         
 
-        MongoDataFile * mdf = db->getFile( eLoc.a() );
+        DataFile * mdf = db->getFile( eLoc.a() );
 
         Extent * e = mdf->debug_getExtent( eLoc );
         if ( ! e->isOk() ){
@@ -329,38 +329,38 @@ public:
     }
 
     void _repair( Database* db , string ns , boost::filesystem::path outfile ){
-        NamespaceDetails * nsd = nsdetails( ns );
-        log() << "nrecords: " << nsd->stats.nrecords 
-              << " datasize: " << nsd->stats.datasize 
-              << " firstExtent: " << nsd->firstExtent 
+        const NamespaceDetails * nsd = nsdetails( ns );
+        log() << "nrecords: " << nsd->numRecords()
+              << " datasize: " << nsd->dataSize()
+              << " firstExtent: " << nsd->firstExtent()
               << endl;
-        
-        if ( nsd->firstExtent.isNull() ){
+
+        if ( nsd->firstExtent().isNull() ){
             log() << " ERROR fisrtExtent is null" << endl;
             return;
         }
-        
-        if ( ! nsd->firstExtent.isValid() ){
+
+        if ( ! nsd->firstExtent().isValid() ){
             log() << " ERROR fisrtExtent is not valid" << endl;
             return;
         }
 
         outfile /= ( ns.substr( ns.find( "." ) + 1 ) + ".bson" );
         log() << "writing to: " << outfile.string() << endl;
-        
+
         FilePtr f (fopen(outfile.string().c_str(), "wb"));
 
         // init with double the docs count because we make two passes 
-        ProgressMeter m( nsd->stats.nrecords * 2 );
+        ProgressMeter m( nsd->numRecords() * 2 );
         m.setName("Repair Progress");
         m.setUnits("objects");
-        
+
         Writer w( f , &m );
 
         try {
             log() << "forward extent pass" << endl;
             LogIndentLevel lil;
-            DiskLoc eLoc = nsd->firstExtent;
+            DiskLoc eLoc = nsd->firstExtent();
             while ( ! eLoc.isNull() ){
                 log() << "extent loc: " << eLoc << endl;
                 eLoc = _repairExtent( db , ns , true , eLoc , w );
@@ -373,7 +373,7 @@ public:
         try {
             log() << "backwards extent pass" << endl;
             LogIndentLevel lil;
-            DiskLoc eLoc = nsd->lastExtent;
+            DiskLoc eLoc = nsd->lastExtent();
             while ( ! eLoc.isNull() ){
                 log() << "extent loc: " << eLoc << endl;
                 eLoc = _repairExtent( db , ns , false , eLoc , w );
@@ -389,10 +389,10 @@ public:
     int _repair( string dbname ) {
         Client::WriteContext cx( dbname );
         Database * db = cx.ctx().db();
-        
+
         list<string> namespaces;
-        db->namespaceIndex.getNamespaces( namespaces );
-        
+        db->namespaceIndex().getNamespaces( namespaces );
+
         boost::filesystem::path root = getParam( "out" );
         root /= dbname;
         boost::filesystem::create_directories( root );

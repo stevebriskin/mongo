@@ -20,7 +20,6 @@
 #include <ctime>
 #include <string>
 #include <boost/thread/xtime.hpp>
-#include <boost/date_time/posix_time/posix_time.hpp>
 
 #include "mongo/bson/util/misc.h"  // Date_t
 
@@ -33,8 +32,8 @@ namespace mongo {
      *
      * Wed Oct 31 13:34:47.996
      *
-     * @param timeStr pointer to the buffer to set the string - should at least be
-     *     24 bytes big.
+     * @param timeStr pointer to the buffer to set the string - empirically, 64 bytes is enough for
+     * the buffer, 26 is not.
      */
     void curTimeString(char* timeStr);
 
@@ -103,3 +102,4 @@ namespace mongo {
 #endif
 
 }  // namespace mongo
+

@@ -126,20 +126,24 @@ namespace mongo {
         std::string logpath;   // Path to log file, if logging to a file; otherwise, empty.
         bool logAppend;        // True if logging to a file in append mode.
         bool logWithSyslog;    // True if logging to syslog; must not be set if logpath is set.
+        std::string clusterAuthMode; // Cluster authentication mode
+
+        bool isHttpInterfaceEnabled; // True if the dbwebserver should be enabled.
 
 #ifndef _WIN32
         ProcessId parentProc;      // --fork pid of initial process
         ProcessId leaderProc;      // --fork pid of leader process
 #endif
-
 #ifdef MONGO_SSL
         bool sslOnNormalPorts;      // --sslOnNormalPorts
         std::string sslPEMKeyFile;       // --sslPEMKeyFile
         std::string sslPEMKeyPassword;   // --sslPEMKeyPassword
+        std::string sslClusterFile;       // --sslInternalKeyFile
+        std::string sslClusterPassword;   // --sslInternalKeyPassword
         std::string sslCAFile;      // --sslCAFile
         std::string sslCRLFile;     // --sslCRLFile
-        bool sslWeakCertificateValidation;
-        bool sslFIPSMode;
+        bool sslWeakCertificateValidation; // --sslWeakCertificateValidation
+        bool sslFIPSMode; // --sslFIPSMode
 #endif
 
         /**
@@ -194,7 +198,7 @@ namespace mongo {
         durOptions(0), objcheck(true), oplogSize(0), defaultProfile(0),
         slowMS(100), defaultLocalThresholdMillis(15), pretouch(0), moveParanoia( false ),
         syncdelay(60), noUnixSocket(false), doFork(0), socket("/tmp"), maxConns(DEFAULT_MAX_CONN),
-        logAppend(false), logWithSyslog(false)
+        logAppend(false), logWithSyslog(false), isHttpInterfaceEnabled(false)
     {
         started = time(0);
 

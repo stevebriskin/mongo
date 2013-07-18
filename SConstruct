@@ -193,7 +193,6 @@ add_option( "asio" , "Use Asynchronous IO (NOT READY YET)" , 0 , True )
 add_option( "ssl" , "Enable SSL" , 0 , True )
 
 # library choices
-add_option( "usesm" , "use spider monkey for javascript" , 0 , True )
 add_option( "usev8" , "use v8 for javascript" , 0 , True )
 add_option( "libc++", "use libc++ (experimental, requires clang)", 0, True )
 
@@ -243,8 +242,6 @@ add_option( "use-system-pcre", "use system version of pcre library", 0, True )
 add_option( "use-system-boost", "use system version of boost libraries", 0, True )
 
 add_option( "use-system-snappy", "use system version of snappy library", 0, True )
-
-add_option( "use-system-sm", "use system version of spidermonkey library", 0, True )
 
 add_option( "use-system-v8", "use system version of v8 library", 0, True )
 
@@ -312,7 +309,6 @@ debugBuild = has_option( "debugBuild" ) or has_option( "debugBuildAndLogging" )
 debugLogging = has_option( "debugBuildAndLogging" )
 noshell = has_option( "noshell" ) 
 
-usesm = has_option( "usesm" )
 usev8 = has_option( "usev8" ) 
 
 asio = has_option( "asio" )
@@ -329,9 +325,6 @@ env = Environment( BUILD_DIR=variantDir,
                    DIST_ARCHIVE_SUFFIX='.tgz',
                    EXTRAPATH=get_option("extrapath"),
                    MODULE_BANNERS=[],
-                   MODULE_LIBDEPS_MONGOD=[],
-                   MODULE_LIBDEPS_MONGOS=[],
-                   MODULE_LIBDEPS_MONGOSHELL=[],
                    MODULETEST_ALIAS='moduletests',
                    MODULETEST_LIST='#build/moduletests.txt',
                    MSVS_ARCH=msarch ,
@@ -347,6 +340,21 @@ env = Environment( BUILD_DIR=variantDir,
                    CONFIGUREDIR = '#' + scons_data_dir + '/sconf_temp',
                    CONFIGURELOG = '#' + scons_data_dir + '/config.log'
                    )
+
+# This could be 'if solaris', but unfortuantely that variable hasn't been set yet.
+if "sunos5" == os.sys.platform:
+    # SERVER-9890: On Solaris, SCons preferentially loads the sun linker tool 'sunlink' when
+    # using the 'default' tools as we do above. The sunlink tool sets -G as the flag for
+    # creating a shared library. But we don't want that, since we always drive our link step
+    # through CC or CXX. Instead, we want to let the compiler map GCC's '-shared' flag to the
+    # appropriate linker specs that it has compiled in. We could (and should in the future)
+    # select an empty set of tools above and then enable them as appropriate on a per platform
+    # basis. Until then the simplest solution, as discussed on the scons-users mailing list,
+    # appears to be to simply explicitly run the 'gnulink' tool to overwrite the Environment
+    # changes made by 'sunlink'. See the following thread for more detail:
+    #  http://four.pairlist.net/pipermail/scons-users/2013-June/001486.html
+    env.Tool('gnulink')
+
 
 if has_option("propagate-shell-environment"):
     env['ENV'] = dict(os.environ);
@@ -463,7 +471,7 @@ if boostVersion is None:
 else:
     boostVersion = "-" + boostVersion
 
-if ( not ( usesm or usev8 or justClientLib) ):
+if ( not ( usev8 or justClientLib) ):
     usev8 = True
     options_topass["usev8"] = True
 
@@ -735,6 +743,18 @@ if nix:
     env.Append( CXXFLAGS=["-Wnon-virtual-dtor", "-Woverloaded-virtual"] )
     env.Append( LINKFLAGS=["-fPIC", "-pthread"] )
 
+    # SERVER-9761: Ensure early detection of missing symbols in dependent libraries at program
+    # startup.
+    #
+    # TODO: Is it necessary to add to both linkflags and shlinkflags, or are LINKFLAGS
+    # propagated to SHLINKFLAGS?
+    if darwin:
+        env.Append( LINKFLAGS=["-Wl,-bind_at_load"] )
+        env.Append( SHLINKFLAGS=["-Wl,-bind_at_load"] )
+    else:
+        env.Append( LINKFLAGS=["-Wl,-z,now"] )
+        env.Append( SHLINKFLAGS=["-Wl,-z,now"] )
+
     if not darwin:
         env.Append( LINKFLAGS=["-rdynamic"] )
 
@@ -770,9 +790,6 @@ if nix:
 
     if has_option( "gdbserver" ):
         env.Append( CPPDEFINES=["USE_GDBSERVER"] )
-
-if usesm:
-    env.Append( CPPDEFINES=["JS_C_STRINGS_ARE_UTF8"] )
 
 if "uname" in dir(os):
     hacks = buildscripts.findHacks( os.uname() )
@@ -1096,24 +1113,27 @@ def doConfigure(myenv):
             Exit(1)
 
     # Check to see if we are trying to use an outdated libstdc++ in C++11 mode. This is
-    # primarly to help people using clang in C++11 mode on OS X but forgetting to use --libc++.
+    # primarly to help people using clang in C++11 mode on OS X but forgetting to use
+    # --libc++. We would, ideally, check the __GLIBCXX__ version, but for various reasons this
+    # is not workable. Instead, we switch on the fact that std::is_nothrow_constructible wasn't
+    # introduced until libstdc++ 4.6.0. Earlier versions of libstdc++ than 4.6 are unlikely to
+    # work well anyway.
     if has_option('c++11') and not has_option('libc++'):
 
         def CheckModernLibStdCxx(context):
 
-            # See http://gcc.gnu.org/onlinedocs/libstdc++/manual/abi.html for the origin of
-            # these values. Our choice of 4.7.0 is somewhat arbitrary.
-            minSupportedLibStdCxx = ("4.7.0", 20120322)
-
             test_body = """
             #include <vector>
-            #if defined(__GLIBCXX__) and (__GLIBCXX__ < %d)
-            #error
+            #include <cstdlib>
+            #if defined(__GLIBCXX__)
+            #include <type_traits>
+            int main() {
+                return std::is_nothrow_constructible<int>::value ? EXIT_SUCCESS : EXIT_FAILURE;
+            }
             #endif
-            """ % minSupportedLibStdCxx[1]
+            """
 
-            messageText = 'Checking for libstdc++ %s or newer (for C++11 support)... '
-            context.Message(messageText % minSupportedLibStdCxx[0])
+            context.Message('Checking for libstdc++ 4.6.0 or better (for C++11 support)... ')
             ret = context.TryCompile(textwrap.dedent(test_body), ".cpp")
             context.Result(ret)
             return ret
@@ -1209,7 +1229,8 @@ def doConfigure(myenv):
 
     if (conf.CheckCXXHeader( "execinfo.h" ) and
         conf.CheckDeclaration('backtrace', includes='#include <execinfo.h>') and
-        conf.CheckDeclaration('backtrace_symbols', includes='#include <execinfo.h>')):
+        conf.CheckDeclaration('backtrace_symbols', includes='#include <execinfo.h>') and
+        conf.CheckDeclaration('backtrace_symbols_fd', includes='#include <execinfo.h>')):
 
         conf.env.Append( CPPDEFINES=[ "MONGO_HAVE_EXECINFO_BACKTRACE" ] )
 
@@ -1504,7 +1525,7 @@ Export("shellEnv")
 Export("testEnv")
 Export("has_option use_system_version_of_library")
 Export("installSetup")
-Export("usesm usev8")
+Export("usev8")
 Export("darwin windows solaris linux freebsd nix")
 Export('module_sconscripts')
 Export("debugBuild")

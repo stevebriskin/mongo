@@ -1348,8 +1348,6 @@ namespace mongo {
                 }
             }
 
-            // TODO: implement addRequiredPrivileges
-
             bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 return run( dbName, cmdObj, errmsg, result, 0 );
             }
@@ -1800,6 +1798,9 @@ namespace mongo {
                                   BSONObjBuilder &result, bool fromRepl) {
             //const string shardedOutputCollection = getTmpName( collection );
 
+            uassert(16961, "Aggregation in a sharded system doesn't yet support cursors",
+                    !cmdObj.hasField("cursor"));
+
             intrusive_ptr<ExpressionContext> pExpCtx(
                 ExpressionContext::create(&InterruptStatusMongos::status));
             pExpCtx->setInRouter(true);
@@ -1809,6 +1810,10 @@ namespace mongo {
                 Pipeline::parseCommand(errmsg, cmdObj, pExpCtx));
             if (!pPipeline.get())
                 return false; // there was some parsing error
+
+            // This restriction will be loosened when we move the merge phase to a shard.
+            uassert(16948, "Aggregation in a sharded system doesn't yet support disk usage",
+                    !pExpCtx->getExtSortAllowed());
 
             string fullns(dbName + "." + pPipeline->getCollectionName());
 
@@ -1851,7 +1856,8 @@ namespace mongo {
             pPipeline->addInitialSource(DocumentSourceCommandShards::create(shardResults, pExpCtx));
 
             // Combine the shards' output and finish the pipeline
-            pPipeline->run(result, errmsg);
+            pPipeline->stitch();
+            pPipeline->run(result);
 
             if (errmsg.length() > 0)
                 return false;
@@ -1867,7 +1873,7 @@ namespace mongo {
         // this function with any other collection name.
         uassert(16618,
                 "Illegal attempt to run a command against a namespace other than $cmd.",
-                NamespaceString(ns).coll == "$cmd");
+                nsToCollectionSubstring(ns) == "$cmd");
 
         BSONElement e = jsobj.firstElement();
         std::string commandName = e.fieldName();

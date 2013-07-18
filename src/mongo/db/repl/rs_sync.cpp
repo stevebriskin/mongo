@@ -25,7 +25,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/d_concurrency.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/prefetch.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/oplog.h"
@@ -498,11 +498,14 @@ namespace replset {
             return true;
         }
 
+	const char* ns = op["ns"].valuestrsafe();
+
         // check for commands
         if ((op["op"].valuestrsafe()[0] == 'c') ||
             // Index builds are acheived through the use of an insert op, not a command op.
             // The following line is the same as what the insert code uses to detect an index build.
-            (NamespaceString(op["ns"].valuestrsafe()).coll == "system.indexes")) {
+            ( *ns != '\0' && nsToCollectionSubstring(ns) == "system.indexes" )) {
+
             if (ops->empty()) {
                 // apply commands one-at-a-time
                 ops->push_back(op);
@@ -603,8 +606,9 @@ namespace replset {
         lock rsLock( this );
         Lock::GlobalWrite writeLock;
 
-        // make sure we're not primary, secondary, or fatal already
-        if (box.getState().primary() || box.getState().secondary() || box.getState().fatal()) {
+        // make sure we're not primary, secondary, rollback, or fatal already
+        if (box.getState().primary() || box.getState().secondary() ||
+            box.getState().fatal()) {
             return false;
         }
 

@@ -18,19 +18,16 @@
 
 #pragma once
 
+#include <sstream>
+
 #include <boost/detail/endian.hpp>
-#include <boost/thread/condition_variable.hpp>
 
 #include "mongo/bson/util/misc.h"
-#include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
 
     /* @return a dump of the buffer as hex byte ascii output */
     string hexdump(const char *data, unsigned len);
-
-    void setThreadName(const char * name);
-    string getThreadName();
 
     template<class T>
     inline string ToString(const T& t) {
@@ -228,3 +225,4 @@ namespace mongo {
     using boost::intrusive_ptr;
     using boost::dynamic_pointer_cast;
 } // namespace mongo
+

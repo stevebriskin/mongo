@@ -105,16 +105,6 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status S2IndexCursor::seek(const vector<const BSONElement*>& position,
-                                 const vector<bool> &inclusive) {
-        return Status(ErrorCodes::IllegalOperation, "Unimplemented seek called on S2Cursor");
-    }
-
-    Status S2IndexCursor::skip(const vector<const BSONElement*>& position,
-                                 const vector<bool> &inclusive) {
-        return Status(ErrorCodes::IllegalOperation, "Unimplemented seek called on S2Cursor");
-    }
-
     Status S2IndexCursor::setOptions(const CursorOptions& options) { return Status::OK(); }
 
     bool S2IndexCursor::isEOF() const { return _underlyingCursor->isEOF(); }
@@ -124,9 +114,5 @@ namespace mongo {
     string S2IndexCursor::toString() { return _underlyingCursor->toString(); }
     Status S2IndexCursor::savePosition() { return _underlyingCursor->savePosition(); }
     Status S2IndexCursor::restorePosition() { return _underlyingCursor->restorePosition(); }
-
-    void S2IndexCursor::aboutToDeleteBucket(const DiskLoc& bucket) {
-        _underlyingCursor->aboutToDeleteBucket(bucket);
-    }
 
 }  // namespace mongo

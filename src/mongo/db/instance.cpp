@@ -29,6 +29,7 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/atomic_int.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -46,7 +47,7 @@
 #include "mongo/db/json.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/query.h"
@@ -128,15 +129,20 @@ namespace mongo {
     }
 
     void inProgCmd( Message &m, DbResponse &dbresponse ) {
+        DbMessage d(m);
+        QueryMessage q(d);
         BSONObjBuilder b;
 
-        if (!cc().getAuthorizationSession()->checkAuthorization(
-                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::inprog)) {
+        const bool isAuthorized = cc().getAuthorizationSession()->checkAuthorization(
+                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::inprog);
+
+        audit::logInProgAuthzCheck(
+                &cc(), q.query, isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+
+        if (!isAuthorized) {
             b.append("err", "unauthorized");
         }
         else {
-            DbMessage d(m);
-            QueryMessage q(d);
             bool all = q.query["$all"].trueValue();
             vector<BSONObj> vals;
             {
@@ -183,17 +189,21 @@ namespace mongo {
     }
 
     void killOp( Message &m, DbResponse &dbresponse ) {
+        DbMessage d(m);
+        QueryMessage q(d);
         BSONObj obj;
-        if (!cc().getAuthorizationSession()->checkAuthorization(
-                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::killop)) {
+        const bool isAuthorized = cc().getAuthorizationSession()->checkAuthorization(
+                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::killop);
+        audit::logKillOpAuthzCheck(&cc(),
+                                   q.query,
+                                   isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+        if (!isAuthorized) {
             obj = fromjson("{\"err\":\"unauthorized\"}");
         }
         /*else if( !dbMutexInfo.isLocked() )
             obj = fromjson("{\"info\":\"no op in progress/not locked\"}");
             */
         else {
-            DbMessage d(m);
-            QueryMessage q(d);
             BSONElement e = q.query.getField("op");
             if( !e.isNumber() ) {
                 obj = fromjson("{\"err\":\"no op number field specified?\"}");
@@ -210,8 +220,11 @@ namespace mongo {
     bool _unlockFsync();
     void unlockFsync(const char *ns, Message& m, DbResponse &dbresponse) {
         BSONObj obj;
-        if (!cc().getAuthorizationSession()->checkAuthorization(
-                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::unlock)) {
+        const bool isAuthorized = cc().getAuthorizationSession()->checkAuthorization(
+                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::unlock);
+        audit::logFsyncUnlockAuthzCheck(
+                &cc(), isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+        if (!isAuthorized) {
             obj = fromjson("{\"err\":\"unauthorized\"}");
         }
         else if (strncmp(ns, "admin.", 6) != 0 ) {
@@ -244,8 +257,12 @@ namespace mongo {
         try {
             if (!NamespaceString(d.getns()).isCommand()) {
                 // Auth checking for Commands happens later.
-                Status status = cc().getAuthorizationSession()->checkAuthForQuery(d.getns());
-                uassert(16550, status.reason(), status.isOK());
+                Client* client = &cc();
+                Status status = client->getAuthorizationSession()->checkAuthForQuery(d.getns(),
+                                                                                     q.query);
+                audit::logQueryAuthzCheck(
+                        client, NamespaceString(d.getns()), q.query, status.code());
+                uassertStatusOK(status);
             }
             dbresponse.exhaustNS = runQuery(m, q, op, *resp);
             verify( !resp->empty() );
@@ -317,7 +334,7 @@ namespace mongo {
     void mongoAbort(const char *msg) { 
         if( reportEventToSystem ) 
             reportEventToSystem(msg);
-        rawOut(msg);
+        severe() << msg;
         ::abort();
     }
 
@@ -359,7 +376,31 @@ namespace mongo {
             opwrite(m);
         }
 
-        globalOpCounters.gotOp( op , isCommand );
+        // Increment op counters.
+        switch (op) {
+        case dbQuery:
+            if (!isCommand) {
+                globalOpCounters.gotQuery();
+            }
+            else {
+                // Command counting is deferred, since it is not known yet whether the command
+                // needs counting.
+            }
+            break;
+        case dbGetMore:
+            globalOpCounters.gotGetMore();
+            break;
+        case dbInsert:
+            // Insert counting is deferred, since it is not known yet whether the insert contains
+            // multiple documents (each of which needs to be counted).
+            break;
+        case dbUpdate:
+            globalOpCounters.gotUpdate();
+            break;
+        case dbDelete:
+            globalOpCounters.gotDelete();
+            break;
+        }
 
         Client& c = cc();
         c.getAuthorizationSession()->startRequest();
@@ -381,7 +422,7 @@ namespace mongo {
         debug.op = op;
 
         long long logThreshold = cmdLine.slowMS;
-        bool shouldLog = logLevel >= 1;
+        bool shouldLog = logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1));
 
         if ( op == dbQuery ) {
             if ( handlePossibleShardedMessage( m , &dbresponse ) )
@@ -441,12 +482,12 @@ namespace mongo {
                 }
             }
             catch ( UserException& ue ) {
-                tlog(3) << " Caught Assertion in " << opToString(op) << ", continuing "
+                MONGO_TLOG(3) << " Caught Assertion in " << opToString(op) << ", continuing "
                         << ue.toString() << endl;
                 debug.exceptionInfo = ue.getInfo();
             }
             catch ( AssertionException& e ) {
-                tlog(3) << " Caught Assertion in " << opToString(op) << ", continuing "
+                MONGO_TLOG(3) << " Caught Assertion in " << opToString(op) << ", continuing "
                         << e.toString() << endl;
                 debug.exceptionInfo = e.getInfo();
                 shouldLog = true;
@@ -459,7 +500,7 @@ namespace mongo {
         logThreshold += currentOp.getExpectedLatencyMs();
 
         if ( shouldLog || debug.executionTime > logThreshold ) {
-            mongo::tlog() << debug.report( currentOp ) << endl;
+            MONGO_TLOG(0) << debug.report( currentOp ) << endl;
         }
 
         if ( currentOp.shouldDBProfile( debug.executionTime ) ) {
@@ -489,13 +530,13 @@ namespace mongo {
         uassert( 13004 , str::stream() << "sent negative cursors to kill: " << n  , n >= 1 );
 
         if ( n > 2000 ) {
-            LOG( n < 30000 ? LL_WARNING : LL_ERROR ) << "receivedKillCursors, n=" << n << endl;
+            ( n < 30000 ? warning() : error() ) << "receivedKillCursors, n=" << n << endl;
             verify( n < 30000 );
         }
 
         int found = ClientCursor::eraseIfAuthorized(n, (long long *) x);
 
-        if ( logLevel > 0 || found != n ) {
+        if ( logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1)) || found != n ) {
             LOG( found == n ? 1 : 0 ) << "killcursors: found " << found << " of " << n << endl;
         }
 
@@ -504,14 +545,14 @@ namespace mongo {
     /* db - database name
        path - db directory
     */
-    /*static*/ void Database::closeDatabase( const char *db, const string& path ) {
+    /*static*/ void Database::closeDatabase( const string& db, const string& path ) {
         verify( Lock::isW() );
 
         Client::Context * ctx = cc().getContext();
         verify( ctx );
         verify( ctx->inDB( db , path ) );
         Database *database = ctx->db();
-        verify( database->name == db );
+        verify( database->name() == db );
 
         oplogCheckCloseDatabase( database ); // oplog caches some things, dirty its caches
 
@@ -548,8 +589,13 @@ namespace mongo {
         bool multi = flags & UpdateOption_Multi;
         bool broadcast = flags & UpdateOption_Broadcast;
 
-        Status status = cc().getAuthorizationSession()->checkAuthForUpdate(ns, upsert);
-        uassert(16538, status.reason(), status.isOK());
+        Status status = cc().getAuthorizationSession()->checkAuthForUpdate(ns,
+                                                                           query,
+                                                                           toupdate,
+                                                                           upsert);
+        audit::logUpdateAuthzCheck(
+                &cc(), NamespaceString(ns), query, toupdate, upsert, multi, status.code());
+        uassertStatusOK(status);
 
         op.debug().query = query;
         op.setQuery(query);
@@ -583,16 +629,17 @@ namespace mongo {
         DbMessage d(m);
         const char *ns = d.getns();
 
-        Status status = cc().getAuthorizationSession()->checkAuthForDelete(ns);
-        uassert(16542, status.reason(), status.isOK());
-
         op.debug().ns = ns;
         int flags = d.pullInt();
         bool justOne = flags & RemoveOption_JustOne;
         bool broadcast = flags & RemoveOption_Broadcast;
         verify( d.moreJSObjs() );
         BSONObj pattern = d.nextJsObj();
-        
+
+        Status status = cc().getAuthorizationSession()->checkAuthForDelete(ns, pattern);
+        audit::logDeleteAuthzCheck(&cc(), NamespaceString(ns), pattern, status.code());
+        uassertStatusOK(status);
+
         op.debug().query = pattern;
         op.setQuery(pattern);
 
@@ -649,8 +696,9 @@ namespace mongo {
                 const NamespaceString nsString( ns );
                 uassert( 16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
 
-                Status status = cc().getAuthorizationSession()->checkAuthForGetMore(ns);
-                uassert(16543, status.reason(), status.isOK());
+                Status status = cc().getAuthorizationSession()->checkAuthForGetMore(ns, cursorid);
+                audit::logGetMoreAuthzCheck(&cc(), NamespaceString(ns), cursorid, status.code());
+                uassertStatusOK(status);
 
                 if (str::startsWith(ns, "local.oplog.")){
                     while (MONGO_FAIL_POINT(rsStopGetMore)) {
@@ -718,24 +766,16 @@ namespace mongo {
         };
 
         if (ex) {
-            exhaust = false;
-
             BSONObjBuilder err;
             ex->getInfo().append( err );
             BSONObj errObj = err.done();
 
-            log() << errObj << endl;
-
             curop.debug().exceptionInfo = ex->getInfo();
 
-            if (ex->getCode() == 13436) {
-                replyToQuery(ResultFlag_ErrSet, m, dbresponse, errObj);
-                curop.debug().responseLength = dbresponse.response->header()->dataLen();
-                curop.debug().nreturned = 1;
-                return ok;
-            }
-
-            msgdata = emptyMoreResult(cursorid);
+            replyToQuery(ResultFlag_ErrSet, m, dbresponse, errObj);
+            curop.debug().responseLength = dbresponse.response->header()->dataLen();
+            curop.debug().nreturned = 1;
+            return ok;
         }
 
         Message *resp = new Message();
@@ -808,14 +848,6 @@ namespace mongo {
         const char *ns = d.getns();
         op.debug().ns = ns;
 
-        bool isIndexWrite = NamespaceString(ns).coll == "system.indexes";
-
-        // Auth checking for index writes happens further down in this function.
-        if (!isIndexWrite) {
-            Status status = cc().getAuthorizationSession()->checkAuthForInsert(ns);
-            uassert(16544, status.reason(), status.isOK());
-        }
-
         if( !d.moreJSObjs() ) {
             // strange.  should we complain?
             return;
@@ -825,14 +857,12 @@ namespace mongo {
         while (d.moreJSObjs()){
             BSONObj obj = d.nextJsObj();
             multi.push_back(obj);
-            if (isIndexWrite) {
-                string indexNS = obj.getStringField("ns");
-                uassert(16548,
-                        mongoutils::str::stream() << "not authorized to create index on "
-                                << indexNS,
-                        cc().getAuthorizationSession()->checkAuthorization(
-                                indexNS, ActionType::ensureIndex));
-            }
+
+            // Check auth for insert (also handles checking if this is an index build and checks
+            // for the proper privileges in that case).
+            Status status = cc().getAuthorizationSession()->checkAuthForInsert(ns, obj);
+            audit::logInsertAuthzCheck(&cc(), NamespaceString(ns), obj, status.code());
+            uassertStatusOK(status);
         }
 
         PageFaultRetryableSection s;

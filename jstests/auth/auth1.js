@@ -26,9 +26,11 @@ db.getSisterDB( "admin" ).addUser( "super", "super" );
 assert.throws( function() { t.findOne() }, [], "read without login" );
 
 print("make sure we can't run certain commands w/out auth");
-var errmsg = "unauthorized";
-assert.eq(db.runCommand({eval : "function() { return 1; }"}).errmsg, errmsg);
-assert.eq(db.adminCommand({getLog : "global"}).errmsg, errmsg);
+var codeUnauthorized = 13;
+var rslt = db.runCommand({eval : "function() { return 1; }"});
+assert.eq(rslt.code, codeUnauthorized, tojson(rslt));
+var rslt = db.runCommand({getLog : "global"});
+assert.eq(rslt.code, codeUnauthorized, tojson(rslt));
 
 assert(!db.auth("eliot", "eliot2"), "auth succeeded with wrong password");
 assert(db.auth("eliot", "eliot"), "auth failed");
@@ -72,8 +74,7 @@ assert.throws(function(){dbRO.system.users.count()});
 
 assert.eq( 2, db.system.users.count() , "B7" ); // rw connection
 assert.throws(function(){dbRO.addUser( "a", "b" )});
-assert( dbRO.getLastError() , "B9" );
-assert.eq( 2, db.system.users.count() , "B10"); // rw connection
+assert.eq( 2, db.system.users.count() , "B8"); // rw connection
 
 assert.eq( 1000, tRO.group( p ).length , "C1" );
 

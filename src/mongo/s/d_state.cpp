@@ -30,6 +30,7 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
@@ -39,6 +40,7 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
 #include "mongo/s/d_logic.h"
+#include "mongo/s/metadata_loader.h"
 #include "mongo/s/shard.h"
 #include "mongo/util/queue.h"
 #include "mongo/util/concurrency/mutex.h"
@@ -119,36 +121,36 @@ namespace mongo {
         _configServer.clear();
         _shardName.clear();
         _shardHost.clear();
-        _chunks.clear();
+        _collMetadata.clear();
     }
 
     // TODO we shouldn't need three ways for checking the version. Fix this.
     bool ShardingState::hasVersion( const string& ns ) {
         scoped_lock lk(_mutex);
 
-        ChunkManagersMap::const_iterator it = _chunks.find(ns);
-        return it != _chunks.end();
+        CollectionMetadataMap::const_iterator it = _collMetadata.find(ns);
+        return it != _collMetadata.end();
     }
 
     bool ShardingState::hasVersion( const string& ns , ChunkVersion& version ) {
         scoped_lock lk(_mutex);
 
-        ChunkManagersMap::const_iterator it = _chunks.find(ns);
-        if ( it == _chunks.end() )
+        CollectionMetadataMap::const_iterator it = _collMetadata.find(ns);
+        if ( it == _collMetadata.end() )
             return false;
 
-        ShardChunkManagerPtr p = it->second;
-        version = p->getVersion();
+        CollectionMetadataPtr p = it->second;
+        version = p->getShardVersion();
         return true;
     }
 
     const ChunkVersion ShardingState::getVersion( const string& ns ) const {
         scoped_lock lk(_mutex);
 
-        ChunkManagersMap::const_iterator it = _chunks.find( ns );
-        if ( it != _chunks.end() ) {
-            ShardChunkManagerPtr p = it->second;
-            return p->getVersion();
+        CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+        if ( it != _collMetadata.end() ) {
+            CollectionMetadataPtr p = it->second;
+            return p->getShardVersion();
         }
         else {
             return ChunkVersion( 0, OID() );
@@ -158,51 +160,150 @@ namespace mongo {
     void ShardingState::donateChunk( const string& ns , const BSONObj& min , const BSONObj& max , ChunkVersion version ) {
         scoped_lock lk( _mutex );
 
-        ChunkManagersMap::const_iterator it = _chunks.find( ns );
-        verify( it != _chunks.end() ) ;
-        ShardChunkManagerPtr p = it->second;
+        CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+        verify( it != _collMetadata.end() ) ;
+        CollectionMetadataPtr p = it->second;
 
         // empty shards should have version 0
         version = ( p->getNumChunks() > 1 ) ? version : ChunkVersion( 0 , OID() );
 
-        ShardChunkManagerPtr cloned( p->cloneMinus( min , max , version ) );
-        // TODO: a bit dangerous to have two different zero-version states - no-manager and
+        ChunkType chunk;
+        chunk.setMin( min );
+        chunk.setMax( max );
+        string errMsg;
+
+        CollectionMetadataPtr cloned( p->cloneMinusChunk( chunk, version, &errMsg ) );
+        // uassert to match old behavior, TODO: report errors w/o throwing
+        uassert( 16855, errMsg, NULL != cloned.get() );
+
+        // TODO: a bit dangerous to have two different zero-version states - no-metadata and
         // no-version
-        _chunks[ns] = cloned;
+        _collMetadata[ns] = cloned;
     }
 
     void ShardingState::undoDonateChunk( const string& ns , const BSONObj& min , const BSONObj& max , ChunkVersion version ) {
         scoped_lock lk( _mutex );
         log() << "ShardingState::undoDonateChunk acquired _mutex" << endl;
 
-        ChunkManagersMap::const_iterator it = _chunks.find( ns );
-        verify( it != _chunks.end() ) ;
-        ShardChunkManagerPtr p( it->second->clonePlus( min , max , version ) );
-        _chunks[ns] = p;
+        CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+        verify( it != _collMetadata.end() ) ;
+
+        ChunkType chunk;
+        chunk.setMin( min );
+        chunk.setMax( max );
+        string errMsg;
+
+        CollectionMetadataPtr cloned( it->second->clonePlusChunk( chunk, version, &errMsg ) );
+        // uassert to match old behavior, TODO: report errors w/o throwing
+        uassert( 16856, errMsg, NULL != cloned.get() );
+
+        _collMetadata[ns] = cloned;
     }
 
-    void ShardingState::splitChunk( const string& ns , const BSONObj& min , const BSONObj& max , const vector<BSONObj>& splitKeys ,
-                                    ChunkVersion version ) {
+    bool ShardingState::notePending( const string& ns,
+                                     const BSONObj& min,
+                                     const BSONObj& max,
+                                     string* errMsg ) {
         scoped_lock lk( _mutex );
 
-        ChunkManagersMap::const_iterator it = _chunks.find( ns );
-        verify( it != _chunks.end() ) ;
-        ShardChunkManagerPtr p( it->second->cloneSplit( min , max , splitKeys , version ) );
-        _chunks[ns] = p;
+        CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+        if ( it == _collMetadata.end() ) {
+
+            *errMsg = str::stream() << "could not note chunk " << " [" << min << "," << max << ")"
+                                    << " as pending because the local metadata for " << ns
+                                    << " has changed";
+
+            return false;
+        }
+
+        ChunkType chunk;
+        chunk.setMin( min );
+        chunk.setMax( max );
+
+        CollectionMetadataPtr cloned( it->second->clonePlusPending( chunk, errMsg ) );
+        if ( !cloned ) return false;
+
+        _collMetadata[ns] = cloned;
+        return true;
+    }
+
+    bool ShardingState::forgetPending( const string& ns,
+                                       const BSONObj& min,
+                                       const BSONObj& max,
+                                       const OID& epoch,
+                                       string* errMsg ) {
+        scoped_lock lk( _mutex );
+
+        CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+        if ( it == _collMetadata.end() ) {
+
+            *errMsg = str::stream() << "no need to forget pending chunk "
+                                    << " [" << min << "," << max << ")"
+                                    << " because the local metadata for " << ns << " has changed";
+
+            return false;
+        }
+
+        CollectionMetadataPtr metadata = it->second;
+
+        // This can currently happen because drops aren't synchronized with in-migrations
+        // The idea for checking this here is that in the future we shouldn't have this problem
+        if ( metadata->getCollVersion().epoch() != epoch ) {
+
+            *errMsg = str::stream() << "no need to forget pending chunk "
+                                    << " [" << min << "," << max << ")"
+                                    << " because the local metadata for " << ns << " has changed";
+
+            return false;
+        }
+
+        ChunkType chunk;
+        chunk.setMin( min );
+        chunk.setMax( max );
+
+        CollectionMetadataPtr cloned( metadata->cloneMinusPending( chunk, errMsg ) );
+        if ( !cloned ) return false;
+
+        _collMetadata[ns] = cloned;
+        return true;
+    }
+
+    void ShardingState::splitChunk( const string& ns,
+                                    const BSONObj& min,
+                                    const BSONObj& max,
+                                    const vector<BSONObj>& splitKeys,
+                                    ChunkVersion version )
+    {
+        scoped_lock lk( _mutex );
+
+        CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+        verify( it != _collMetadata.end() ) ;
+
+        ChunkType chunk;
+        chunk.setMin( min );
+        chunk.setMax( max );
+        string errMsg;
+
+        CollectionMetadataPtr cloned( it->second->cloneSplit( chunk, splitKeys, version, &errMsg ) );
+        // uassert to match old behavior, TODO: report errors w/o throwing
+        uassert( 16857, errMsg, NULL != cloned.get() );
+
+        _collMetadata[ns] = cloned;
     }
 
     void ShardingState::resetVersion( const string& ns ) {
         scoped_lock lk( _mutex );
 
-        _chunks.erase( ns );
+        _collMetadata.erase( ns );
     }
 
     bool ShardingState::trySetVersion( const string& ns , ChunkVersion& version /* IN-OUT */ ) {
 
-        // Currently this function is called after a getVersion(), which is the first "check", and the assumption here
-        // is that we don't do anything nearly as long as a remote query in a thread between then and now.
-        // Otherwise it may be worth adding an additional check without the _configServerMutex below, since then it
-        // would be likely that the version may have changed in the meantime without waiting for or fetching config results.
+        // Currently this function is called after a getVersion(), which is the first "check", but
+        // because refreshing the config data from a remote server takes a long time, many
+        // operations may be trying to refresh stale CollectionMetadata at the same time.
+        // The _configServerTickets serializes this process such that only a small number of threads
+        // can try to refresh at the same time.
 
         // TODO:  Mutex-per-namespace?
         
@@ -211,11 +312,11 @@ namespace mongo {
         _configServerTickets.waitForTicket();
         TicketHolderReleaser needTicketFrom( &_configServerTickets );
 
-        // fast path - double-check if requested version is at the same version as this chunk manager before verifying
-        // against config server
+        // fast path - double-check if requested version is at the same version as this metadata
+        // before verifying against config server
         //
-        // This path will short-circuit the version set if another thread already managed to update the version in the
-        // meantime.  First check is from getVersion().
+        // This path will short-circuit the version set if another thread already managed to update
+        // the version in the meantime.  First check is from getVersion().
         //
         // cases:
         //   + this shard updated the version for a migrate's commit (FROM side)
@@ -224,55 +325,71 @@ namespace mongo {
         //     one triggered the 'slow path' (below)
         //     when the second's request gets here, the version is already current
         ChunkVersion storedVersion;
-        ShardChunkManagerPtr currManager;
+        CollectionMetadataPtr currMetadata;
         {
             scoped_lock lk( _mutex );
-            ChunkManagersMap::const_iterator it = _chunks.find( ns );
-            if( it == _chunks.end() ){
+            CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+            if( it == _collMetadata.end() ){
 
-                // TODO: We need better semantic distinction between *no manager found* and
-                // *manager of version zero found*
-                log() << "no current chunk manager found for this shard, will initialize" << endl;
+                // TODO: We need better semantic distinction between *no metadata found* and
+                // *metadata of version zero found*
+                log() << "no current collection metadata found for this shard, will initialize"
+                      << endl;
             }
             else{
-                currManager = it->second;
-                if( ( storedVersion = it->second->getVersion() ).isEquivalentTo( version ) )
+                currMetadata = it->second;
+                if( ( storedVersion = it->second->getShardVersion() ).isEquivalentTo( version ) )
                     return true;
             }
         }
         
         LOG( 2 ) << "verifying cached version " << storedVersion.toString() << " and new version " << version.toString() << " for '" << ns << "'" << endl;
 
-        // slow path - requested version is different than the current chunk manager's, if one exists, so must check for
-        // newest version in the config server
+        // slow path - requested version is different than the current metadata, if one exists, so
+        // must check for newest version in the config server
         //
         // cases:
         //   + a chunk moved TO here
-        //     (we don't bump up the version on the TO side but the commit to config does use higher version)
+        //     (we don't bump up the version on the TO side but the commit to config does use higher
+        //      version)
         //     a client reloads from config an issued the request
         //   + there was a take over from a secondary
-        //     the secondary had no state (managers) at all, so every client request will fall here
+        //     the secondary had no state (metadata) at all, so every client request will fall here
         //   + a stale client request a version that's not current anymore
 
-        // Can't lock default mutex while creating ShardChunkManager, b/c may have to create a new connection to myself
-        const string c = (_configServer == _shardHost) ? "" /* local */ : _configServer;
+        string errMsg;
+        ConnectionString configLoc = ConnectionString::parse( _configServer, errMsg );
+        uassert( 16853, str::stream() << "bad config server connection string" << _configServer
+                << causedBy( errMsg ),
+                configLoc.type() != ConnectionString::INVALID );
 
-        // If our epochs aren't compatible, it's not useful to use the old manager for chunk diffs
-        if( currManager && ! currManager->getCollVersion().hasCompatibleEpoch( version ) ){
+        // If our epochs aren't compatible, it's not useful to use the old metadata for chunk diffs
+        if( currMetadata && ! currMetadata->getCollVersion().hasCompatibleEpoch( version ) ){
 
             warning() << "detected incompatible version epoch in new version " << version
-                      << ", old version was " << currManager->getCollVersion() << endl;
+                      << ", old version was " << currMetadata->getCollVersion() << endl;
 
-            currManager.reset();
+            currMetadata.reset();
         }
 
-        ShardChunkManagerPtr p( ShardChunkManager::make( c , ns , _shardName, currManager ) );
+        MetadataLoader mdLoader( configLoc );
+        CollectionMetadata* newMetadataRaw = new CollectionMetadata();
+        CollectionMetadataPtr newMetadata( newMetadataRaw );
+        Status status = mdLoader.makeCollectionMetadata( ns,
+                                                         _shardName,
+                                                         currMetadata.get(),
+                                                         newMetadataRaw );
 
-        // Handle the case where the collection isn't sharded more gracefully
-        if( p->getKeyPattern().isEmpty() ){
-            version = ChunkVersion( 0, OID() );
-            // There was an error getting any data for this collection, return false
+        if ( status.code() == ErrorCodes::RemoteChangeDetected
+                || status.code() == ErrorCodes::NamespaceNotFound ) {
+            version = ChunkVersion( 0, 0, OID() );
+            warning() << "did not load new metadata for " << causedBy( status.reason() ) << endl;
+            // we loaded something unexpected, the collection may be dropped or dropping
             return false;
+        }
+        else if ( !status.isOK() ) {
+            // Throw exception on connectivity or parsing errors to maintain interface
+            uasserted( 16854, status.reason() );
         }
 
         {
@@ -282,15 +399,16 @@ namespace mongo {
             // This lock prevents simultaneous metadata changes using the same map
             scoped_lock lk( _mutex );
 
-            // since we loaded the chunk manager unlocked, other thread may have done the same
+            // since we loaded the metadata unlocked, other thread may have done the same
             // make sure we keep the freshest config info only
-            ChunkManagersMap::const_iterator it = _chunks.find( ns );
-            if ( it == _chunks.end() || p->getVersion() >= it->second->getVersion() ) {
-                _chunks[ns] = p;
+            CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+            if ( it == _collMetadata.end()
+                || newMetadata->getShardVersion() >= it->second->getShardVersion() ) {
+                _collMetadata[ns] = newMetadata;
             }
 
             ChunkVersion oldVersion = version;
-            version = p->getVersion();
+            version = newMetadata->getShardVersion();
             return oldVersion.isEquivalentTo( version );
         }
     }
@@ -309,16 +427,16 @@ namespace mongo {
 
             scoped_lock lk(_mutex);
 
-            for ( ChunkManagersMap::iterator it = _chunks.begin(); it != _chunks.end(); ++it ) {
-                ShardChunkManagerPtr p = it->second;
-                bb.appendTimestamp( it->first , p->getVersion().toLong() );
+            for ( CollectionMetadataMap::iterator it = _collMetadata.begin(); it != _collMetadata.end(); ++it ) {
+                CollectionMetadataPtr p = it->second;
+                bb.appendTimestamp( it->first , p->getShardVersion().toLong() );
             }
             bb.done();
         }
 
     }
 
-    bool ShardingState::needShardChunkManager( const string& ns ) const {
+    bool ShardingState::needCollectionMetadata( const string& ns ) const {
         if ( ! _enabled )
             return false;
 
@@ -328,12 +446,12 @@ namespace mongo {
         return true;
     }
 
-    ShardChunkManagerPtr ShardingState::getShardChunkManager( const string& ns ) {
+    CollectionMetadataPtr ShardingState::getCollectionMetadata( const string& ns ) {
         scoped_lock lk( _mutex );
 
-        ChunkManagersMap::const_iterator it = _chunks.find( ns );
-        if ( it == _chunks.end() ) {
-            return ShardChunkManagerPtr();
+        CollectionMetadataMap::const_iterator it = _collMetadata.find( ns );
+        if ( it == _collMetadata.end() ) {
+            return CollectionMetadataPtr();
         }
         else {
             return it->second;
@@ -817,7 +935,7 @@ namespace mongo {
         }
 
         // TODO : all collections at some point, be sharded or not, will have a version
-        //  (and a ShardChunkManager)
+        //  (and a CollectionMetadata)
         received = info->getVersion( ns );
         wanted = shardingState.getVersion( ns );
 

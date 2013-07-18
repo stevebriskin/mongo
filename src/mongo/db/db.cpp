@@ -60,9 +60,11 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/task.h"
+#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/file_allocator.h"
 #include "mongo/util/net/message_server.h"
+#include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/ramlog.h"
 #include "mongo/util/stacktrace.h"
@@ -102,7 +104,6 @@ namespace mongo {
 
     CmdLine cmdLine;
     static bool scriptingEnabled = true;
-    static bool httpInterface = false;
     bool shouldRepairDatabases = 0;
     static bool forceRepair = 0;
     Timer startupSrandTimer;
@@ -286,7 +287,7 @@ namespace mongo {
 
         logStartup();
         startReplication();
-        if ( httpInterface )
+        if ( cmdLine.isHttpInterfaceEnabled )
             boost::thread web( boost::bind(&webServerThread, new RestAdminAccess() /* takes ownership */));
 
 #if(TESTEXHAUST)
@@ -337,7 +338,7 @@ namespace mongo {
             string dbName = *i;
             LOG(1) << "\t" << dbName << endl;
             Client::Context ctx( dbName );
-            MongoDataFile *p = cc().database()->getFile( 0 );
+            DataFile *p = cc().database()->getFile( 0 );
             DataFileHeader *h = p->getHeader();
             if ( !h->isCurrentVersion() || forceRepair ) {
 
@@ -371,7 +372,7 @@ namespace mongo {
             }
             else {
                 if (h->versionMinor == PDFILE_VERSION_MINOR_22_AND_OLDER) {
-                    const string systemIndexes = cc().database()->name + ".system.indexes";
+                    const string systemIndexes = cc().database()->name() + ".system.indexes";
                     shared_ptr<Cursor> cursor(theDataFileMgr.findAll(systemIndexes));
                     for ( ; cursor && cursor->ok(); cursor->advance()) {
                         const BSONObj index = cursor->current();
@@ -446,12 +447,15 @@ namespace mongo {
 
         void run() {
             Client::initThread( name().c_str() );
-            if( cmdLine.syncdelay == 0 )
+            if( cmdLine.syncdelay == 0 ) {
                 log() << "warning: --syncdelay 0 is not recommended and can have strange performance" << endl;
-            else if( cmdLine.syncdelay == 1 )
+            }
+            else if( cmdLine.syncdelay == 1 ) {
                 log() << "--syncdelay 1" << endl;
-            else if( cmdLine.syncdelay != 60 )
+            }
+            else if( cmdLine.syncdelay != 60 ) {
                 LOG(1) << "--syncdelay " << cmdLine.syncdelay << endl;
+            }
             int time_flushing = 0;
             while ( ! inShutdown() ) {
                 _diaglog.flush();
@@ -474,7 +478,7 @@ namespace mongo {
 
                 _flushed(time_flushing);
 
-                if( logLevel >= 1 || time_flushing >= 10000 ) {
+                if( logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1)) || time_flushing >= 10000 ) {
                     log() << "flushing mmaps took " << time_flushing << "ms " << " for " << numFiles << " files" << endl;
                 }
             }
@@ -577,13 +581,11 @@ namespace mongo {
 
         Client::initThread("initandlisten");
 
-        Logstream::get().addGlobalTee( new RamLog("global") );
-
         bool is32bit = sizeof(int*) == 4;
 
         {
             ProcessId pid = ProcessId::getCurrent();
-            Nullstream& l = log();
+            LogstreamBuilder l = log();
             l << "MongoDB starting : pid=" << pid << " port=" << cmdLine.port << " dbpath=" << dbpath;
             if( replSettings.master ) l << " master=" << replSettings.master;
             if( replSettings.slave )  l << " slave=" << (int) replSettings.slave;
@@ -990,12 +992,33 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
                 log() << "can't have both --httpinterface and --nohttpinterface" << endl;
                 ::_exit( EXIT_BADOPTIONS );
             }
-            httpInterface = true;
+            cmdLine.isHttpInterfaceEnabled = true;
         }
+        // SERVER-10019 Enabling rest/jsonp without --httpinterface should break in the future 
         if (params.count("rest")) {
+            if (params.count("nohttpinterface")) {
+                log() << "** WARNING: Should not specify both --rest and --nohttpinterface" << 
+                    startupWarningsLog;
+            }
+            else if (!params.count("httpinterface")) {
+                log() << "** WARNING: --rest is specified without --httpinterface," << 
+                    startupWarningsLog;
+                log() << "**          enabling http interface" << startupWarningsLog;
+                cmdLine.isHttpInterfaceEnabled = true;
+            }
             cmdLine.rest = true;
         }
         if (params.count("jsonp")) {
+            if (params.count("nohttpinterface")) {
+                log() << "** WARNING: Should not specify both --jsonp and --nohttpinterface" << 
+                    startupWarningsLog;
+            }
+            else if (!params.count("httpinterface")) {
+                log() << "** WARNING --jsonp is specified without --httpinterface," << 
+                    startupWarningsLog;
+                log() << "**         enabling http interface" << startupWarningsLog;
+                cmdLine.isHttpInterfaceEnabled = true;
+            }
             cmdLine.jsonp = true;
         }
         if (params.count("noscripting")) {
@@ -1275,6 +1298,15 @@ MONGO_INITIALIZER(CreateAuthorizationManager)(InitializerContext* context) {
     return Status::OK();
 }
 
+#ifdef MONGO_SSL
+MONGO_INITIALIZER_GENERAL(setSSLManagerType, 
+                          MONGO_NO_PREREQUISITES, 
+                          ("SSLManager"))(InitializerContext* context) {
+    isSSLServer = true;
+    return Status::OK();
+}
+#endif
+
 static int mongoDbMain(int argc, char* argv[], char **envp) {
     static StaticObserver staticObserver;
 
@@ -1300,6 +1332,7 @@ static int mongoDbMain(int argc, char* argv[], char **envp) {
 
 
     processCommandLineOptions(std::vector<std::string>(argv, argv + argc));
+    mongo::forkServerOrDie();
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     CmdLine::censor(argc, argv);
 

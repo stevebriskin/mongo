@@ -23,7 +23,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 namespace rename_collection {
@@ -35,7 +35,7 @@ namespace rename_collection {
         ActionSet sourceActions;
         ActionSet targetActions;
 
-        if (sourceNS.db == targetNS.db) {
+        if (sourceNS.db() == targetNS.db()) {
             sourceActions.addAction(ActionType::renameCollectionSameDB);
             targetActions.addAction(ActionType::renameCollectionSameDB);
         } else {

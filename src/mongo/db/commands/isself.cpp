@@ -25,6 +25,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/security_key.h"
 #include "mongo/db/jsobj.h"
 #include "../../util/net/listen.h"
 #include "../commands.h"
@@ -96,12 +97,15 @@ namespace mongo {
         freeifaddrs( addrs );
         addrs = NULL;
 
-        if (logLevel >= 1) {
-            LOG(1) << "getMyAddrs():";
+        if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1))) {
+            LogstreamBuilder builder(logger::globalLogDomain(),
+                                     getThreadName(),
+                                     logger::LogSeverity::Debug(1));
+            builder << "getMyAddrs():";
             for (vector<string>::const_iterator it=out.begin(), end=out.end(); it!=end; ++it) {
-                LOG(1) << " [" << *it << ']';
+                builder << " [" << *it << ']';
             }
-            LOG(1) << endl;
+            builder << endl;
         }
 
         return out;
@@ -140,12 +144,15 @@ namespace mongo {
 
         freeaddrinfo(addrs);
 
-        if (logLevel >= 1) {
-            LOG(1) << "getallIPs(\"" << iporhost << "\"):";
+        if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1))) {
+            LogstreamBuilder builder(logger::globalLogDomain(),
+                                     getThreadName(),
+                                     logger::LogSeverity::Debug(1));
+            builder << "getallIPs(\"" << iporhost << "\"):";
             for (vector<string>::const_iterator it=out.begin(), end=out.end(); it!=end; ++it) {
-                LOG(1) << " [" << *it << ']';
+                builder << " [" << *it << ']';
             }
-            LOG(1) << endl;
+            builder << endl;
         }
 
         return out;
@@ -243,8 +250,8 @@ namespace mongo {
                 return false;
             }
 
-            if (AuthorizationManager::isAuthEnabled() && !cmdLine.keyFile.empty() ) {
-                if (!conn.auth("local", internalSecurity.user, internalSecurity.pwd, errmsg, false)) {
+            if (AuthorizationManager::isAuthEnabled() && isInternalAuthSet()) {
+                if (!authenticateInternalUser(&conn)) {
                     return false;
                 }
             }

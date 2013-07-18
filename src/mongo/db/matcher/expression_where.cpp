@@ -18,7 +18,7 @@
 
 #include "mongo/pch.h"
 #include "mongo/base/init.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
@@ -67,7 +67,7 @@ namespace mongo {
         _userScope = scope.getOwned();
 
         NamespaceString nswrapper( _ns );
-        _scope = globalScriptEngine->getPooledScope( nswrapper.db.c_str(), "where" );
+        _scope = globalScriptEngine->getPooledScope( nswrapper.db().toString(), "where" );
         _func = _scope->createFunction( _code.c_str() );
 
         if ( !_func )

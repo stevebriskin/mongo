@@ -75,7 +75,7 @@ namespace QueryUtilTests {
             virtual bool isPointIntervalSet() { return false; }
             static void checkElt( BSONElement expected, BSONElement actual ) {
                 if ( expected.woCompare( actual, false ) ) {
-                    log() << "expected: " << expected << ", got: " << actual;
+                    mongo::unittest::log() << "expected: " << expected << ", got: " << actual;
                     ASSERT( false );
                 }
             }
@@ -1208,24 +1208,23 @@ namespace QueryUtilTests {
 
     namespace FieldRangeSetTests {
 
-        class ToString {
+        class Basics {
         public:
             void run() {
-                BSONObj obj = BSON( "a" << 1 );
-                FieldRangeSet fieldRangeSet( "", obj, true, true );
-                fieldRangeSet.toString(); // Just test that we don't crash.
-            }
-        };
-        
-        class Namespace {
-        public:
-            void run() {
-                boost::shared_ptr<FieldRangeSet> frs;
                 {
-                    string ns = str::stream() << "foo";
-                    frs.reset( new FieldRangeSet( ns.c_str(), BSONObj(), true, true ) );
+                    BSONObj obj = BSON( "a" << 1 );
+                    FieldRangeSet fieldRangeSet( "", obj, true, true );
+                    fieldRangeSet.toString(); // Just test that we don't crash.
                 }
-                ASSERT_EQUALS( string( "foo" ), frs->ns() );
+
+                {
+                    boost::shared_ptr<FieldRangeSet> frs;
+                    {
+                        string ns = str::stream() << "foo";
+                        frs.reset( new FieldRangeSet( ns.c_str(), BSONObj(), true, true ) );
+                    }
+                    ASSERT_EQUALS( string( "foo" ), frs->ns() );
+                }
             }
         };
 
@@ -1648,7 +1647,7 @@ namespace QueryUtilTests {
                 client_.resetIndexCache();
                 client_.ensureIndex( ns(), key, false, name.c_str() );
                 NamespaceDetails *d = nsd();
-                for( int i = 0; i < d->nIndexes; ++i ) {
+                for( int i = 0; i < d->getCompletedIndexCount(); ++i ) {
                     if ( d->idx(i).keyPattern() == key /*indexName() == name*/ || ( d->idx(i).isIdIndex() && IndexDetails::isIdIndexPattern( key ) ) )
                         return &d->idx(i);
                 }
@@ -2124,7 +2123,7 @@ namespace QueryUtilTests {
             }
             static void assertEqualWithoutFieldNames( const BSONObj &one, const BSONObj &two ) {
                 if ( !equalWithoutFieldNames( one, two ) ) {
-                    log() << one << " != " << two << endl;
+                    mongo::unittest::log() << one << " != " << two << endl;
                     ASSERT( equalWithoutFieldNames( one, two ) );
                 }
             }
@@ -3000,8 +2999,7 @@ namespace QueryUtilTests {
             add<FieldRangeTests::ExactMatchRepresentation::Intersection>();
             add<FieldRangeTests::ExactMatchRepresentation::Union>();
             add<FieldRangeTests::ExactMatchRepresentation::Difference>();
-            add<FieldRangeSetTests::ToString>();
-            add<FieldRangeSetTests::Namespace>();
+            add<FieldRangeSetTests::Basics>();
             add<FieldRangeSetTests::Intersect>();
             add<FieldRangeSetTests::MultiKeyIntersect>();
             add<FieldRangeSetTests::EmptyMultiKeyIntersect>();

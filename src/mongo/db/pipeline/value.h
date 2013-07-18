@@ -97,6 +97,16 @@ namespace mongo {
         */
         static Value createIntOrLong(long long value);
 
+        /** Construct an Array-typed Value from consumed without copying the vector.
+         *  consumed is replaced with an empty vector.
+         *  In C++11 this would be spelled Value(std::move(consumed)).
+         */
+        static Value consume(vector<Value>& consumed) {
+            RCVector* vec = new RCVector();
+            std::swap(vec->vec, consumed);
+            return Value(ValueStorage(Array, vec));
+        }
+
         /** A "missing" value indicates the lack of a Value.
          *  This is similar to undefined/null but should not appear in output to BSON.
          *  Missing Values are returned by Document when accessing non-existent fields.
@@ -224,16 +234,12 @@ namespace mongo {
         /// Call this after memcpying to update ref counts if needed
         void memcpyed() const { _storage.memcpyed(); }
 
-        // LEGACY creation functions
-        static Value createFromBsonElement(const BSONElement* pBsonElement);
-        static Value createInt(int value) { return Value(value); }
-        static Value createLong(long long value) { return Value(value); }
-        static Value createDouble(double value) { return Value(value); }
-        static Value createTimestamp(const OpTime& value) { return Value(value); }
-        static Value createString(const string& value) { return Value(value); }
-        static Value createDocument(const Document& doc) { return Value(doc); }
-        static Value createArray(const vector<Value>& vec) { return Value(vec); }
-        static Value createDate(const long long value);
+        /// members for Sorter
+        struct SorterDeserializeSettings {}; // unused
+        void serializeForSorter(BufBuilder& buf) const;
+        static Value deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&);
+        int memUsageForSorter() const { return getApproximateSize(); }
+        Value getOwned() const { return *this; }
 
     private:
         /** This is a "honeypot" to prevent unexpected implicit conversions to the accepted argument
@@ -243,6 +249,8 @@ namespace mongo {
          */
         template <typename InvalidArgumentType>
         explicit Value(const InvalidArgumentType& invalidArgument);
+
+        explicit Value(const ValueStorage& storage) :_storage(storage) {}
 
         // does no type checking
         StringData getStringData() const; // May contain embedded NUL bytes

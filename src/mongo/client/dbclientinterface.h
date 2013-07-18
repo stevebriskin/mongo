@@ -22,7 +22,10 @@
 
 #include "mongo/pch.h"
 
+#include <boost/function.hpp>
+
 #include "mongo/db/jsobj.h"
+#include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_port.h"
@@ -578,9 +581,9 @@ namespace mongo {
         set<string> _seenIndexes;
     public:
         /** controls how chatty the client is about network errors & such.  See log.h */
-        int _logLevel;
+        logger::LogSeverity _logLevel;
 
-        DBClientWithCommands() : _logLevel(0),
+        DBClientWithCommands() : _logLevel(logger::LogSeverity::Log()),
                 _cachedAvailableOptions( (enum QueryOptions)0 ),
                 _haveCachedAvailableOptions(false) { }
 
@@ -658,7 +661,7 @@ namespace mongo {
         */
         virtual unsigned long long count(const string &ns, const BSONObj& query = BSONObj(), int options=0, int limit=0, int skip=0 );
 
-        string createPasswordDigest( const string &username , const string &clearTextPassword );
+        static string createPasswordDigest(const string &username, const string &clearTextPassword);
 
         /** returns true in isMaster parm if this db is the current master
            of a replica pair.
@@ -979,6 +982,15 @@ namespace mongo {
                           const string &pwd,
                           string& errmsg,
                           bool digestPassword);
+
+        /**
+         * Use the MONGODB-X509 protocol to authenticate as "username. The certificate details
+         * has already been communicated automatically as part of the connect call.
+         * Returns false on failure and set "errmsg".
+         */
+        bool _authX509(const string&dbname,
+                            const string &username,
+                            string& errmsg);
 
     private:
         enum QueryOptions _cachedAvailableOptions;

@@ -673,7 +673,7 @@ namespace mongo {
 
     void ParallelSortClusteredCursor::_handleStaleNS( const NamespaceString& staleNS, bool forceReload, bool fullReload ){
 
-        DBConfigPtr config = grid.getDBConfig( staleNS.db );
+        DBConfigPtr config = grid.getDBConfig( staleNS.db() );
 
         // Reload db if needed, make sure it works
         if( config && fullReload && ! config->reload() ){
@@ -770,13 +770,13 @@ namespace mongo {
         bool returnPartial = ( _qSpec.options() & QueryOption_PartialResults );
         bool specialVersion = _cInfo.versionedNS.size() > 0;
         bool specialFilter = ! _cInfo.cmdFilter.isEmpty();
-        NamespaceString ns = specialVersion ? _cInfo.versionedNS : _qSpec.ns();
+        NamespaceString ns( specialVersion ? _cInfo.versionedNS : _qSpec.ns() );
 
         ChunkManagerPtr manager;
         ShardPtr primary;
 
         string prefix;
-        if (MONGO_unlikely(logLevel >= pc)) {
+        if (MONGO_unlikely(logger::globalLogDomain()->shouldLog(pc))) {
             if( _totalTries > 0 ) {
                 prefix = str::stream() << "retrying (" << _totalTries << " tries)";
             }
@@ -792,13 +792,13 @@ namespace mongo {
 
         if( isVersioned() ){
 
-            DBConfigPtr config = grid.getDBConfig( ns.db ); // Gets or loads the config
+            DBConfigPtr config = grid.getDBConfig( ns.db() ); // Gets or loads the config
             uassert( 15989, "database not found for parallel cursor request", config );
 
             // Try to get either the chunk manager or the primary shard
             config->getChunkManagerOrPrimary( ns, manager, primary );
 
-            if (MONGO_unlikely(logLevel >= pc)) {
+            if (MONGO_unlikely(logger::globalLogDomain()->shouldLog(pc))) {
                 if (manager) {
                     vinfo = str::stream() << "[" << manager->getns() << " @ "
                         << manager->getVersion().toString() << "]";
@@ -826,7 +826,7 @@ namespace mongo {
 
             // Don't use version to get shards here
             todo = _qShards;
-            if (MONGO_unlikely(logLevel >= pc)) {
+            if (MONGO_unlikely(logger::globalLogDomain()->shouldLog(pc))) {
                 vinfo = str::stream() << "[" << _qShards.size() << " shards specified]";
             }
         }
@@ -978,7 +978,7 @@ namespace mongo {
             catch( StaleConfigException& e ){
 
                 // Our version isn't compatible with the current version anymore on at least one shard, need to retry immediately
-                NamespaceString staleNS = e.getns();
+                NamespaceString staleNS( e.getns() );
 
                 // For legacy reasons, this may not be set in the exception :-(
                 if( staleNS.size() == 0 ) staleNS = ns; // ns is the *versioned* namespace, be careful of this
@@ -1195,7 +1195,7 @@ namespace mongo {
             if( staleNSExceptions.size() ){
                 for( map<string,StaleConfigException>::iterator i = staleNSExceptions.begin(), end = staleNSExceptions.end(); i != end; ++i ){
 
-                    const string& staleNS = i->first;
+                    NamespaceString staleNS( i->first );
                     const StaleConfigException& exception = i->second;
 
                     bool forceReload, fullReload;

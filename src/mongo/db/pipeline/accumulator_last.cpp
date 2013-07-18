@@ -21,24 +21,27 @@
 
 namespace mongo {
 
-    Value AccumulatorLast::evaluate(const Document& pDocument) const {
-        verify(vpOperand.size() == 1);
-
+    void AccumulatorLast::processInternal(const Value& input, bool merging) {
         /* always remember the last value seen */
-        pValue = vpOperand[0]->evaluate(pDocument);
-
-        return pValue;
+        _last = input;
+        _memUsageBytes = sizeof(*this) + _last.getApproximateSize() - sizeof(Value);
     }
 
-    AccumulatorLast::AccumulatorLast():
-        AccumulatorSingleValue() {
+    Value AccumulatorLast::getValue(bool toBeMerged) const {
+        return _last;
     }
 
-    intrusive_ptr<Accumulator> AccumulatorLast::create(
-        const intrusive_ptr<ExpressionContext> &pCtx) {
-        intrusive_ptr<AccumulatorLast> pAccumulator(
-            new AccumulatorLast());
-        return pAccumulator;
+    AccumulatorLast::AccumulatorLast() {
+        _memUsageBytes = sizeof(*this);
+    }
+
+    void AccumulatorLast::reset() {
+        _memUsageBytes = sizeof(*this);
+        _last = Value();
+    }
+
+    intrusive_ptr<Accumulator> AccumulatorLast::create() {
+        return new AccumulatorLast();
     }
 
     const char *AccumulatorLast::getOpName() const {

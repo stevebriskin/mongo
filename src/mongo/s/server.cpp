@@ -29,12 +29,14 @@
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/dbwebserver.h"
 #include "mongo/db/initialize_server_global_state.h"
+#include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/balance.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/config.h"
+#include "mongo/s/config_server_checker_service.h"
 #include "mongo/s/config_upgrade.h"
 #include "mongo/s/cursors.h"
 #include "mongo/s/grid.h"
@@ -43,10 +45,12 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/concurrency/task.h"
+#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/exception_filter_win32.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_server.h"
+#include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
@@ -77,7 +81,6 @@ namespace mongo {
     string mongosCommand;
     bool dbexitCalled = false;
     static bool scriptingEnabled = true;
-    static bool httpInterface = false;
     static vector<string> configdbs;
 
     bool inShutdown() {
@@ -226,8 +229,6 @@ namespace mongo {
 
     void init() {
         serverID.init();
-
-        Logstream::get().addGlobalTee( new RamLog("global") );
     }
 
     void start( const MessageServer::Options& opts ) {
@@ -300,14 +301,7 @@ static bool runMongosServer( bool doUpgrade ) {
         return false;
     }
 
-    {
-        class CheckConfigServers : public task::Task {
-            virtual string name() const { return "CheckConfigServers"; }
-            virtual void doWork() { configServer.ok(true); }
-        };
-
-        task::repeat(new CheckConfigServers, 60*1000);
-    }
+    startConfigServerChecker();
 
     VersionType initVersionInfo;
     VersionType versionInfo;
@@ -338,7 +332,7 @@ static bool runMongosServer( bool doUpgrade ) {
     CmdLine::launchOk();
 #endif
 
-    if ( httpInterface )
+    if ( cmdLine.isHttpInterfaceEnabled )
         boost::thread web( boost::bind(&webServerThread, new NoAdminAccess() /* takes ownership */) );
 
     MessageServer::Options opts;
@@ -451,7 +445,7 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
     }
 
     if ( params.count( "test" ) ) {
-        logLevel = 5;
+        ::mongo::logger::globalLogDomain()->setMinimumLoggedSeverity(::mongo::logger::LogSeverity::Debug(5));
         StartupTest::runTests();
         cout << "tests passed" << endl;
         ::_exit(EXIT_SUCCESS);
@@ -466,7 +460,7 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
             out() << "can't have both --httpinterface and --nohttpinterface" << endl;
             ::_exit(EXIT_FAILURE);
         }
-        httpInterface = true;
+        cmdLine.isHttpInterfaceEnabled = true;
     }
 
     if (params.count("noAutoSplit")) {
@@ -490,6 +484,9 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
     }
 
     _isUpgradeSwitchSet = params.count("upgrade");
+
+    // dbpath currently must be linked in to mongos, but the directory should never be written to.
+    dbpath = "";
 
 #if defined(_WIN32)
     vector<string> disallowedOptions;
@@ -537,8 +534,7 @@ static int _main() {
     }
 #endif
 
-    runMongosServer(_isUpgradeSwitchSet);
-    return 0;
+    return !runMongosServer(_isUpgradeSwitchSet);
 }
 
 #if defined(_WIN32)
@@ -556,6 +552,15 @@ MONGO_INITIALIZER(CreateAuthorizationManager)(InitializerContext* context) {
     return Status::OK();
 }
 
+#ifdef MONGO_SSL
+MONGO_INITIALIZER_GENERAL(setSSLManagerType, 
+                          MONGO_NO_PREREQUISITES, 
+                          ("SSLManager"))(InitializerContext* context) {
+    isSSLServer = true;
+    return Status::OK();
+}
+#endif
+
 int mongoSMain(int argc, char* argv[], char** envp) {
     static StaticObserver staticObserver;
     if (argc < 1)
@@ -564,6 +569,7 @@ int mongoSMain(int argc, char* argv[], char** envp) {
     mongosCommand = argv[0];
 
     processCommandLineOptions(std::vector<std::string>(argv, argv + argc));
+    mongo::forkServerOrDie();
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     CmdLine::censor(argc, argv);
     try {

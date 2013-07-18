@@ -435,7 +435,7 @@ namespace ExtSortTests {
             return _current > _stop;
         }
         IWPair next() {
-            IWPair out(_current, 0);
+            IWPair out(_current, -_current);
             _current += _increment;
             return out;
         }
@@ -488,7 +488,8 @@ namespace ExtSortTests {
             }
 
         } catch (...) {
-            log() << "Failure from line " << line << " on iteration " << iteration << endl;
+            mongo::unittest::log() <<
+                "Failure from line " << line << " on iteration " << iteration << endl;
             throw;
         }
     }
@@ -498,7 +499,7 @@ namespace ExtSortTests {
     boost::shared_ptr<IWIterator> makeInMemIterator(const int (&array)[N]) {
         vector<IWPair> vec;
         for (int i=0; i<N; i++)
-            vec.push_back(IWPair(array[i], 0));
+            vec.push_back(IWPair(array[i], -array[i]));
         return boost::make_shared<sorter::InMemIterator<IntWrapper, IntWrapper> >(vec);
     }
 
@@ -536,7 +537,11 @@ namespace ExtSortTests {
                 public:
                     UnsortedIter() :_pos(0) {}
                     bool more() { return _pos < sizeof(unsorted)/sizeof(unsorted[0]); }
-                    IWPair next() { return IWPair(unsorted[_pos++], 0); }
+                    IWPair next() {
+                        IWPair ret(unsorted[_pos], -unsorted[_pos]);
+                        _pos++;
+                        return ret;
+                    }
                     size_t _pos;
                 } unsortedIter;
 
@@ -552,17 +557,17 @@ namespace ExtSortTests {
             { // small
                 SortedFileWriter<IntWrapper, IntWrapper> sorter;
                 sorter.addAlreadySorted(0,0);
-                sorter.addAlreadySorted(1,0);
-                sorter.addAlreadySorted(2,0);
-                sorter.addAlreadySorted(3,0);
-                sorter.addAlreadySorted(4,0);
+                sorter.addAlreadySorted(1,-1);
+                sorter.addAlreadySorted(2,-2);
+                sorter.addAlreadySorted(3,-3);
+                sorter.addAlreadySorted(4,-4);
                 ASSERT_ITERATORS_EQUIVALENT(boost::shared_ptr<IWIterator>(sorter.done()),
                                             make_shared<IntIterator>(0,5));
             }
             { // big
                 SortedFileWriter<IntWrapper, IntWrapper> sorter;
                 for (int i=0; i< 10*1000*1000; i++)
-                    sorter.addAlreadySorted(i,0);
+                    sorter.addAlreadySorted(i,-i);
 
                 ASSERT_ITERATORS_EQUIVALENT(boost::shared_ptr<IWIterator>(sorter.done()),
                                             make_shared<IntIterator>(0,10*1000*1000));
@@ -697,11 +702,11 @@ namespace ExtSortTests {
 
             // add data to the sorter
             virtual void addData(ptr<IWSorter> sorter) {
-                sorter->add(2,0);
-                sorter->add(1,0);
+                sorter->add(2,-2);
+                sorter->add(1,-1);
                 sorter->add(0,0);
-                sorter->add(4,0);
-                sorter->add(3,0);
+                sorter->add(4,-4);
+                sorter->add(3,-3);
             }
 
             // returns an iterator with the correct results
@@ -738,11 +743,11 @@ namespace ExtSortTests {
             }
             void addData(ptr<IWSorter> sorter) {
                 sorter->add(0,0);
-                sorter->add(3,0);
-                sorter->add(4,0);
-                sorter->add(2,0);
-                sorter->add(1,0);
-                sorter->add(-1,0);
+                sorter->add(3,-3);
+                sorter->add(4,-4);
+                sorter->add(2,-2);
+                sorter->add(1,-1);
+                sorter->add(-1,1);
             }
             virtual boost::shared_ptr<IWIterator> correct() {
                 return make_shared<IntIterator>(-1,4);
@@ -754,16 +759,16 @@ namespace ExtSortTests {
 
         class Dupes : public Basic {
             void addData(ptr<IWSorter> sorter) {
-                sorter->add(1,0);
-                sorter->add(-1,0);
-                sorter->add(1,0);
-                sorter->add(-1,0);
-                sorter->add(1,0);
+                sorter->add(1,-1);
+                sorter->add(-1,1);
+                sorter->add(1,-1);
+                sorter->add(-1,1);
+                sorter->add(1,-1);
                 sorter->add(0,0);
-                sorter->add(2,0);
-                sorter->add(-1,0);
-                sorter->add(2,0);
-                sorter->add(3,0);
+                sorter->add(2,-2);
+                sorter->add(-1,1);
+                sorter->add(2,-2);
+                sorter->add(3,-3);
             }
             virtual boost::shared_ptr<IWIterator> correct() {
                 const int array[] = {-1,-1,-1, 0, 1,1,1, 2,2, 3};
@@ -796,7 +801,7 @@ namespace ExtSortTests {
 
             void addData(ptr<IWSorter> sorter) {
                 for (int i=0; i<NUM_ITEMS; i++)
-                    sorter->add(_array[i], 0);
+                    sorter->add(_array[i], -_array[i]);
 
                 if (typeid(*this) == typeid(LotsOfDataLittleMemory)) {
                     // don't do this check in subclasses since they may set a limit

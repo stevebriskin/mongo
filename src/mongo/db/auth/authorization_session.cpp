@@ -28,9 +28,10 @@
 #include "mongo/db/auth/principal_set.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/privilege_set.h"
+#include "mongo/db/auth/security_key.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -63,9 +64,21 @@ namespace {
         _authenticatedPrincipals.add(principal);
         if (!principal->isImplicitPrivilegeAcquisitionEnabled())
             return;
+
+        const std::string dbname = principal->getName().getDB().toString();
+        if (dbname == StringData("local", StringData::LiteralTag()) &&
+            principal->getName().getUser() == internalSecurity.user) {
+
+            // Grant full access to internal user
+            ActionSet allActions;
+            allActions.addAllActions();
+            acquirePrivilege(Privilege(PrivilegeSet::WILDCARD_RESOURCE, allActions),
+                             principal->getName());
+            return;
+        }
+
         _acquirePrivilegesForPrincipalFromDatabase(ADMIN_DBNAME, principal->getName());
         principal->markDatabaseAsProbed(ADMIN_DBNAME);
-        const std::string dbname = principal->getName().getDB().toString();
         _acquirePrivilegesForPrincipalFromDatabase(dbname, principal->getName());
         principal->markDatabaseAsProbed(dbname);
         _externalState->onAddAuthorizedPrincipal(principal);
@@ -118,8 +131,8 @@ namespace {
         return Status::OK();
     }
 
-    void AuthorizationSession::grantInternalAuthorization(const std::string& userName) {
-        Principal* principal = new Principal(UserName(userName, "local"));
+    void AuthorizationSession::grantInternalAuthorization(const UserName& userName) {
+        Principal* principal = new Principal(userName);
         ActionSet actions;
         actions.addAllActions();
 
@@ -146,12 +159,6 @@ namespace {
                                   << user.getDB(),
                           0);
         }
-        if (user.getUser() == internalSecurity.user) {
-            // Grant full access to internal user
-            ActionSet allActions;
-            allActions.addAllActions();
-            return acquirePrivilege(Privilege(PrivilegeSet::WILDCARD_RESOURCE, allActions), user);
-        }
         return _externalState->getAuthorizationManager().buildPrivilegeSet(dbname,
                                                                            user,
                                                                            privilegeDocument,
@@ -168,7 +175,7 @@ namespace {
         return checkAuthForPrivilege(Privilege(resource, actions)).isOK();
     }
 
-    Status AuthorizationSession::checkAuthForQuery(const std::string& ns) {
+    Status AuthorizationSession::checkAuthForQuery(const std::string& ns, const BSONObj& query) {
         NamespaceString namespaceString(ns);
         verify(!namespaceString.isCommand());
         if (!checkAuthorization(ns, ActionType::find)) {
@@ -179,17 +186,41 @@ namespace {
         return Status::OK();
     }
 
-    Status AuthorizationSession::checkAuthForInsert(const std::string& ns) {
-        NamespaceString namespaceString(ns);
-        if (!checkAuthorization(ns, ActionType::insert)) {
+    Status AuthorizationSession::checkAuthForGetMore(const std::string& ns, long long cursorID) {
+        if (!checkAuthorization(ns, ActionType::find)) {
             return Status(ErrorCodes::Unauthorized,
-                          mongoutils::str::stream() << "not authorized for insert on " << ns,
+                          mongoutils::str::stream() << "not authorized for getmore on " << ns,
                           0);
         }
         return Status::OK();
     }
 
-    Status AuthorizationSession::checkAuthForUpdate(const std::string& ns, bool upsert) {
+    Status AuthorizationSession::checkAuthForInsert(const std::string& ns,
+                                                    const BSONObj& document) {
+        NamespaceString namespaceString(ns);
+        if (namespaceString.coll() == StringData("system.indexes", StringData::LiteralTag())) {
+            std::string indexNS = document["ns"].String();
+            if (!checkAuthorization(indexNS, ActionType::ensureIndex)) {
+                return Status(ErrorCodes::Unauthorized,
+                              mongoutils::str::stream() << "not authorized to create index on " <<
+                                      indexNS,
+                              0);
+            }
+        } else {
+            if (!checkAuthorization(ns, ActionType::insert)) {
+                return Status(ErrorCodes::Unauthorized,
+                              mongoutils::str::stream() << "not authorized for insert on " << ns,
+                              0);
+            }
+        }
+
+        return Status::OK();
+    }
+
+    Status AuthorizationSession::checkAuthForUpdate(const std::string& ns,
+                                                    const BSONObj& query,
+                                                    const BSONObj& update,
+                                                    bool upsert) {
         NamespaceString namespaceString(ns);
         if (!upsert) {
             if (!checkAuthorization(ns, ActionType::update)) {
@@ -211,7 +242,7 @@ namespace {
         return Status::OK();
     }
 
-    Status AuthorizationSession::checkAuthForDelete(const std::string& ns) {
+    Status AuthorizationSession::checkAuthForDelete(const std::string& ns, const BSONObj& query) {
         NamespaceString namespaceString(ns);
         if (!checkAuthorization(ns, ActionType::remove)) {
             return Status(ErrorCodes::Unauthorized,
@@ -221,24 +252,28 @@ namespace {
         return Status::OK();
     }
 
-    Status AuthorizationSession::checkAuthForGetMore(const std::string& ns) {
-        return checkAuthForQuery(ns);
-    }
-
     Privilege AuthorizationSession::_modifyPrivilegeForSpecialCases(const Privilege& privilege) {
         ActionSet newActions;
         newActions.addAllActionsFromSet(privilege.getActions());
-        std::string collectionName = NamespaceString(privilege.getResource()).coll;
-        if (collectionName == "system.users") {
+        NamespaceString ns( privilege.getResource() );
+
+        if (ns.coll() == "system.users") {
+            if (newActions.contains(ActionType::insert) ||
+                    newActions.contains(ActionType::update)) {
+                // End users can't insert or update system.users directly, only the system can.
+                // TODO(spencer): check for remove also once there's a command to remove users.
+                newActions.addAction(ActionType::userAdminV1);
+            } else {
+                newActions.addAction(ActionType::userAdmin);
+            }
             newActions.removeAction(ActionType::find);
             newActions.removeAction(ActionType::insert);
             newActions.removeAction(ActionType::update);
             newActions.removeAction(ActionType::remove);
-            newActions.addAction(ActionType::userAdmin);
-        } else if (collectionName == "system.profile") {
+        } else if (ns.coll() == "system.profile") {
             newActions.removeAction(ActionType::find);
             newActions.addAction(ActionType::profileRead);
-        } else if (collectionName == "system.indexes" && newActions.contains(ActionType::find)) {
+        } else if (ns.coll() == "system.indexes" && newActions.contains(ActionType::find)) {
             newActions.removeAction(ActionType::find);
             newActions.addAction(ActionType::indexRead);
         }

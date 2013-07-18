@@ -16,7 +16,7 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -26,20 +26,17 @@
 #include <unistd.h>
 #endif
 
-#ifdef MONGO_HAVE_EXECINFO_BACKTRACE
-#include <execinfo.h>
-#endif
-
-#include "log.h"
-#include "signal_handlers.h"
+#include "mongo/platform/backtrace.h"
+#include "mongo/util/log.h"
+#include "mongo/util/signal_handlers.h"
 
 namespace mongo {
 
     /*
      * WARNING: PLEASE READ BEFORE CHANGING THIS MODULE
      *
-     * All code in this module should be singal-friendly. Before adding any system
-     * call or other dependency, please make sure the latter still holds.
+     * All code in this module must be signal-friendly. Before adding any system
+     * call or other dependency, please make sure that this still holds.
      *
      */
 
@@ -84,7 +81,7 @@ namespace mongo {
 
     static void formattedBacktrace( int fd ) {
 
-#ifdef MONGO_HAVE_EXECINFO_BACKTRACE
+#if !defined(_WIN32)
 
         int numFrames;
         const int MAX_DEPTH = 20;
@@ -107,14 +104,12 @@ namespace mongo {
     }
 
     void printStackAndExit( int signalNum ) {
-        int fd = Logstream::getLogDesc();
+        const int fd = 0;
 
-        if ( fd >= 0 ) {
-            formattedWrite( fd , "Received signal %d\n" , signalNum );
-            formattedWrite( fd , "Backtrace: " );
-            formattedBacktrace( fd );
-            formattedWrite( fd , "===\n" );
-        }
+        formattedWrite( fd , "Received signal %d\n" , signalNum );
+        formattedWrite( fd , "Backtrace: " );
+        formattedBacktrace( fd );
+        formattedWrite( fd , "===\n" );
 
         ::_exit( EXIT_ABRUPT );
     }

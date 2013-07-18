@@ -19,17 +19,18 @@
 #include "mongo/pch.h"
 
 #include <boost/unordered_map.hpp>
-#include "util/intrusive_counter.h"
-#include "db/clientcursor.h"
-#include "db/jsobj.h"
-#include "db/matcher.h"
-#include "db/pipeline/document.h"
-#include "db/pipeline/expression.h"
+
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/matcher.h"
+#include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
-#include "db/pipeline/value.h"
-#include "util/string_writer.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/value.h"
 #include "mongo/db/projection.h"
+#include "mongo/db/sorter/sorter.h"
 #include "mongo/s/shard.h"
+#include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
     class Accumulator;
@@ -41,14 +42,9 @@ namespace mongo {
     class ExpressionObject;
     class DocumentSourceLimit;
 
-    class DocumentSource :
-        public IntrusiveCounterUnsigned,
-        public StringWriter {
+    class DocumentSource : public IntrusiveCounterUnsigned {
     public:
         virtual ~DocumentSource();
-
-        // virtuals from StringWriter
-        virtual void writeString(stringstream &ss) const;
 
         /**
            Set the step for a user-specified pipeline step.
@@ -367,21 +363,6 @@ namespace mongo {
     class DocumentSourceCursor :
         public DocumentSource {
     public:
-        /**
-         * Holds a Cursor and all associated state required to access the cursor.  An object of this
-         * type may only be used by one thread.
-         */
-        struct CursorWithContext {
-            /** Takes a read lock that will be held for the lifetime of the object. */
-            CursorWithContext( const string& ns );
-
-            // Must be the first struct member for proper construction and destruction, as other
-            // members may depend on the read lock it acquires.
-            Client::ReadContext _readContext;
-            shared_ptr<ShardChunkManager> _chunkMgr;
-            ClientCursor::Holder _cursor;
-        };
-
         // virtuals from DocumentSource
         virtual ~DocumentSourceCursor();
         virtual bool eof();
@@ -397,16 +378,22 @@ namespace mongo {
         virtual void dispose();
 
         /**
-          Create a document source based on a cursor.
-
-          This is usually put at the beginning of a chain of document sources
-          in order to fetch data from the database.
-
-          @param pCursor the cursor to use to fetch data
-          @param pExpCtx the expression context for the pipeline
-        */
+         * Create a document source based on a passed-in cursor.
+         *
+         * This is usually put at the beginning of a chain of document sources
+         * in order to fetch data from the database.
+         *
+         * The DocumentSource takes ownership of the cursor and will destroy it
+         * when the DocumentSource is finished with the cursor, if it hasn't
+         * already been destroyed.
+         *
+         * @param ns the namespace the cursor is over
+         * @param cursorId the id of the cursor to use
+         * @param pExpCtx the expression context for the pipeline
+         */
         static intrusive_ptr<DocumentSourceCursor> create(
-            const shared_ptr<CursorWithContext>& cursorWithContext,
+            const string& ns,
+            CursorId cursorId,
             const intrusive_ptr<ExpressionContext> &pExpCtx);
 
         /*
@@ -414,7 +401,6 @@ namespace mongo {
 
           @param namespace the namespace
         */
-        void setNamespace(const string &ns);
 
         /*
           Record the query that was specified for the cursor this wraps, if
@@ -449,7 +435,8 @@ namespace mongo {
 
     private:
         DocumentSourceCursor(
-            const shared_ptr<CursorWithContext>& cursorWithContext,
+            const string& ns,
+            CursorId cursorId,
             const intrusive_ptr<ExpressionContext> &pExpCtx);
 
         void findNext();
@@ -458,24 +445,17 @@ namespace mongo {
         bool hasCurrent;
         Document pCurrent;
 
-        string ns; // namespace
-
-        /*
-          The bson dependencies must outlive the Cursor wrapped by this
-          source.  Therefore, bson dependencies must appear before pCursor
-          in order cause its destructor to be called *after* pCursor's.
-         */
+        // BSONObj members must outlive _projection and cursor.
         BSONObj _query;
         BSONObj _sort;
         shared_ptr<Projection> _projection; // shared with pClientCursor
         ParsedDeps _dependencies;
 
-        shared_ptr<CursorWithContext> _cursorWithContext;
+        string ns; // namespace
+        CursorId _cursorId;
+        CollectionMetadataPtr _collMetadata;
 
-        ClientCursor::Holder& cursor();
-        const ShardChunkManager* chunkMgr() { return _cursorWithContext->_chunkMgr.get(); }
-
-        bool canUseCoveredIndex();
+        bool canUseCoveredIndex(ClientCursor* cursor);
 
         /*
           Yield the cursor sometimes.
@@ -485,7 +465,7 @@ namespace mongo {
           client cursor, and throw an error.  NOTE This differs from the
           behavior of most other operations, see SERVER-2454.
          */
-        void yieldSometimes();
+        void yieldSometimes(ClientCursor* cursor);
     };
 
 
@@ -646,8 +626,7 @@ namespace mongo {
                 group field
          */
         void addAccumulator(const std::string& fieldName,
-                            intrusive_ptr<Accumulator> (*pAccumulatorFactory)(
-                            const intrusive_ptr<ExpressionContext> &),
+                            intrusive_ptr<Accumulator> (*pAccumulatorFactory)(),
                             const intrusive_ptr<Expression> &pExpression);
 
         /**
@@ -678,6 +657,12 @@ namespace mongo {
     private:
         DocumentSourceGroup(const intrusive_ptr<ExpressionContext> &pExpCtx);
 
+        /// Spill groups map to disk and returns an iterator to the file.
+        shared_ptr<Sorter<Value, Value>::Iterator> spill();
+
+        // Only used by spill. Would be function-local if that were legal in C++03.
+        class SpillSTLComparator;
+
         /*
           Before returning anything, this source must fetch everything from
           the underlying source and group it.  populate() is used to do that
@@ -689,9 +674,9 @@ namespace mongo {
 
         intrusive_ptr<Expression> pIdExpression;
 
-        typedef boost::unordered_map<Value,
-            vector<intrusive_ptr<Accumulator> >, Value::Hash> GroupsType;
-        GroupsType groups;
+        typedef vector<intrusive_ptr<Accumulator> > Accumulators;
+        typedef boost::unordered_map<Value, Accumulators, Value::Hash> GroupsMap;
+        GroupsMap groups;
 
         /*
           The field names for the result documents and the accumulator
@@ -706,14 +691,26 @@ namespace mongo {
           These three vectors parallel each other.
         */
         vector<string> vFieldName;
-        vector<intrusive_ptr<Accumulator> (*)(
-            const intrusive_ptr<ExpressionContext> &)> vpAccumulatorFactory;
+        vector<intrusive_ptr<Accumulator> (*)()> vpAccumulatorFactory;
         vector<intrusive_ptr<Expression> > vpExpression;
 
 
-        Document makeDocument(const GroupsType::iterator &rIter);
+        Document makeDocument(const Value& id, const Accumulators& accums, bool mergeableOutput);
 
-        GroupsType::iterator groupsIterator;
+        bool _spilled;
+        const bool _extSortAllowed;
+        const int _maxMemoryUsageBytes;
+
+        // only used when !_spilled
+        GroupsMap::iterator groupsIterator;
+
+        // only used when _spilled
+        scoped_ptr<Sorter<Value, Value>::Iterator> _sorterIterator;
+        pair<Value, Value> _firstPartOfNextGroup;
+        Value _currentId;
+        Accumulators _currentAccumulators;
+        bool _doneAfterNextAdvance;
+        bool _done;
     };
 
 
@@ -837,7 +834,8 @@ namespace mongo {
         virtual void sourceToBson(BSONObjBuilder *pBuilder, bool explain) const;
 
     private:
-        DocumentSourceProject(const intrusive_ptr<ExpressionContext> &pExpCtx);
+        DocumentSourceProject(const intrusive_ptr<ExpressionContext>& pExpCtx,
+                              const intrusive_ptr<ExpressionObject>& exprObj);
 
         // configuration state
         intrusive_ptr<ExpressionObject> pEO;
@@ -937,48 +935,36 @@ namespace mongo {
         void populate();
         bool populated;
 
-        // These are called by populate()
-        void populateAll();  // no limit
-        void populateOne();  // limit == 1
-        void populateTopK(); // limit > 1
-
         /* these two parallel each other */
         typedef vector<intrusive_ptr<ExpressionFieldPath> > SortPaths;
         SortPaths vSortKey;
         vector<char> vAscending; // used like vector<bool> but without specialization
 
-        struct KeyAndDoc {
-            explicit KeyAndDoc(const Document& d, const SortPaths& sp); // extracts sort key
-            Value key; // array of keys if vSortKey.size() > 1
-            Document doc;
-        };
-        friend void swap(KeyAndDoc& l, KeyAndDoc& r);
+        /// Extracts the fields in vSortKey from the Document;
+        Value extractKey(const Document& d) const;
 
-        /// Compare two KeyAndDocs according to the specified sort key.
-        int compare(const KeyAndDoc& lhs, const KeyAndDoc& rhs) const;
+        /// Compare two Values according to the specified sort key.
+        int compare(const Value& lhs, const Value& rhs) const;
 
-        /*
-          This is a utility class just for the STL sort that is done
-          inside.
-         */
+        typedef Sorter<Value, Document> MySorter;
+
+        // For MySorter
         class Comparator {
         public:
             explicit Comparator(const DocumentSourceSort& source): _source(source) {}
-            bool operator()(const KeyAndDoc& lhs, const KeyAndDoc& rhs) const {
-                return (_source.compare(lhs, rhs) < 0);
+            int operator()(const MySorter::Data& lhs, const MySorter::Data& rhs) const {
+                return _source.compare(lhs.first, rhs.first);
             }
         private:
             const DocumentSourceSort& _source;
         };
 
-        deque<KeyAndDoc> documents;
-
         intrusive_ptr<DocumentSourceLimit> limitSrc;
+
+        bool _done;
+        Document _current;
+        scoped_ptr<MySorter::Iterator> _output;
     };
-    inline void swap(DocumentSourceSort::KeyAndDoc& l, DocumentSourceSort::KeyAndDoc& r) {
-        l.key.swap(r.key);
-        l.doc.swap(r.doc);
-    }
 
     class DocumentSourceLimit :
         public SplittableDocumentSource {

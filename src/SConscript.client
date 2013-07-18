@@ -2,6 +2,8 @@
 
 # This SConscript describes build and install rules for the Mongo C++ driver and associated exmaple
 # programs.
+import os
+
 Import('env has_option installSetup use_system_version_of_library')
 
 Import('nix linux darwin windows')
@@ -48,9 +50,20 @@ clientSourceBasic = [
     'mongo/db/jsobj.cpp',
     'mongo/db/json.cpp',
     'mongo/db/lasterror.cpp',
-    'mongo/db/namespace.cpp',
     'mongo/db/dbmessage.cpp',
+    'mongo/logger/console.cpp',
+    'mongo/logger/log_manager.cpp',
+    'mongo/logger/log_severity.cpp',
+    'mongo/logger/logger.cpp',
+    'mongo/logger/logstream_builder.cpp',
+    'mongo/logger/message_event_utf8_encoder.cpp',
+    'mongo/logger/message_log_domain.cpp',
+    'mongo/logger/ramlog.cpp',
+    'mongo/logger/rotatable_file_manager.cpp',
+    'mongo/logger/rotatable_file_writer.cpp',
     'mongo/pch.cpp',
+    'mongo/platform/backtrace.cpp',
+    'mongo/platform/posix_fadvise.cpp',
     'mongo/platform/process_id.cpp',
     'mongo/platform/random.cpp',
     'mongo/util/assert_util.cpp',
@@ -60,6 +73,7 @@ clientSourceBasic = [
     'mongo/util/concurrency/spin_lock.cpp',
     'mongo/util/concurrency/synchronization.cpp',
     'mongo/util/concurrency/task.cpp',
+    'mongo/util/concurrency/thread_name.cpp',
     'mongo/util/concurrency/thread_pool.cpp',
     'mongo/util/concurrency/mutexdebugger.cpp',
     'mongo/util/debug_util.cpp',
@@ -83,8 +97,6 @@ clientSourceBasic = [
     'mongo/util/net/ssl_manager.cpp',
     'mongo/util/password.cpp',
     'mongo/util/processinfo.cpp',
-    env.File('mongo/util/processinfo_${PYSYSPLATFORM}.cpp'),
-    'mongo/util/ramlog.cpp',
     'mongo/util/signal_handlers.cpp',
     'mongo/util/stringutils.cpp',
     'mongo/util/text.cpp',
@@ -99,14 +111,28 @@ clientSourceBasic = [
 clientSourceSasl = ['mongo/client/sasl_client_authenticate_impl.cpp',
                     'mongo/client/sasl_client_session.cpp']
 
-clientSourceAll = clientSourceBasic + clientSourceSasl
+clientSourceProcessInfo = [
+    'mongo/util/processinfo_darwin.cpp',
+    'mongo/util/processinfo_freebsd.cpp',
+    'mongo/util/processinfo_linux2.cpp',
+    'mongo/util/processinfo_none.cpp',
+    'mongo/util/processinfo_sunos5.cpp',
+    'mongo/util/processinfo_win32.cpp'
+]
+
+clientSourceAll = clientSourceBasic + clientSourceSasl + clientSourceProcessInfo
 
 usingSasl = env['MONGO_BUILD_SASL_CLIENT']
 
+clientSource = list(clientSourceBasic)
 if usingSasl:
-    clientSource = clientSourceAll
-else:
-    clientSource = clientSourceBasic
+    clientSource += clientSourceSasl
+
+processInfoPlatformFile = env.File( "mongo/util/processinfo_${PYSYSPLATFORM}.cpp" )
+# NOTE: See comment about similar code in src/mongo/SConscript
+if not os.path.exists( str( processInfoPlatformFile ) ):
+    processInfoPlatformFile = env.File( "mongo/util/processinfo_none.cpp" )
+clientSource += [processInfoPlatformFile]
 
 exampleSourceMap = [
         ('authTest', 'mongo/client/examples/authTest.cpp'),
@@ -130,6 +156,7 @@ clientHeaderDirectories = [
     "db/stats/",
     "db/repl/",
     "db/ops/",
+    "logger/",
     "platform/",
     "s/",
     "scripting/",
@@ -264,22 +291,20 @@ clientTests = staticClientEnv.Install("#/", staticClientPrograms)
 if buildShared:
     sharedClientEnv = clientEnv.Clone()
 
+    # Arrange for the tests to link against the mongoclient in the #/sharedclient directory.
+    sharedClientEnv.PrependUnique(
+        LIBS=['mongoclient'],
+        LIBPATH=["#/sharedclient"]
+    )
+
     # Deal with the different lookup models between regular UNIX and Darwin. For regular unix,
-    # we can just link against the shared lib wherever it lives, and set $ORIGIN to pull the
-    # copy we run against from the current directory (#/sharedclient). This won't work on
-    # Darwin though, so to work around, we link against the staged copy of the mongoclient
-    # dylib in #sharedclient, which has @executable path set as its install_name.
-    if nix:
-        if darwin:
-            sharedClientEnv.PrependUnique(
-                LIBS=['mongoclient'],
-                LIBPATH=["#/sharedclient"]
-            )
-        else:
-            sharedClientEnv.PrependUnique(
-                LIBS=[mongoClientSharedLib],
-                LINKFLAGS="-Wl,-z,origin",
-                RPATH=[sharedClientEnv.Literal("\\$$ORIGIN")])
+    # we set $ORIGIN to pull the copy we run against from the current directory
+    # (#/sharedclient). On Darwin, the staged copy of the mongoclient dylib in #sharedclient
+    # has @executable path set as its install_name, so we pick up the same behavior that way.
+    if nix and not darwin:
+        sharedClientEnv.PrependUnique(
+            LINKFLAGS="-Wl,-z,origin",
+            RPATH=[sharedClientEnv.Literal("\\$$ORIGIN")])
 
     sharedClientPrograms = [
         sharedClientEnv.Program("sharedclient/" + target, obj) for (target, obj) in exampleObjMap]

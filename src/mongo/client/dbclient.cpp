@@ -26,8 +26,7 @@
 #include "mongo/client/syncclusterconnection.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/namespace-inl.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
 #include "mongo/util/assert_util.h"
 #include "mongo/util/md5.hpp"
@@ -436,10 +435,9 @@ namespace mongo {
     }
 
     unsigned long long DBClientWithCommands::count(const string &myns, const BSONObj& query, int options, int limit, int skip ) {
-        NamespaceString ns(myns);
         BSONObj cmd = _countCmd( myns , query , options , limit , skip );
         BSONObj res;
-        if( !runCommand(ns.db.c_str(), cmd, res, options) )
+        if( !runCommand(nsToDatabase(myns), cmd, res, options) )
             uasserted(11010,string("count fails:") + res.toString());
         return res["n"].numberLong();
     }
@@ -447,7 +445,7 @@ namespace mongo {
     BSONObj DBClientWithCommands::_countCmd(const string &myns, const BSONObj& query, int options, int limit, int skip ) {
         NamespaceString ns(myns);
         BSONObjBuilder b;
-        b.append( "count" , ns.coll );
+        b.append( "count" , ns.coll() );
         b.append( "query" , query );
         if ( limit )
             b.append( "limit" , limit );
@@ -568,12 +566,24 @@ namespace mongo {
                     errmsg,
                     _authMongoCR(userSource, user, password, errmsg, digestPassword));
         }
+#ifdef MONGO_SSL
+        else if (mechanism == StringData("MONGODB-X509", StringData::LiteralTag())){
+            std::string userSource;
+            uassertStatusOK(bsonExtractStringField(params,
+                                                   saslCommandUserSourceFieldName,
+                                                   &userSource));
+            std::string errmsg;
+            uassert(ErrorCodes::AuthenticationFailed,
+                    errmsg,
+                    _authX509(userSource, getSSLManager()->getClientSubjectName(), errmsg));
+        }
+#endif
         else if (saslClientAuthenticate != NULL) {
             uassertStatusOK(saslClientAuthenticate(this, params));
         }
         else {
             uasserted(ErrorCodes::BadValue,
-                      "SASL authentication support not compiled into client library.");
+                      mechanism + " mechanism support not compiled into client library.");
         }
     };
 
@@ -641,6 +651,23 @@ namespace mongo {
             authCmd = b.done();
         }
 
+        if( runCommand(dbname, authCmd, info) ) {
+            return true;
+        }
+
+        errmsg = info.toString();
+        return false;
+    }
+
+    bool DBClientWithCommands::_authX509(const string&dbname,
+                                              const string &username,
+                                              string& errmsg){
+        BSONObj authCmd;
+        BSONObjBuilder cmdBuilder;
+        cmdBuilder << "authenticate" << 1 << "mechanism" << "MONGODB-X509" << "user" << username;
+        authCmd = cmdBuilder.done();
+
+        BSONObj info;
         if( runCommand(dbname, authCmd, info) ) {
             return true;
         }
@@ -1153,9 +1180,8 @@ namespace mongo {
         say( toSend );
     }
 
-    
     auto_ptr<DBClientCursor> DBClientWithCommands::getIndexes( const string &ns ) {
-        return query( Namespace( ns.c_str() ).getSisterNS( "system.indexes" ).c_str() , BSON( "ns" << ns ) );
+        return query( NamespaceString( ns ).getSystemIndexesCollection() , BSON( "ns" << ns ) );
     }
 
     void DBClientWithCommands::dropIndex( const string& ns , BSONObj keys ) {
@@ -1166,7 +1192,7 @@ namespace mongo {
     void DBClientWithCommands::dropIndex( const string& ns , const string& indexName ) {
         BSONObj info;
         if ( ! runCommand( nsToDatabase( ns ) ,
-                           BSON( "deleteIndexes" << NamespaceString( ns ).coll << "index" << indexName ) ,
+                           BSON( "deleteIndexes" << nsToCollectionSubstring(ns) << "index" << indexName ) ,
                            info ) ) {
             LOG(_logLevel) << "dropIndex failed: " << info << endl;
             uassert( 10007 ,  "dropIndex failed" , 0 );
@@ -1176,9 +1202,12 @@ namespace mongo {
 
     void DBClientWithCommands::dropIndexes( const string& ns ) {
         BSONObj info;
-        uassert( 10008 ,  "dropIndexes failed" , runCommand( nsToDatabase( ns ) ,
-                 BSON( "deleteIndexes" << NamespaceString( ns ).coll << "index" << "*") ,
-                 info ) );
+        uassert( 10008,
+                 "dropIndexes failed",
+                 runCommand( nsToDatabase( ns ),
+                             BSON( "deleteIndexes" << nsToCollectionSubstring(ns) << "index" << "*"),
+                             info )
+                 );
         resetIndexCache();
     }
 
@@ -1193,7 +1222,7 @@ namespace mongo {
 
         for ( list<BSONObj>::iterator i=all.begin(); i!=all.end(); i++ ) {
             BSONObj o = *i;
-            insert( Namespace( ns.c_str() ).getSisterNS( "system.indexes" ).c_str() , o );
+            insert( NamespaceString( ns ).getSystemIndexesCollection() , o );
         }
 
     }
@@ -1263,7 +1292,7 @@ namespace mongo {
         if ( ttl > 0 )
             toSave.append( "expireAfterSeconds", ttl );
 
-        insert( Namespace( ns.c_str() ).getSisterNS( "system.indexes"  ).c_str() , toSave.obj() );
+        insert( NamespaceString( ns ).getSystemIndexesCollection() , toSave.obj() );
         return 1;
     }
 

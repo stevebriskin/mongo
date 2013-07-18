@@ -20,9 +20,9 @@
 
 #include "mongo/db/btreecursor.h"
 #include "mongo/db/geo/geoquery.h"
+#include "mongo/db/geo/s2common.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/index/s2_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/platform/unordered_set.h"
@@ -46,11 +46,6 @@ namespace mongo {
         // appropriate sub-cursor.
         virtual Status seek(const BSONObj& position);
 
-        // Not implemented:
-        virtual Status seek(const vector<const BSONElement*>& position,
-                            const vector<bool>& inclusive);
-        virtual Status skip(const vector<const BSONElement*>& position,
-                            const vector<bool>& inclusive);
         virtual Status setOptions(const CursorOptions& options);
 
         // Implemented:
@@ -63,8 +58,6 @@ namespace mongo {
 
         virtual Status savePosition();
         virtual Status restorePosition();
-
-        virtual void aboutToDeleteBucket(const DiskLoc& bucket);
 
     private:
         S2IndexingParams _params;

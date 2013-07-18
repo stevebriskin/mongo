@@ -368,7 +368,7 @@ namespace {
      */
     const Extent* getNthExtent(int extentNum, const NamespaceDetails* nsd) {
         int curExtent = 0;
-        for (Extent* ex = DataFileMgr::getExtent(nsd->firstExtent);
+        for (Extent* ex = DataFileMgr::getExtent(nsd->firstExtent());
              ex != NULL;
              ex = ex->getNextExtent()) {
 
@@ -543,8 +543,11 @@ namespace {
             recordsArrayBuilder.reset(new BSONArrayBuilder(result.subarrayStart("records")));
         }
 
+        Database* db = cc().database();
+        ExtentManager& extentManager = db->getExtentManager();
+
         DiskLoc prevDl = ex->firstRecord;
-        for (DiskLoc dl = ex->firstRecord; ! dl.isNull(); dl = r->nextInExtent(dl)) {
+        for (DiskLoc dl = ex->firstRecord; !dl.isNull(); dl = extentManager.getNextRecordInExtent(dl)) {
             r = dl.rec();
             processRecord(dl, prevDl, r, extentOfs, params, sliceData,
                           recordsArrayBuilder.get());
@@ -564,7 +567,7 @@ namespace {
 
         if (processingDeletedRecords) {
             for (int bucketNum = 0; bucketNum < mongo::Buckets; bucketNum++) {
-                DiskLoc dl = nsd->deletedList[bucketNum];
+                DiskLoc dl = nsd->deletedListEntry(bucketNum);
                 while (!dl.isNull()) {
                     DeletedRecord* dr = dl.drec();
                     processDeletedRecord(dl, dr, ex, params, bucketNum, sliceData,
@@ -714,7 +717,7 @@ namespace {
             success = analyzeExtent(nsd, ex, subCommand, globalParams, errmsg, outputBuilder);
         }
         else {
-            const DiskLoc dl = nsd->firstExtent;
+            const DiskLoc dl = nsd->firstExtent();
             if (dl.isNull()) {
                 errmsg = "no extents in namespace";
                 return false;
@@ -777,7 +780,7 @@ namespace {
         const string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
         const NamespaceDetails* nsd = nsdetails(ns);
         if (!cmdLine.quiet) {
-            tlog() << "CMD: storageDetails " << ns << ", analyze " << subCommandStr << endl;
+            MONGO_TLOG(0) << "CMD: storageDetails " << ns << ", analyze " << subCommandStr << endl;
         }
         if (!nsd) {
             errmsg = "ns not found";

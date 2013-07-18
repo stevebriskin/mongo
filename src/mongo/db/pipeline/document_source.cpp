@@ -77,14 +77,6 @@ namespace mongo {
         pBuilder->append(insides.done());
     }
 
-    void DocumentSource::writeString(stringstream &ss) const {
-        BSONArrayBuilder bab;
-        addToBsonArray(&bab);
-        BSONArray ba(bab.arr());
-        ss << ba.toString(/* isArray */true); 
-            // our toString should use standard string types.....
-    }
-
     BSONObj DocumentSource::depsToProjection(const set<string>& deps) {
         BSONObjBuilder bb;
 
@@ -167,7 +159,7 @@ namespace mongo {
             }
         }
 
-        return Value(values);
+        return Value::consume(values);
     }
 
     Document DocumentSource::documentFromBsonWithDeps(const BSONObj& bson,

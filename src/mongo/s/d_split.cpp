@@ -28,6 +28,7 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/btreecursor.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -277,10 +278,10 @@ namespace mongo {
                     // otherwise make it (max,MinKey,MinKey...) so that bound is non-inclusive
                     max = Helpers::toKeyFormat( kp.extendRangeBound( max, false ) );
                 }
-                
-                const long long recCount = d->stats.nrecords;
-                const long long dataSize = d->stats.datasize;
-                
+
+                const long long recCount = d->numRecords();
+                const long long dataSize = d->dataSize();
+
                 //
                 // 1.b Now that we have the size estimate, go over the remaining parameters and apply any maximum size
                 //     restrictions specified there.
@@ -623,8 +624,8 @@ namespace mongo {
                     result.append( "requestedMin" , min );
                     result.append( "requestedMax" , max );
 
-                    LOG( LL_WARNING ) << "aborted split because " << errmsg << ": " << min << "->" << max
-                                      << " is now " << currMin << "->" << currMax << endl;
+                    warning() << "aborted split because " << errmsg << ": " << min << "->" << max
+                              << " is now " << currMin << "->" << currMax << endl;
                     return false;
                 }
 
@@ -633,8 +634,8 @@ namespace mongo {
                     result.append( "from" , myShard.getName() );
                     result.append( "official" , shard );
 
-                    LOG( LL_WARNING ) << "aborted split because " << errmsg << ": chunk is at " << shard
-                                      << " and not at " << myShard.getName() << endl;
+                    warning() << "aborted split because " << errmsg << ": chunk is at " << shard
+                              << " and not at " << myShard.getName() << endl;
                     return false;
                 }
 
@@ -643,8 +644,8 @@ namespace mongo {
                     maxVersion.addToBSON( result, "officialVersion" );
                     shardingState.getVersion( ns ).addToBSON( result, "myVersion" );
 
-                    LOG( LL_WARNING ) << "aborted split because " << errmsg << ": official " << maxVersion
-                                      << " mine: " << shardingState.getVersion(ns) << endl;
+                    warning() << "aborted split because " << errmsg << ": official " << maxVersion
+                              << " mine: " << shardingState.getVersion(ns) << endl;
                     return false;
                 }
 
@@ -652,7 +653,8 @@ namespace mongo {
                 origChunk.max = currMax.getOwned();
                 origChunk.lastmod = ChunkVersion::fromBSON(currChunk[ChunkType::DEPRECATED_lastmod()]);
 
-                // since this could be the first call that enable sharding we also make sure to have the chunk manager up to date
+                // since this could be the first call that enable sharding we also make sure to load
+                // the shard's metadata
                 shardingState.gotShardName( shard );
                 ChunkVersion shardVersion;
                 shardingState.trySetVersion( ns , shardVersion /* will return updated */ );
@@ -732,7 +734,7 @@ namespace mongo {
             }
 
             //
-            // 4. apply the batch of updates to metadata and to the chunk manager
+            // 4. apply the batch of updates to remote and local metadata
             //
 
             BSONObj cmd = cmdBuilder.obj();
@@ -754,7 +756,7 @@ namespace mongo {
                 msgasserted( 13593 , ss.str() );
             }
 
-            // install a chunk manager with knowledge about newly split chunks in this shard's state
+            // install chunk metadata with knowledge about newly split chunks in this shard's state
             splitKeys.pop_back(); // 'max' was used as sentinel
             maxVersion.incMinor();
             shardingState.splitChunk( ns , min , max , splitKeys , maxVersion );

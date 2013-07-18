@@ -11,6 +11,11 @@ print("\ndo a write");
 master.getDB("test").foo.insert({x:1});
 replTest.awaitReplication();
 
+// do another write, because the first one might be longer than 10 seconds ago
+// on the secondary (due to starting up), and we need to be within 10 seconds
+// to step down.
+master.getDB("test").foo.insert({x:2});
+master.getDB("test").runCommand({getLastError : 1, w : 2, wtimeout : 30000 });
 // lock secondary, to pause replication
 print("\nlock secondary");
 var locked = replTest.liveNodes.slaves[0];
@@ -18,11 +23,11 @@ printjson( locked.getDB("admin").runCommand({fsync : 1, lock : 1}) );
 
 // do a write
 print("\ndo a write");
-master.getDB("test").foo.insert({x:2});
+master.getDB("test").foo.insert({x:3});
 
 // step down the primary asyncronously
 print("stepdown");
-var command = "sleep(4000); tojson(rs.stepDown());"
+var command = "sleep(4000); tojson(db.adminCommand( { replSetStepDown : 60, force : 1 } ));"
 var waitfunc = startParallelShell(command, master.port);
 
 print("getlasterror; should assert or return an error, depending on timing");

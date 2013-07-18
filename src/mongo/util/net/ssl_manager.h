@@ -25,7 +25,6 @@
 #include <openssl/ssl.h>
 
 namespace mongo {
-
     class SSLManagerInterface {
     public:
         virtual ~SSLManagerInterface();
@@ -47,14 +46,28 @@ namespace mongo {
         /**
          * Fetches a peer certificate and validates it if it exists
          * Throws SocketException on failure
+         * @return a std::string containing the certificate's subject name.
          */
-        virtual void validatePeerCertificate(const SSL* ssl) = 0;
+        virtual std::string validatePeerCertificate(const SSL* ssl) = 0;
 
         /**
          * Cleans up SSL thread local memory; use at thread exit
          * to avoid memory leaks
          */
         virtual void cleanupThreadLocals() = 0;
+
+        /**
+         * Gets the subject name of our own server certificate
+         * @return the subject name.
+         */
+        virtual std::string getServerSubjectName() = 0;
+
+        /**
+         * Gets the subject name of our own client certificate
+         * used for cluster authentiation
+         * @return the subject name.
+         */
+        virtual std::string getClientSubjectName() = 0;
 
         /**
          * ssl.h shims
@@ -77,5 +90,6 @@ namespace mongo {
     // Access SSL functions through this instance.
     SSLManagerInterface* getSSLManager();
 
+    extern bool isSSLServer;
 }
 #endif

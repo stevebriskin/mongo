@@ -20,8 +20,13 @@
 
 #include "mongo/db/ops/update.h"
 
+#include <cstring>  // for memcpy
+
+#include "mongo/bson/mutable/damage_vector.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/index_set.h"
 #include "mongo/db/namespace_details.h"
 #include "mongo/db/ops/update_driver.h"
 #include "mongo/db/ops/update_internal.h"
@@ -33,6 +38,7 @@
 #include "mongo/db/record.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/platform/unordered_set.h"
 
 //#define DEBUGUPDATE(x) cout << x << endl;
 #define DEBUGUPDATE(x)
@@ -42,7 +48,7 @@ namespace mongo {
     MONGO_EXPORT_SERVER_PARAMETER( newUpdateFrameworkEnabled, bool, false );
 
     bool isNewUpdateFrameworkEnabled() {
-        return false;
+        return newUpdateFrameworkEnabled;
     }
 
     void checkNoMods( BSONObj o ) {
@@ -357,7 +363,7 @@ namespace mongo {
                     // is of the form "db.collection".  Therefore, the following expression must
                     // always be valid.  "system.users" updates must never be done in place, in
                     // order to ensure that they are validated inside DataFileMgr::updateRecord(.).
-                    bool isSystemUsersMod = (NamespaceString(ns).coll == "system.users");
+                    bool isSystemUsersMod = nsToCollectionSubstring(ns) == "system.users";
 
                     BSONObj newObj;
                     if ( !mss->isUpdateIndexed() && mss->canApplyInPlace() && !isSystemUsersMod ) {
@@ -486,101 +492,200 @@ namespace mongo {
 
         // TODO
         // + Separate UpdateParser from UpdateRunner (the latter should be "stage-y")
-        // + fast path for update for query by _id
-        // + $atomic support (or better, support proper yielding if not)
-        // + define the dedup story (and do it here, if that's the decidion)
-        // + support in-place updates (and determination if indices are involved in an update)
-        // + update OpDebug counters properly
-        // + specific paths set on insert
-        // + support for relaxing viable path constraint in replication
-        // + set UpdateResponse properly
+        //   + All the yield and deduplicate logic would move to the query stage
+        //     portion of it
+        //
+        // + Replication related
+        //   + fast path for update for query by _id
+        //   + support for relaxing viable path constraint in replication
+        //
+        // + Field Management
+        //   + Force all upsert to contain _id
+        //   + Prevent changes to immutable fields (_id, and those mentioned by sharding)
+        //
+        // + Yiedling related
+        //   + $atomic support (or better, support proper yielding if not)
+        //   + page fault support
+
+        debug.updateobj = updateobj;
+
+        NamespaceDetails* d = nsdetails( ns );
+        NamespaceDetailsTransient* nsdt = &NamespaceDetailsTransient::get( ns );
 
         UpdateDriver::Options opts;
         opts.multi = multi;
         opts.upsert = upsert;
         opts.logOp = logop;
-        UpdateDriver driver(opts);
-        Status status = driver.parse( updateobj );
+        UpdateDriver driver( opts );
+        Status status = driver.parse( nsdt->indexKeys(), updateobj );
         if ( !status.isOK() ) {
             uasserted( 16840, status.reason() );
         }
 
         shared_ptr<Cursor> cursor = getOptimizedCursor( ns, patternOrig, BSONObj(), planPolicy );
-        NamespaceDetails* d = nsdetails(ns); // can be null if an upsert...
-        NamespaceDetailsTransient* nsdt = &NamespaceDetailsTransient::get(ns);
 
-        // We may or may not have documents for this update. If we don't, then try to upsert,
-        // if allowed.
-        if ( !cursor->ok() && upsert ) {
+        // The 'cursor' the optimizer gave us may contain query plans that generate duplicate
+        // diskloc's. We set up here the mechanims that will prevent us from processing those
+        // twice if we see them. We also set up a 'ClientCursor' so that we can support
+        // yielding.
+        const bool dedupHere = cursor->autoDedup();
+        shared_ptr<Cursor> cPtr = cursor;
+        auto_ptr<ClientCursor> clientCursor( new ClientCursor( QueryOption_NoCursorTimeout,
+                                                               cPtr,
+                                                               ns ) );
 
-            // If this is not a full object replace, we need to generate a document by
-            // examining the query. Otherwise, we can use the replacement object itself.
-            BSONObj oldObj;
-            if ( *updateobj.firstElementFieldName() == '$' ) {
-                if ( !driver.createFromQuery( patternOrig, &oldObj ) ) {
-                    uasserted( 16835, "cannot create object to update" );
-                }
-                // TODO this is the hook for activating a $setOnInsert
-            }
+        //
+        // We'll start assuming we have one or more documents for this update. (Othwerwise,
+        // we'll fallback to upserting.)
+        //
 
-            // Since this is an upsert, we will be oplogging it as an insert. We don't
-            // need the driver's help to build the oplog record, then.
-            driver.setLogOp(false);
+        // We record that this will not be an upsert, in case a mod doesn't want to be applied
+        // when in strict update mode.
+        driver.setContext( ModifierInterface::ExecInfo::UPDATE_CONTEXT );
 
-            BSONObj newObj;
-            status = driver.update( oldObj, StringData(), &newObj, NULL /* no oplog record */);
-            if ( !status.isOK() ) {
-                uasserted( 16836, status.reason() );
-            }
-
-            theDataFileMgr.insertWithObjMod( ns, newObj, false, su );
-
-            if ( logop ) {
-                logOp( "i", ns, newObj, 0, 0, fromMigrate, &newObj );
-            }
-
-            return UpdateResult( false, false, 0, BSONObj() );
-        }
-
-        // We have documents for this update. Let's fetch each of them and pipe them through
-        // the update expression.
+        // Let's fetch each of them and pipe them through the update expression, making sure to
+        // keep track of the necessary stats. Recall that we'll be pulling documents out of
+        // cursors and some of them do not deduplicate the entries they generate. We have
+        // deduping logic in here, too -- for now.
+        unordered_set<DiskLoc, DiskLoc::Hasher> seenLocs;
+        int numUpdated = 0;
+        debug.nscanned = 0;
         while ( cursor->ok() ) {
 
-            // Get Obj and match details
+            // Let's fetch the next candidate object for this update.
             Record* r = cursor->_current();
             DiskLoc loc = cursor->currLoc();
             const BSONObj oldObj = loc.obj();
 
+            // We count how many documents we scanned even though we may skip those that are
+            // deemed duplicated. The final 'numUpdated' and 'nscanned' numbers may differ for
+            // that reason.
+            debug.nscanned++;
 
-            // Skip documents that don't match. Also, we don't want to update the very object
-            // atop of which the cursor is, becuase that document may move. So we advance the
-            // cursor before operating on the record.
+            // Skips this document if it:
+            // a) doesn't match the query portion of the update
+            // b) was deemed duplicate by the underlying cursor machinery
+            //
+            // Now, if we are going to update the document,
+            // c) we don't want to do so while the cursor is at it, as that may invalidate
+            // the cursor. So, we advance to next document, before issuing the update.
             MatchDetails matchDetails;
             matchDetails.requestElemMatchKey();
             if ( !cursor->currentMatches( &matchDetails ) ) {
+                // a)
                 cursor->advance();
                 continue;
             }
-            else if (multi) {
+            else if ( cursor->getsetdup( loc ) && dedupHere ) {
+                // b)
                 cursor->advance();
+                continue;
+            }
+            else if (driver.dollarModMode() && multi) {
+                // c)
+                cursor->advance();
+                if ( dedupHere ) {
+                    if ( seenLocs.count( loc ) ) {
+                        continue;
+                    }
+                }
+
+                // There are certain kind of cursors that hold multiple pointers to data
+                // underneath. $or cursors is one example. In a $or cursor, it may be the case
+                // that when we did the last advance(), we finished consuming documents from
+                // one of $or child and started consuming the next one. In that case, it is
+                // possible that the last document of the previous child is the same as the
+                // first document of the next (see SERVER-5198 and jstests/orp.js).
+                //
+                // So we advance the cursor here until we see a new diskloc.
+                //
+                // Note that we won't be yielding, and we may not do so for a while if we find
+                // a particularly duplicated sequence of loc's. That is highly unlikely,
+                // though.  (See SERVER-5725, if curious, but "stage" based $or will make that
+                // ticket moot).
+                while( cursor->ok() && loc == cursor->currLoc() ) {
+                    cursor->advance();
+                }
             }
 
-            BSONObj newObj;
+            // For some (unfortunate) historical reasons, not all cursors would be valid after
+            // a write simply because we advanced them to a document not affected by the write.
+            // To protect in those cases, not only we engaged in the advance() logic above, but
+            // we also tell the cursor we're about to write a document that we've just seen.
+            // prepareToTouchEarlierIterate() requires calling later
+            // recoverFromTouchingEarlierIterate(), so we make a note here to do so.
+            bool touchPreviousDoc = multi && cursor->ok();
+            if ( touchPreviousDoc  ) {
+                clientCursor->setDoingDeletes( true );
+                cursor->prepareToTouchEarlierIterate();
+            }
+
+            // Ask the driver to apply the mods. It may be that the driver can apply those "in
+            // place", that is, some values of the old document just get adjusted without any
+            // change to the binary layout on the bson layer. It may be that a whole new
+            // document is needed to accomodate the new bson layout of the resulting document.
+            mutablebson::Document doc( oldObj, mutablebson::Document::kInPlaceEnabled );
             BSONObj logObj;
-            status = driver.update( oldObj, matchDetails.elemMatchKey(), &newObj, &logObj );
+            StringData matchedField = matchDetails.hasElemMatchKey() ?
+                                                    matchDetails.elemMatchKey():
+                                                    StringData();
+            status = driver.update( matchedField, &doc, &logObj );
             if ( !status.isOK() ) {
                 uasserted( 16837, status.reason() );
             }
 
-            // Write Obj
-            theDataFileMgr.updateRecord(ns,
-                                        d,
-                                        nsdt,
-                                        r,
-                                        loc,
-                                        newObj.objdata(),
-                                        newObj.objsize(),
-                                        debug);
+            // If the driver applied the mods in place, we can ask the mutable for what
+            // changed. We call those changes "damages". :) We use the damages to inform the
+            // journal what was changed, and then apply them to the original document
+            // ourselves. If, however, the driver applied the mods out of place, we ask it to
+            // generate a new, modified document for us. In that case, the file manager will
+            // take care of the journaling details for us.
+            //
+            // This code flow is admittedly odd. But, right now, journaling is baked in the file
+            // manager. And if we aren't using the file manager, we have to do jounaling
+            // ourselves.
+            BSONObj newObj;
+            const char* source = NULL;
+            mutablebson::DamageVector damages;
+            bool inPlace = doc.getInPlaceUpdates(&damages, &source);
+            if ( inPlace && !driver.modsAffectIndices() ) {
+
+                // All updates were in place. Apply them via durability and writing pointer.
+                mutablebson::DamageVector::const_iterator where = damages.begin();
+                const mutablebson::DamageVector::const_iterator end = damages.end();
+                for( ; where != end; ++where ) {
+                    const char* sourcePtr = source + where->sourceOffset;
+                    void* targetPtr = getDur().writingPtr(
+                        const_cast<char*>(oldObj.objdata()) + where->targetOffset,
+                        where->size);
+                    std::memcpy(targetPtr, sourcePtr, where->size);
+                }
+                newObj = oldObj;
+                debug.fastmod = true;
+            }
+            else {
+
+                // The updates were not in place. Apply them through the file manager.
+                newObj = doc.getObject();
+                DiskLoc newLoc = theDataFileMgr.updateRecord(ns,
+                                                             d,
+                                                             nsdt,
+                                                             r,
+                                                             loc,
+                                                             newObj.objdata(),
+                                                             newObj.objsize(),
+                                                             debug);
+
+                // If we've moved this object to a new location, make sure we don't apply
+                // that update again if our traversal picks the objecta again.
+                //
+                // We also take note that the diskloc if the updates are affecting indices.
+                // Chances are that we're traversing one of them and they may be multi key and
+                // therefore duplicate disklocs.
+                if ( newLoc != loc || driver.modsAffectIndices()  ) {
+                    seenLocs.insert( newLoc );
+                }
+            }
 
             // Log Obj
             if ( logop ) {
@@ -590,14 +695,78 @@ namespace mongo {
                 }
             }
 
-            getDur().commitIfNeeded();
+            // One more document updated.
+            numUpdated++;
 
             if (!multi) {
                 break;
             }
+
+            // If we used the cursor mechanism that prepares an earlier seen document for a
+            // write we need to tell such mechanisms that the write is over.
+            if ( touchPreviousDoc ) {
+                cursor->recoverFromTouchingEarlierIterate();
+            }
+
+            getDur().commitIfNeeded();
+
         }
 
-        return UpdateResult( false, false, 0, BSONObj() );
+        if (numUpdated > 0) {
+            return UpdateResult( true /* updated existing object(s) */,
+                                 driver.dollarModMode() /* $mod or obj replacement */,
+                                 numUpdated /* # of docments update */,
+                                 BSONObj() );
+        }
+        else if (numUpdated == 0 && !upsert) {
+            return UpdateResult( false /* no object updated */,
+                                 driver.dollarModMode() /* $mod or obj replacement */,
+                                 0 /* no updates */,
+                                 BSONObj() );
+        }
+
+        //
+        // We haven't succeeded updating any existing document but upserts are allowed.
+        //
+
+        // If this is a $mod base update, we need to generate a document by examining the
+        // query and the mods. Otherwise, we can use the object replacement sent by the user
+        // update command that was parsed by the driver before.
+        BSONObj oldObj;
+        if ( *updateobj.firstElementFieldName() == '$' ) {
+            if ( !driver.createFromQuery( patternOrig, &oldObj ) ) {
+                uasserted( 16835, "cannot create object to update" );
+            }
+            debug.fastmodinsert = true;
+        }
+        else {
+            debug.upsert = true;
+        }
+
+        // Since this is an upsert, we will be oplogging it as an insert. We don't
+        // need the driver's help to build the oplog record, then. We also set the
+        // context of the update driver to an "upsert". Some mods may only work in that
+        // context (e.g. $setOnInsert).
+        driver.setLogOp( false );
+        driver.setContext( ModifierInterface::ExecInfo::INSERT_CONTEXT );
+
+        mutablebson::Document doc( oldObj, mutablebson::Document::kInPlaceDisabled );
+        status = driver.update( StringData(), &doc, NULL /* no oplog record */);
+        if ( !status.isOK() ) {
+            uasserted( 16836, status.reason() );
+        }
+        BSONObj newObj = doc.getObject();
+
+        theDataFileMgr.insertWithObjMod( ns, newObj, false, su );
+
+        if ( logop ) {
+            logOp( "i", ns, newObj, 0, 0, fromMigrate, &newObj );
+        }
+
+        return UpdateResult( false /* updated a non existing document */,
+                             driver.dollarModMode() /* $mod or obj replacement? */,
+                             1 /* count of updated documents */,
+                             newObj /* object that was upserted */ );
     }
 
     UpdateResult updateObjects( const char* ns,
@@ -685,19 +854,19 @@ namespace mongo {
             UpdateDriver::Options opts;
             opts.multi = false;
             opts.upsert = false;
-            UpdateDriver driver(opts);
-            Status status = driver.parse( operators );
+            UpdateDriver driver( opts );
+            Status status = driver.parse( IndexPathSet(), operators );
             if ( !status.isOK() ) {
                 uasserted( 16838, status.reason() );
             }
 
-            BSONObj newObj;
-            status = driver.update( from, StringData(), &newObj, NULL /* not oplogging */ );
+            mutablebson::Document doc( from, mutablebson::Document::kInPlaceDisabled );
+            status = driver.update( StringData(), &doc, NULL /* not oplogging */ );
             if ( !status.isOK() ) {
                 uasserted( 16839, status.reason() );
             }
 
-            return newObj;
+            return doc.getObject();
         }
         else {
             ModSet mods( operators );

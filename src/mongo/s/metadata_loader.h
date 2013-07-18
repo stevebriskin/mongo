@@ -18,22 +18,23 @@
 
 #include <string>
 
+#include "mongo/base/status.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
 
-    class CollectionManager;
+    class CollectionMetadata;
     class CollectionType;
     class DBClientCursor;
 
     /**
      * The MetadataLoader is responsible for interfacing with the config servers and obtaining
-     * the data that CollectionManagers are made of. Effectively, the loader is the "builder"
-     * class for that manager.
+     * the data that CollectionMetadatas are made of. Effectively, the loader is the "builder"
+     * class for that metadata.
      *
      * The loader will go out of its way to try to fetch the smaller amount possible of data
-     * from the config server without sacrificing the freshness and accuracy of the managers is
+     * from the config server without sacrificing the freshness and accuracy of the metadata it
      * builds. (See ConfigDiffTracker class.)
      *
      * The class is not thread safe.
@@ -46,59 +47,63 @@ namespace mongo {
          * that we make no restrictions about which connection string that is, including
          * CUSTOM, which we rely on in testing.
          */
-        explicit MetadataLoader(ConnectionString configLoc);
+        explicit MetadataLoader( const ConnectionString& configLoc );
 
         ~MetadataLoader();
 
         /**
-         * Returns a new manager's instance representing the chunkset of the collection 'ns'
-         * (or its entirety, if not sharded) that lives on 'shard'. Optionally, uses an
-         * 'oldManager' for the same 'ns'/'shard'; the contents of 'oldManger' can help
-         * reducing the amount of data read from the config servers.
+         * Fills a new metadata instance representing the chunkset of the collection 'ns'
+         * (or its entirety, if not sharded) that lives on 'shard' with data from the config server.
+         * Optionally, uses an 'oldMetadata' for the same 'ns'/'shard'; the contents of
+         * 'oldMetadata' can help reducing the amount of data read from the config servers.
          *
-         * If the collection's information can't be loaded, returns NULL and fill in 'errMsg'
-         * with a description, if 'errMsg' was provided.
+         * OK on success.
+         *
+         * Failure return values:
+         * Abnormal:
+         * @return FailedToParse if there was an error parsing the remote config data
+         * Normal:
+         * @return NamespaceNotFound if the collection no longer exists
+         * @return HostUnreachable if there was an error contacting the config servers
+         * @return RemoteChangeDetected if the data loaded was modified by another operation
          */
-        CollectionManager* makeCollectionManager(const string& ns,
-                                                 const string& shard,
-                                                 const CollectionManager* oldManager,
-                                                 string* errMsg);
-
-        /**
-         * Returns a new manager's instance representing an non-sharded, empty collection with
-         * the initial version number (1|0|oid).
-         */
-        CollectionManager* makeEmptyCollectionManager();
+        Status makeCollectionMetadata( const string& ns,
+                                       const string& shard,
+                                       const CollectionMetadata* oldMetadata,
+                                       CollectionMetadata* metadata ) const;
 
     private:
         ConnectionString _configLoc;
 
         /**
-         * Returns true and fills in the internal state of 'manager' to portray the portion of
-         * the collection 'ns' that lives in 'shard'. If provided, uses the contents of
-         * 'oldManager' as a base, which allows less data to be brought from the config
-         * server. If information about the collection can be accessed or is invalid, returns
-         * false and fills in an error description on '*errMsg', which is mandatory here.
+         * Returns OK and fills in the internal state of 'metadata' with general collection
+         * information, not including chunks.
+         *
+         * If information about the collection can be accessed or is invalid, returns:
+         * @return NamespaceNotFound if the collection no longer exists
+         * @return FailedToParse if there was an error parsing the remote config data
+         * @return HostUnreachable if there was an error contacting the config servers
+         * @return RemoteChangeDetected if the collection doc loaded is unexpectedly different
+         *
          */
-        bool initCollection(const string& ns,
-                            const string& shard,
-                            const CollectionManager* oldManager,
-                            CollectionManager* manager,
-                            string* errMsg);
+        Status initCollection( const string& ns,
+                               const string& shard,
+                               CollectionMetadata* metadata ) const;
 
         /**
-         * Returns true and fills in the chunk state of 'manager' to portray the chunks of the
-         * collection 'ns' that sit in 'shard'. If provided, uses the contents of 'oldManager'
-         * as a base (see description in initCollection above). If information about the
-         * chunks can be accessed or is invalid, returns false and fills in an error
-         * description on '*errMsg', which is mandatory here.
+         * Returns OK and fills in the chunk state of 'metadata' to portray the chunks of the
+         * collection 'ns' that sit in 'shard'. If provided, uses the contents of 'oldMetadata'
+         * as a base (see description in initCollection above).
+         *
+         * If information about the chunks can be accessed or is invalid, returns:
+         * @return HostUnreachable if there was an error contacting the config servers
+         * @return RemoteChangeDetected if the chunks loaded are unexpectedly different
+         * TODO: @return FailedToParse
          */
-        bool initChunks(const CollectionType& collDoc,
-                        const string& ns,
-                        const string& shard,
-                        const CollectionManager* oldManager,
-                        CollectionManager* manager,
-                        string* errMsg);
+        Status initChunks( const string& ns,
+                           const string& shard,
+                           const CollectionMetadata* oldMetadata,
+                           CollectionMetadata* metadata ) const;
     };
 
 } // namespace mongo

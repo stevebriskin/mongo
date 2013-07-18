@@ -24,13 +24,15 @@
 #include <string>
 #include <vector>
 
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/server_parameters.h"
 
 namespace mongo {
@@ -49,12 +51,14 @@ namespace mongo {
                                                            false);
     }
 
-    string Command::parseNsFullyQualified(const string& dbname, const BSONObj& cmdObj) const { 
+    string Command::parseNsFullyQualified(const string& dbname, const BSONObj& cmdObj) const {
         string s = cmdObj.firstElement().valuestr();
         NamespaceString nss(s);
         // these are for security, do not remove:
-        massert(15962, "need to specify namespace" , !nss.db.empty() );
-        massert(15966, str::stream() << "dbname not ok in Command::parseNsFullyQualified: " << dbname , dbname == nss.db || dbname == "admin" );
+        massert(15962, "need to specify namespace" , !nss.db().empty() );
+        massert(15966,
+                str::stream() << "dbname not ok in Command::parseNsFullyQualified: "
+                << dbname , dbname == nss.db() || dbname == "admin" );
         return s;
     }
 
@@ -198,6 +202,22 @@ namespace mongo {
         }
     }
 
+    Status Command::checkAuthForCommand(ClientBasic* client,
+                                        const std::string& dbname,
+                                        const BSONObj& cmdObj) {
+        std::vector<Privilege> privileges;
+        this->addRequiredPrivileges(dbname, cmdObj, &privileges);
+        return client->getAuthorizationSession()->checkAuthForPrivileges(privileges);
+    }
+
+    void Command::appendCommandStatus(BSONObjBuilder& result, const Status& status) {
+        appendCommandStatus(result, status.isOK(), status.reason());
+        BSONObj tmp = result.asTempObj();
+        if (!status.isOK() && !tmp.hasField("code")) {
+            result.append("code", status.code());
+        }
+    }
+
     void Command::logIfSlow( const Timer& timer, const string& msg ) {
         int ms = timer.millis();
         if ( ms > cmdLine.slowMS ) {
@@ -205,6 +225,51 @@ namespace mongo {
         }
     }
 
+    static Status _checkAuthorizationImpl(Command* c,
+                                          ClientBasic* client,
+                                          const std::string& dbname,
+                                          const BSONObj& cmdObj,
+                                          bool fromRepl) {
+        if ( c->adminOnly() && ! fromRepl && dbname != "admin" ) {
+            return Status(ErrorCodes::Unauthorized, str::stream() << c->name <<
+                          " may only be run against the admin database.");
+        }
+        if (AuthorizationManager::isAuthEnabled()) {
+            Status status = c->checkAuthForCommand(client, dbname, cmdObj);
+            if (status == ErrorCodes::Unauthorized) {
+                return Status(ErrorCodes::Unauthorized,
+                              str::stream() << "not authorized on " << dbname <<
+                              " to execute command " << cmdObj);
+            }
+            if (!status.isOK()) {
+                return status;
+            }
+        }
+        else if (c->adminOnly() &&
+                 c->localHostOnlyIfNoAuth(cmdObj) &&
+                 !client->getIsLocalHostConnection()) {
+
+            return Status(ErrorCodes::Unauthorized, str::stream() << c->name <<
+                          " must run from localhost when running db without auth");
+        }
+        return Status::OK();
+    }
+
+    Status Command::_checkAuthorization(Command* c,
+                                        ClientBasic* client,
+                                        const std::string& dbname,
+                                        const BSONObj& cmdObj,
+                                        bool fromRepl) {
+        Status status = _checkAuthorizationImpl(c, client, dbname, cmdObj, fromRepl);
+        if (!status.isOK()) {
+            log() << status << std::endl;
+        }
+        audit::logCommandAuthzCheck(client,
+                                    NamespaceString(c->parseNs(dbname, cmdObj)),
+                                    cmdObj,
+                                    status.code());
+        return status;
+    }
 }
 
 #include "../client/connpool.h"

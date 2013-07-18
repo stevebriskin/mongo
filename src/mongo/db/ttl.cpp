@@ -21,12 +21,16 @@
 #include "mongo/db/ttl.h"
 
 #include "mongo/base/counter.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/databaseholder.h"
+#include "mongo/db/database_holder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/is_master.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/util/background.h"
 
 namespace mongo {
@@ -37,7 +41,7 @@ namespace mongo {
     ServerStatusMetricField<Counter64> ttlPassesDisplay("ttl.passes", &ttlPasses);
     ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocuments", &ttlDeletedDocuments);
 
-
+    MONGO_EXPORT_SERVER_PARAMETER( ttlMonitorEnabled, bool, true );
     
     class TTLMonitor : public BackgroundJob {
     public:
@@ -50,11 +54,7 @@ namespace mongo {
         
         void doTTLForDB( const string& dbName ) {
 
-            //check isMaster before becoming god
             bool isMaster = isMasterNs( dbName.c_str() );
-
-            Client::GodScope god;
-
             vector<BSONObj> indexes;
             {
                 auto_ptr<DBClientCursor> cursor =
@@ -119,11 +119,17 @@ namespace mongo {
 
         virtual void run() {
             Client::initThread( name().c_str() );
+            cc().getAuthorizationSession()->grantInternalAuthorization(UserName("_ttl", "local"));
 
             while ( ! inShutdown() ) {
                 sleepsecs( 60 );
                 
                 LOG(3) << "TTLMonitor thread awake" << endl;
+
+                if ( !ttlMonitorEnabled ) {
+                   LOG(1) << "TTLMonitor is disabled" << endl;
+                   continue;
+                }
                 
                 if ( lockedForWriting() ) {
                     // note: this is not perfect as you can go into fsync+lock between 

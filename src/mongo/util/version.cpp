@@ -46,7 +46,7 @@ namespace mongo {
      *      1.2.3-rc4-pre-
      * If you really need to do something else you'll need to fix _versionArray()
      */
-    const char versionString[] = "2.5.1-pre-";
+    const char versionString[] = "2.5.2-pre-";
 
     // See unit test for example outputs
     BSONArray toVersionArray(const char* version){
@@ -165,9 +165,6 @@ namespace mongo {
        result.appendBool( "debug" , debug );
        result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
     }
-
-
-    Tee* const startupWarningsLog = new RamLog("startupWarnings"); //intentionally leaked
 
     //
     // system warnings

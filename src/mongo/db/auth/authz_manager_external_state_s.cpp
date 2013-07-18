@@ -19,8 +19,11 @@
 #include <string>
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/auth/user_name.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -50,5 +53,66 @@ namespace mongo {
         conn->done();
         return !result->isEmpty();
     }
+
+    Status AuthzManagerExternalStateMongos::insertPrivilegeDocument(const string& dbname,
+                                                                    const BSONObj& userObj) const {
+        string userNS = dbname + ".system.users";
+        scoped_ptr<ScopedDbConnection> conn(getConnectionForUsersCollection(userNS));
+
+        conn->get()->insert(userNS, userObj);
+
+        // 30 second timeout for w:majority
+        BSONObj res = conn->get()->getLastErrorDetailed(false, false, -1, 30*1000);
+        string errstr = conn->get()->getLastErrorString(res);
+        if (errstr.empty()) {
+            return Status::OK();
+        }
+        if (res.hasField("code") && res["code"].Int() == ASSERT_ID_DUPKEY) {
+            return Status(ErrorCodes::DuplicateKey,
+                          mongoutils::str::stream() << "User \"" << userObj["user"].String() <<
+                                 "\" already exists on database \"" << dbname << "\"");
+        }
+        return Status(ErrorCodes::UserModificationFailed, errstr);
+    }
+
+    Status AuthzManagerExternalStateMongos::updatePrivilegeDocument(
+            const UserName& user, const BSONObj& updateObj) const {
+        string userNS = mongoutils::str::stream() << user.getDB() << ".system.users";
+        scoped_ptr<ScopedDbConnection> conn(getConnectionForUsersCollection(userNS));
+
+        conn->get()->update(userNS,
+                            QUERY("user" << user.getUser() << "userSource" << BSONNULL),
+                            updateObj);
+
+        // 30 second timeout for w:majority
+        BSONObj res = conn->get()->getLastErrorDetailed(false, false, -1, 30*1000);
+        string err = conn->get()->getLastErrorString(res);
+        if (!err.empty()) {
+            return Status(ErrorCodes::UserModificationFailed, err);
+        }
+
+        int numUpdated = res["n"].numberInt();
+        dassert(numUpdated <= 1 && numUpdated >= 0);
+        if (numUpdated == 0) {
+            return Status(ErrorCodes::UserNotFound,
+                          mongoutils::str::stream() << "User " << user.getFullName() <<
+                                  " not found");
+        }
+
+        return Status::OK();
+    }
+
+    void AuthzManagerExternalStateMongos::getAllDatabaseNames(
+            std::vector<std::string>* dbnames) const {
+        // TODO(spencer): NOT YET IMPLEMENTED
+        fassertFailed(16964);
+    }
+
+    std::vector<BSONObj> AuthzManagerExternalStateMongos::getAllV1PrivilegeDocsForDB(
+            const std::string& dbname) const {
+        // TODO(spencer): NOT YET IMPLEMENTED
+        fassertFailed(16965);
+    }
+
 
 } // namespace mongo

@@ -142,6 +142,13 @@ namespace mongo {
          */
         Document clone() const { return Document(storage().clone().get()); }
 
+        /// members for Sorter
+        struct SorterDeserializeSettings {}; // unused
+        void serializeForSorter(BufBuilder& buf) const;
+        static Document deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&);
+        int memUsageForSorter() const { return getApproximateSize(); }
+        Document getOwned() const { return *this; }
+
         // TEMP for compatibility with legacy intrusive_ptr<Document>
               Document& operator*()       { return *this; }
         const Document& operator*() const { return *this; }
@@ -316,6 +323,11 @@ namespace mongo {
             return ret;
         }
 
+        /// Used to simplify the common pattern of creating a value of the document.
+        Value freezeToValue() {
+            return Value(freeze());
+        }
+
         /** Borrow a readable reference to this Document.
          *
          *  Note that unlike freeze(), this indicates intention to continue
@@ -400,6 +412,74 @@ namespace mongo {
         Document _doc;
         DocumentStorageIterator _it;
     };
+
+    /// Macro to create Document literals. Syntax is the same as the BSON("name" << 123) macro.
+#define DOC(fields) ((DocumentStream() << fields).done())
+
+    /** Macro to create Array-typed Value literals.
+     *  Syntax is the same as the BSON_ARRAY(123 << "foo") macro.
+     */
+#define DOC_ARRAY(fields) ((ValueArrayStream() << fields).done())
+
+
+    // These classes are only for the implementation of the DOC and DOC_ARRAY macros.
+    // They should not be used for any other reason.
+    class DocumentStream {
+        // The stream alternates between DocumentStream taking a fieldname
+        // and ValueStream taking a Value.
+        class ValueStream {
+        public:
+            ValueStream(DocumentStream& builder) :builder(builder) {}
+
+            DocumentStream& operator << (const Value& val) {
+                builder._md[name] = val;
+                return builder;
+            }
+
+            /// support anything directly supported by a value constructor
+            template <typename T>
+            DocumentStream& operator << (const T& val) {
+                return *this << Value(val);
+            }
+
+            StringData name;
+            DocumentStream& builder;
+        };
+
+    public:
+        DocumentStream() :_stream(*this) {}
+
+        ValueStream& operator << (const StringData& name) {
+            _stream.name = name;
+            return _stream;
+        }
+
+        Document done() { return _md.freeze(); }
+
+    private:
+        ValueStream _stream;
+        MutableDocument _md;
+    };
+
+    class ValueArrayStream {
+    public:
+        ValueArrayStream& operator << (const Value& val) {
+            _array.push_back(val);
+            return *this;
+        }
+
+        /// support anything directly supported by a value constructor
+        template <typename T>
+        ValueArrayStream& operator << (const T& val) {
+            return *this << Value(val);
+        }
+
+        Value done() { return Value::consume(_array); }
+
+    private:
+        vector<Value> _array;
+    };
+
 }
 
 namespace std {

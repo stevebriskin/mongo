@@ -27,6 +27,8 @@
 #include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dur_commitjob.h"
+#include "mongo/db/index/btree_index_cursor.h"  // for aboutToDeleteBucket
+#include "mongo/db/intervalbtreecursor.h"  // also for aboutToDeleteBucket
 #include "mongo/db/json.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/pdfile.h"
@@ -144,7 +146,7 @@ namespace mongo {
         this->assertValid(order, true);
 
         if ( bt_dmp ) {
-            _log() << thisLoc.toString() << ' ';
+            log() << thisLoc.toString() << ' ';
             ((BtreeBucket *) this)->dump(depth);
         }
 
@@ -817,7 +819,8 @@ namespace mongo {
 
     template< class V >
     void BtreeBucket<V>::delBucket(const DiskLoc thisLoc, const IndexDetails& id) {
-        ClientCursor::informAboutToDeleteBucket(thisLoc); // slow...
+        BtreeIndexCursor::aboutToDeleteBucket(thisLoc);
+        IntervalBtreeCursor::aboutToDeleteBucket(thisLoc);
         verify( !isHead() );
 
         DiskLoc ll = this->parent;
@@ -949,7 +952,8 @@ namespace mongo {
             ll.btree<V>()->childForPos( indexInParent( thisLoc ) ).writing() = this->nextChild;
         }
         BTREE(this->nextChild)->parent.writing() = this->parent;
-        ClientCursor::informAboutToDeleteBucket( thisLoc );
+        BtreeIndexCursor::aboutToDeleteBucket(thisLoc);
+        IntervalBtreeCursor::aboutToDeleteBucket(thisLoc);
         deallocBucket( thisLoc, id );
     }
 
@@ -1757,18 +1761,19 @@ namespace mongo {
     template< class V >
     void BtreeBucket<V>::dump(unsigned depth) const {
         string indent = string(depth, ' ');
-        _log() << "BUCKET n:" << this->n;
-        _log() << " parent:" << hex << this->parent.getOfs() << dec;
+        LogstreamBuilder l = log();
+        l << "BUCKET n:" << this->n;
+        l << " parent:" << hex << this->parent.getOfs() << dec;
         for ( int i = 0; i < this->n; i++ ) {
-            _log() << '\n' << indent;
+            l << '\n' << indent;
             KeyNode k = keyNode(i);
             string ks = k.key.toString();
-            _log() << "  " << hex << k.prevChildBucket.getOfs() << '\n';
-            _log() << indent << "    " << i << ' ' << ks.substr(0, 30) << " Loc:" << k.recordLoc.toString() << dec;
+            l << "  " << hex << k.prevChildBucket.getOfs() << '\n';
+            l << indent << "    " << i << ' ' << ks.substr(0, 30) << " Loc:" << k.recordLoc.toString() << dec;
             if ( this->k(i).isUnused() )
-                _log() << " UNUSED";
+                l << " UNUSED";
         }
-        _log() << "\n" << indent << "  " << hex << this->nextChild.getOfs() << dec << endl;
+        l << "\n" << indent << "  " << hex << this->nextChild.getOfs() << dec << endl;
     }
 
     /** todo: meaning of return code unclear clean up */

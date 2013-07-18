@@ -17,10 +17,13 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "mongo/base/disallow_copying.h"
+#include "mongo/base/status.h"
 #include "mongo/db/auth/authz_manager_external_state.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/platform/unordered_map.h"
 
 namespace mongo {
 
@@ -34,11 +37,30 @@ namespace mongo {
 
         AuthzManagerExternalStateMock() {};
 
+        // no-op for the mock
+        virtual Status insertPrivilegeDocument(const std::string& dbname,
+                                               const BSONObj& userObj) const;
+
+        // no-op for the mock
+        virtual Status updatePrivilegeDocument(const UserName& user,
+                                               const BSONObj& updateObj) const;
+
+        // Non-const version that puts document into a vector that can be accessed later
+        Status insertPrivilegeDocument(const std::string& dbname, const BSONObj& userObj);
+
+        void clearPrivilegeDocuments();
+
+        virtual void getAllDatabaseNames(std::vector<std::string>* dbnames) const;
+
+        virtual std::vector<BSONObj> getAllV1PrivilegeDocsForDB(const std::string& dbname) const;
+
         virtual bool _findUser(const std::string& usersNamespace,
                                const BSONObj& query,
-                               BSONObj* result) const {
-            return false;
-        }
+                               BSONObj* result) const;
+
+
+    private:
+        unordered_map<std::string, std::vector<BSONObj> > _userDocuments; // dbname to user docs
     };
 
 } // namespace mongo

@@ -40,6 +40,14 @@ namespace mongo {
         long long connectionId() const { return _connectionId; }
         void setConnectionId( long long connectionId );
 
+        void setX509SubjectName(const std::string& x509SubjectName){
+            _x509SubjectName = x509SubjectName;
+        }
+
+        std::string getX509SubjectName(){
+            return _x509SubjectName;
+        }
+
     public:
         // TODO make this private with some helpers
 
@@ -48,6 +56,7 @@ namespace mongo {
 
     private:
         long long _connectionId;
+        std::string _x509SubjectName;
     };
 
     class MessagingPort : public AbstractMessagingPort {
@@ -57,7 +66,8 @@ namespace mongo {
         // in some cases the timeout will actually be 2x this value - eg we do a partial send,
         // then the timeout fires, then we try to send again, then the timeout fires again with
         // no data sent, then we detect that the other side is down
-        MessagingPort(double so_timeout = 0, int logLevel = 0 );
+        MessagingPort(double so_timeout = 0,
+                      logger::LogSeverity logLevel = logger::LogSeverity::Log() );
 
         MessagingPort(boost::shared_ptr<Socket> socket);
 

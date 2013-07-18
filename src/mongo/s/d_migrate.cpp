@@ -54,6 +54,7 @@
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_config.h"
 #include "mongo/db/repl/write_concern.h"
+#include "mongo/logger/ramlog.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/config.h"
@@ -64,14 +65,13 @@
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/queue.h"
-#include "mongo/util/ramlog.h"
 #include "mongo/util/startup_test.h"
 
 using namespace std;
 
 namespace mongo {
 
-    Tee* migrateLog = new RamLog( "migrate" );
+    Tee* migrateLog = RamLog::get("migrate");
 
     class MoveTimingHelper {
     public:
@@ -401,9 +401,9 @@ namespace mongo {
             // there's a fair amount of slack before we determine a chunk is too large because object sizes will vary
             unsigned long long maxRecsWhenFull;
             long long avgRecSize;
-            const long long totalRecs = d->stats.nrecords;
+            const long long totalRecs = d->numRecords();
             if ( totalRecs > 0 ) {
-                avgRecSize = d->stats.datasize / totalRecs;
+                avgRecSize = d->dataSize() / totalRecs;
                 maxRecsWhenFull = maxChunkSize / avgRecSize;
                 maxRecsWhenFull = std::min( (unsigned long long)(Chunk::MaxObjectPerChunk + 1) , 130 * maxRecsWhenFull / 100 /* slack */ );
             }
@@ -529,7 +529,7 @@ namespace mongo {
 
         void aboutToDelete( const Database* db , const DiskLoc& dl ) {
             verify(db);
-            Lock::assertWriteLocked(db->name);
+            Lock::assertWriteLocked(db->name());
 
             if ( ! _getActive() )
                 return;
@@ -924,7 +924,8 @@ namespace mongo {
                     return false;
                 }
 
-                // since this could be the first call that enable sharding we also make sure to have the chunk manager up to date
+                // since this could be the first call that enable sharding we also make sure to
+                // load the shard's metadata, if we don't have it
                 shardingState.gotShardName( myOldShard );
 
                 // Using the maxVersion we just found will enforce a check - if we use zero version,
@@ -947,9 +948,9 @@ namespace mongo {
 
             // 3.
 
-            ShardChunkManagerPtr chunkManager = shardingState.getShardChunkManager( ns );
-            verify( chunkManager != NULL );
-            BSONObj shardKeyPattern = chunkManager->getKeyPattern();
+            CollectionMetadataPtr collMetadata = shardingState.getCollectionMetadata( ns );
+            verify( collMetadata != NULL );
+            BSONObj shardKeyPattern = collMetadata->getKeyPattern();
             if ( shardKeyPattern.isEmpty() ){
                 errmsg = "no shard key found";
                 return false;
@@ -1023,6 +1024,23 @@ namespace mongo {
 
                 conn.done();
 
+                if ( res["ns"].str() != ns ||
+                        res["from"].str() != fromShard.getConnString() ||
+                        !res["min"].isABSONObj() ||
+                        res["min"].Obj().woCompare(min) != 0 ||
+                        !res["max"].isABSONObj() ||
+                        res["max"].Obj().woCompare(max) != 0 ) {
+                    // This can happen when the destination aborted the migration and
+                    // received another recvChunk before this thread sees the transition
+                    // to the abort state. This is currently possible only if multiple migrations
+                    // are happening at once. This is an unfortunate consequence of the shards not
+                    // being able to keep track of multiple incoming and outgoing migrations.
+                    errmsg = str::stream() << "Destination shard aborted migration, "
+                            "now running a new one: " << res;
+                    warning() << errmsg << endl;
+                    return false;
+                }
+
                 LOG(0) << "moveChunk data transfer progress: " << res << " my mem used: " << migrateFromStatus.mbUsed() << migrateLog;
 
                 if ( ! ok || res["state"].String() == "fail" ) {
@@ -1073,7 +1091,8 @@ namespace mongo {
 
             {
                 // 5.a
-                // we're under the collection lock here, so no other migrate can change maxVersion or ShardChunkManager state
+                // we're under the collection lock here, so no other migrate can change maxVersion
+                // or CollectionMetadata state
                 migrateFromStatus.setInCriticalSection( true );
                 ChunkVersion myVersion = maxVersion;
                 myVersion.incMajor();
@@ -1082,8 +1101,9 @@ namespace mongo {
                     Lock::DBWrite lk( ns );
                     verify( myVersion > shardingState.getVersion( ns ) );
 
-                    // bump the chunks manager's version up and "forget" about the chunk being moved
-                    // this is not the commit point but in practice the state in this shard won't until the commit it done
+                    // bump the metadata's version up and "forget" about the chunk being moved
+                    // this is not the commit point but in practice the state in this shard won't
+                    // until the commit it done
                     shardingState.donateChunk( ns , min , max , myVersion );
                 }
 
@@ -1092,46 +1112,45 @@ namespace mongo {
                 // 5.b
                 // we're under the collection lock here, too, so we can undo the chunk donation because no other state change
                 // could be ongoing
-                {
-                    BSONObj res;
-                    ScopedDbConnection connTo(toShard.getConnString(), 35.0);
 
-                    bool ok;
+                BSONObj res;
+                bool ok;
 
-                    try{
-                        ok = connTo->runCommand( "admin" ,
-                                                        BSON( "_recvChunkCommit" << 1 ) ,
-                                                        res );
-                    }
-                    catch( DBException& e ){
-                        errmsg = str::stream() << "moveChunk could not contact to: shard " << toShard.getConnString() << " to commit transfer" << causedBy( e );
-                        warning() << errmsg << endl;
-                        ok = false;
-                    }
-
+                try {
+                    ScopedDbConnection connTo( toShard.getConnString(), 35.0 );
+                    ok = connTo->runCommand( "admin", BSON( "_recvChunkCommit" << 1 ), res );
                     connTo.done();
-
-                    if ( ! ok ) {
-                        log() << "moveChunk migrate commit not accepted by TO-shard: " << res
-                              << " resetting shard version to: " << startingVersion << migrateLog;
-                        {
-                            Lock::GlobalWrite lk;
-                            log() << "moveChunk global lock acquired to reset shard version from "
-                                    "failed migration" << endl;
-
-                            // revert the chunk manager back to the state before "forgetting" about the chunk
-                            shardingState.undoDonateChunk( ns , min , max , startingVersion );
-                        }
-                        log() << "Shard version successfully reset to clean up failed migration"
-                                << endl;
-
-                        errmsg = "_recvChunkCommit failed!";
-                        result.append( "cause" , res );
-                        return false;
-                    }
-
-                    log() << "moveChunk migrate commit accepted by TO-shard: " << res << migrateLog;
                 }
+                catch ( DBException& e ) {
+                    errmsg = str::stream() << "moveChunk could not contact to: shard "
+                                           << toShard.getConnString() << " to commit transfer"
+                                           << causedBy( e );
+                    warning() << errmsg << endl;
+                    ok = false;
+                }
+
+                if ( !ok ) {
+                    log() << "moveChunk migrate commit not accepted by TO-shard: " << res
+                          << " resetting shard version to: " << startingVersion << migrateLog;
+                    {
+                        Lock::GlobalWrite lk;
+                        log() << "moveChunk global lock acquired to reset shard version from "
+                              "failed migration"
+                              << endl;
+
+                        // revert the chunk manager back to the state before "forgetting" about the
+                        // chunk
+                        shardingState.undoDonateChunk( ns, min, max, startingVersion );
+                    }
+                    log() << "Shard version successfully reset to clean up failed migration"
+                          << endl;
+
+                    errmsg = "_recvChunkCommit failed!";
+                    result.append( "cause", res );
+                    return false;
+                }
+
+                log() << "moveChunk migrate commit accepted by TO-shard: " << res << migrateLog;
 
                 // 5.c
 
@@ -1173,18 +1192,21 @@ namespace mongo {
 
                 nextVersion = myVersion;
 
-                // if we have chunks left on the FROM shard, update the version of one of them as well
-                // we can figure that out by grabbing the chunkManager installed on 5.a
-                // TODO expose that manager when installing it
+                // if we have chunks left on the FROM shard, update the version of one of them as
+                // well.  we can figure that out by grabbing the metadata installed on 5.a
 
-                ShardChunkManagerPtr chunkManager = shardingState.getShardChunkManager( ns );
-                if( chunkManager->getNumChunks() > 0 ) {
+                collMetadata = shardingState.getCollectionMetadata( ns );
+                if( collMetadata->getNumChunks() > 0 ) {
 
                     // get another chunk on that shard
                     BSONObj lookupKey;
-                    BSONObj bumpMin, bumpMax;
+                    BSONObj bumpMin;
+                    BSONObj bumpMax;
                     do {
-                        chunkManager->getNextChunk( lookupKey , &bumpMin , &bumpMax );
+                        ChunkType bumpChunk;
+                        collMetadata->getNextChunk( lookupKey , &bumpChunk );
+                        bumpMin = bumpChunk.getMin();
+                        bumpMax = bumpChunk.getMax();
                         lookupKey = bumpMin;
                     }
                     while( bumpMin == min );
@@ -1242,7 +1264,7 @@ namespace mongo {
                 LOG(7) << "moveChunk update: " << cmd << migrateLog;
 
                 int exceptionCode = OkCode;
-                bool ok = false;
+                ok = false;
                 BSONObj cmdResult;
                 try {
                     ScopedDbConnection conn(shardingState.getConfigServer(), 10.0);
@@ -1273,7 +1295,7 @@ namespace mongo {
                     {
                         Lock::GlobalWrite lk;
 
-                        // Revert the chunk manager back to the state before "forgetting"
+                        // Revert the metadata back to the state before "forgetting"
                         // about the chunk.
                         shardingState.undoDonateChunk( ns , min , max , startingVersion );
                     }
@@ -1458,7 +1480,7 @@ namespace mongo {
                 Client::WriteContext ctx( ns );
                 // Only copy if ns doesn't already exist
                 if ( ! nsdetails( ns ) ) {
-                    string system_namespaces = NamespaceString( ns ).db + ".system.namespaces";
+                    string system_namespaces = nsToDatabase(ns) + ".system.namespaces";
                     BSONObj entry = conn->findOne( system_namespaces, BSON( "name" << ns ) );
                     if ( entry["options"].isABSONObj() ) {
                         string errmsg;
@@ -1484,7 +1506,7 @@ namespace mongo {
                 for ( unsigned i=0; i<all.size(); i++ ) {
                     BSONObj idx = all[i];
                     Client::WriteContext ct( ns );
-                    string system_indexes = cc().database()->name + ".system.indexes";
+                    string system_indexes = cc().database()->name() + ".system.indexes";
                     theDataFileMgr.insertAndLog( system_indexes.c_str(),
                                                  idx,
                                                  true, /* god mode */
@@ -1879,7 +1901,8 @@ namespace mongo {
         Client::initThread( "migrateThread" );
         if (AuthorizationManager::isAuthEnabled()) {
             ShardedConnectionInfo::addHook();
-            cc().getAuthorizationSession()->grantInternalAuthorization("_migrateThread");
+            cc().getAuthorizationSession()->grantInternalAuthorization(
+                    UserName("_migrateThread", "local"));
         }
         migrateStatus.go();
         cc().shutdown();

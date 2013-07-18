@@ -23,9 +23,7 @@ var rwUser = 'rwUser';
 var roUser = 'roUser';
 var password = 'password';
 
-try {
-    adminDB.addUser( rwUser, password, false, st.rs0.numNodes );
-} catch (e) {} // expected b/c of SERVER-6101.  TODO: remove try/catch once SERVER-6101 is fixed.
+adminDB.addUser( rwUser, password, false, st.rs0.numNodes );
 
 assert( adminDB.auth( rwUser, password ) );
 adminDB.addUser( roUser, password, true );
@@ -59,6 +57,8 @@ for ( var i = 0; i < 100; i++ ) {
     }
 }
 testDB.getLastError( 'majority' );
+
+assert.eq(1000, testDB.foo.count());
 
 // Wait for the balancer to start back up
 st.startBalancer()

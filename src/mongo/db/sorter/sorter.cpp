@@ -39,6 +39,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/atomic_int.h"
+#include "mongo/db/cmdline.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/log.h"
@@ -415,7 +416,7 @@ namespace mongo {
 
                 SortedFileWriter<Key, Value> writer(_settings);
                 for ( ; !_data.empty(); _data.pop_front()) {
-                    writer.addAlreadySorted(_data.front().first, _data.back().second);
+                    writer.addAlreadySorted(_data.front().first, _data.front().second);
                 }
 
                 _iters.push_back(boost::shared_ptr<Iterator>(writer.done()));
@@ -613,21 +614,31 @@ namespace mongo {
             std::vector<Data> _data; // the "current" data. Organized as max-heap if size == limit.
             std::vector<boost::shared_ptr<Iterator> > _iters; // data that has already been spilled
         };
+
+        inline unsigned nextFileNumber() {
+            // This is unified across all Sorter types and instances.
+            static AtomicUInt fileCounter;
+            return fileCounter++;
+        }
     } // namespace sorter
 
     //
     // SortedFileWriter
     //
 
-    static AtomicUInt fileCounter;
+
     template <typename Key, typename Value>
     SortedFileWriter<Key, Value>::SortedFileWriter(const Settings& settings)
         : _settings(settings)
     {
+        // This should be checked by consumers, but if we get here don't allow writes.
+        massert(16946, "Attempting to use external sort from mongos. This is not allowed.",
+                !cmdLine.isMongos());
+
         {
             StringBuilder sb;
             // TODO use tmpPath rather than dbpath/_tmp
-            sb << dbpath << "/_tmp" << "/extsort." << fileCounter++;
+            sb << dbpath << "/_tmp" << "/extsort." << sorter::nextFileNumber();
             _fileName = sb.str();
         }
 
@@ -695,6 +706,11 @@ namespace mongo {
     Sorter<Key, Value>* Sorter<Key, Value>::make(const SortOptions& opts,
                                                  const Comparator& comp,
                                                  const Settings& settings) {
+
+        // This should be checked by consumers, but if it isn't try to fail early.
+        massert(16947, "Attempting to use external sort from mongos. This is not allowed.",
+                !(cmdLine.isMongos() && opts.extSortAllowed));
+
         switch (opts.limit) {
             case 0:  return new sorter::NoLimitSorter<Key, Value, Comparator>(opts, comp, settings);
             case 1:  return new sorter::LimitOneSorter<Key, Value, Comparator>(opts, comp);

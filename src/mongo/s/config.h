@@ -23,13 +23,10 @@
 
 #pragma once
 
-#include "../db/namespace.h"
-#include "../client/model.h"
 #include "mongo/client/dbclient_rs.h"
-
-#include "chunk.h"
-#include "shard.h"
-#include "shardkey.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/shard.h"
+#include "mongo/s/shardkey.h"
 
 namespace mongo {
 
@@ -219,6 +216,13 @@ namespace mongo {
         bool init( vector<string> configHosts );
 
         bool init( const std::string& s );
+
+        /**
+         * Check hosts are unique. Returns true if all configHosts
+         * hostname:port entries are unique. Otherwise return false
+         * and fill errmsg with message containing the offending server.
+         */
+        bool checkHostsAreUnique( const vector<string>& configHosts, string* errmsg );
 
         bool allUp();
         bool allUp( string& errmsg );

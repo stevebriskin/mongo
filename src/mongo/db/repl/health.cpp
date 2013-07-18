@@ -19,11 +19,13 @@
 #include "mongo/db/repl/health.h"
 
 #include "mongo/client/connpool.h"
+#include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/connections.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/task.h"
@@ -44,7 +46,7 @@ namespace mongo {
     using namespace mongoutils::html;
     using namespace bson;
 
-    static RamLog * _rsLog = new RamLog( "rs" );
+    static RamLog * _rsLog = RamLog::get("rs");
     Tee *rsLog = _rsLog;
     extern bool replSetBlind; // for testing
 
@@ -127,8 +129,6 @@ namespace mongo {
         return "";
     }
 
-    extern time_t started;
-
     // oplogdiags in web ui
     static void say(stringstream&ss, const bo& op) {
         ss << "<tr>";
@@ -178,21 +178,19 @@ namespace mongo {
         const bo fields;
 
         /** todo fix we might want an so timeout here */
-        DBClientConnection conn(false, 0, /*timeout*/ 20);
-        {
-            string errmsg;
-            if( !conn.connect(m->fullName(), errmsg) ) {
-                ss << "couldn't connect to " << m->fullName() << ' ' << errmsg;
-                return;
-            }
+        OplogReader reader(false);
+
+        if (reader.connect(m->fullName()) == false) {
+            ss << "couldn't connect to " << m->fullName();
+            return;
         }
 
-        auto_ptr<DBClientCursor> c = conn.query(rsoplog, Query().sort("$natural",1), 20, 0, &fields);
-        if( c.get() == 0 ) {
+        reader.query(rsoplog, Query().sort("$natural",1), 20, 0, &fields);
+        if ( !reader.haveCursor() ) {
             ss << "couldn't query " << rsoplog;
             return;
         }
-        static const char *h[] = {"ts","optime", "h","op","ns","rest",0};
+        static const char *h[] = {"ts","optime","h","op","ns","rest",0};
 
         ss << "<style type=\"text/css\" media=\"screen\">"
            "table { font-size:75% }\n"
@@ -206,8 +204,8 @@ namespace mongo {
         OpTime otFirst;
         OpTime otLast;
         OpTime otEnd;
-        while( c->more() ) {
-            bo o = c->next();
+        while( reader.more() ) {
+            bo o = reader.next();
             otLast = o["ts"]._opTime();
             if( otFirst.isNull() )
                 otFirst = otLast;
@@ -218,13 +216,13 @@ namespace mongo {
             ss << rsoplog << " is empty\n";
         }
         else {
-            auto_ptr<DBClientCursor> c = conn.query(rsoplog, Query().sort("$natural",-1), 20, 0, &fields);
-            if( c.get() == 0 ) {
+            reader.query(rsoplog, Query().sort("$natural",-1), 20, 0, &fields);
+            if( !reader.haveCursor() ) {
                 ss << "couldn't query [2] " << rsoplog;
                 return;
             }
             string x;
-            bo o = c->next();
+            bo o = reader.next();
             otEnd = o["ts"]._opTime();
             while( 1 ) {
                 stringstream z;
@@ -232,9 +230,9 @@ namespace mongo {
                     break;
                 say(z, o);
                 x = z.str() + x;
-                if( !c->more() )
+                if( !reader.more() )
                     break;
-                o = c->next();
+                o = reader.next();
             }
             if( !x.empty() ) {
                 ss << "<tr><td>...</td><td>...</td><td>...</td><td>...</td><td>...</td></tr>\n" << x;
@@ -310,7 +308,7 @@ namespace mongo {
             s << tr() << td(_self->fullName() + " (me)") <<
               td(_self->id()) <<
               td("1") <<  //up
-              td(ago(started)) <<
+              td(ago(cmdLine.started)) <<
               td("") << // last heartbeat
               td(ToString(_self->config().votes)) <<
               td(ToString(_self->config().priority)) <<

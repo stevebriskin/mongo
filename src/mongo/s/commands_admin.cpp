@@ -24,8 +24,11 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/commands/shutdown.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/field_parser.h"
+#include "mongo/db/hasher.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/client_info.h"
@@ -410,15 +413,14 @@ namespace mongo {
                     return false;
                 }
 
+                bool isHashedShardKey = // br
+                        ( IndexNames::findPluginName( proposedKey ) == IndexNames::HASHED );
+
                 // Currently the allowable shard keys are either
                 // i) a hashed single field, e.g. { a : "hashed" }, or
                 // ii) a compound list of ascending fields, e.g. { a : 1 , b : 1 }
-                if ( proposedKey.firstElementType() == mongo::String ) {
+                if ( isHashedShardKey ) {
                     // case i)
-                    if ( !str::equals( proposedKey.firstElement().valuestrsafe() , "hashed" ) ) {
-                        errmsg = "unrecognized string: " + proposedKey.firstElement().str();
-                        return false;
-                    }
                     if ( proposedKey.nFields() > 1 ) {
                         errmsg = "hashed shard keys currently only support single field keys";
                         return false;
@@ -477,6 +479,7 @@ namespace mongo {
                 //         ii. is not sparse
                 //         iii. contains no null values
                 //         iv. is not multikey (maybe lift this restriction later)
+                //         v. if a hashed index, has default seed (lift this restriction later)
                 //
                 // 3. If the proposed shard key is specified as unique, there must exist a useful,
                 //    unique index exactly equal to the proposedKey (not just a prefix).
@@ -525,6 +528,22 @@ namespace mongo {
                     BSONObj currentKey = idx["key"].embeddedObject();
                     // Check 2.i. and 2.ii.
                     if ( ! idx["sparse"].trueValue() && proposedKey.isPrefixOf( currentKey ) ) {
+
+                        // We can't currently use hashed indexes with a non-default hash seed
+                        // Check v.
+                        // Note that this means that, for sharding, we only support one hashed index
+                        // per field per collection.
+                        if ( isHashedShardKey && !idx["seed"].eoo()
+                            && idx["seed"].numberInt() != BSONElementHasher::DEFAULT_HASH_SEED ) {
+                            errmsg = str::stream()
+                                    << "can't shard collection " << ns << " with hashed shard key "
+                                    << proposedKey
+                                    << " because the hashed index uses a non-default seed of "
+                                    << idx["seed"].numberInt();
+                            conn.done();
+                            return false;
+                        }
+
                         hasUsefulIndexForKey = true;
                     }
                 }
@@ -612,9 +631,6 @@ namespace mongo {
                 vector<BSONObj> initSplits;  // there will be at most numShards-1 of these
                 vector<BSONObj> allSplits;   // all of the initial desired split points
 
-                bool isHashedShardKey =
-                        str::equals(proposedKey.firstElement().valuestrsafe(), "hashed");
-
                 // only pre-split when using a hashed shard key and collection is still empty
                 if ( isHashedShardKey && isEmpty ){
 
@@ -651,7 +667,7 @@ namespace mongo {
                     }
                 }
 
-                tlog() << "CMD: shardcollection: " << cmdObj << endl;
+                MONGO_TLOG(0) << "CMD: shardcollection: " << cmdObj << endl;
 
                 config->shardCollection( ns , proposedKey , careAboutUnique , &initSplits );
 
@@ -677,7 +693,8 @@ namespace mongo {
                         BSONObj moveResult;
                         if (!chunk->moveAndCommit(to, Chunk::MaxChunkSize,
                                 false, true, moveResult)) {
-                            warning() << "Couldn't move chunk " << chunk << " to shard "  << to
+                            warning().stream()
+                                      << "Couldn't move chunk " << chunk << " to shard "  << to
                                       << " while sharding collection " << ns << ". Reason: "
                                       <<  moveResult << endl;
                         }
@@ -699,9 +716,10 @@ namespace mongo {
                             if ( ! subSplits.empty() ){
                                 BSONObj splitResult;
                                 if ( ! currentChunk->multiSplit( subSplits , splitResult ) ){
-                                    warning() << "Couldn't split chunk " << currentChunk
-                                              << " while sharding collection " << ns << ". Reason: "
-                                              << splitResult << endl;
+                                    warning().stream()
+                                        << "Couldn't split chunk " << currentChunk
+                                        << " while sharding collection " << ns << ". Reason: "
+                                        << splitResult << endl;
                                 }
                                 subSplits.clear();
                             }
@@ -874,7 +892,7 @@ namespace mongo {
                 }
 
                 verify(chunk.get());
-                log() << "splitting: " << ns << "  shard: " << chunk << endl;
+                log().stream() << "splitting: " << ns << "  shard: " << chunk << endl;
 
                 BSONObj res;
                 bool worked;
@@ -989,7 +1007,7 @@ namespace mongo {
                     return false;
                 }
 
-                tlog() << "CMD: movechunk: " << cmdObj << endl;
+                MONGO_TLOG(0) << "CMD: movechunk: " << cmdObj << endl;
 
                 BSONObj res;
                 if (!c->moveAndCommit(to,

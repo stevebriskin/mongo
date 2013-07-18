@@ -26,8 +26,11 @@
 
 #include "mongo/db/repl/master_slave.h"
 
+#include <pcrecpp.h>
+
 #include <boost/thread/thread.hpp>
 
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
@@ -374,7 +377,9 @@ namespace mongo {
             ReplInfo r("resync: cloning a database");
             string errmsg;
             int errCode = 0;
-            bool ok = Cloner::cloneFrom(hostName.c_str(), errmsg, cc().database()->name, false, /*slaveOk*/ true, /*replauth*/ true, /*snapshot*/false, /*mayYield*/true, /*mayBeInterrupted*/false, &errCode);
+            bool ok = Cloner::cloneFrom(hostName.c_str(), errmsg, cc().database()->name(), false,
+                                        /*slaveOk*/ true, /*replauth*/ true, /*snapshot*/false,
+                                        /*mayYield*/true, /*mayBeInterrupted*/false, &errCode);
             if ( !ok ) {
                 if ( errCode == DatabaseDifferCaseCode ) {
                     resyncDrop( db.c_str(), "internal" );
@@ -522,8 +527,7 @@ namespace mongo {
        @param alreadyLocked caller already put us in write lock if true
     */
     void ReplSource::sync_pullOpLog_applyOperation(BSONObj& op, bool alreadyLocked) {
-        if( logLevel >= 6 ) // op.tostring is expensive so doing this check explicitly
-            LOG(6) << "processing op: " << op << endl;
+        LOG(6) << "processing op: " << op << endl;
 
         if( op.getStringField("op")[0] == 'n' )
             return;
@@ -604,8 +608,7 @@ namespace mongo {
         bool empty = ctx.db()->isEmpty();
         bool incompleteClone = incompleteCloneDbs.count( clientName ) != 0;
 
-        if( logLevel >= 6 )
-            LOG(6) << "ns: " << ns << ", justCreated: " << ctx.justCreated() << ", empty: " << empty << ", incompleteClone: " << incompleteClone << endl;
+        LOG(6) << "ns: " << ns << ", justCreated: " << ctx.justCreated() << ", empty: " << empty << ", incompleteClone: " << incompleteClone << endl;
 
         // always apply admin command command
         // this is a bit hacky -- the semantics of replication/commands aren't well specified
@@ -632,7 +635,7 @@ namespace mongo {
                 save();
                 Client::Context ctx(ns);
                 nClonedThisPass++;
-                resync(ctx.db()->name);
+                resync(ctx.db()->name());
                 addDbNextPass.erase(clientName);
                 incompleteCloneDbs.erase( clientName );
             }
@@ -839,17 +842,14 @@ namespace mongo {
                 nextOpTime = OpTime(); // will reread the op below
             }
             else if ( nextOpTime != syncedTo ) { // didn't get what we queried for - error
-                Nullstream& l = log();
-                l << "repl:   nextOpTime " << nextOpTime.toStringLong() << ' ';
-                if ( nextOpTime < syncedTo )
-                    l << "<??";
-                else
-                    l << ">";
-
-                l << " syncedTo " << syncedTo.toStringLong() << '\n';
-                log() << "repl:   time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs()) << "sec\n";
-                log() << "repl:   tailing: " << tailing << '\n';
-                log() << "repl:   data too stale, halting replication" << endl;
+                log()
+                    << "repl:   nextOpTime " << nextOpTime.toStringLong() << ' '
+                    << ((nextOpTime < syncedTo) ? "<??" : ">")
+                    << " syncedTo " << syncedTo.toStringLong() << '\n'
+                    << "repl:   time diff: " << (nextOpTime.getSecs() - syncedTo.getSecs())
+                    << "sec\n"
+                    << "repl:   tailing: " << tailing << '\n'
+                    << "repl:   data too stale, halting replication" << endl;
                 replInfo = replAllDead = "data too stale halted replication";
                 verify( syncedTo < nextOpTime );
                 throw SyncException();
@@ -972,7 +972,7 @@ namespace mongo {
         _sleepAdviceTime = 0;
         ReplInfo r("sync");
         if ( !cmdLine.quiet ) {
-            Nullstream& l = log();
+            LogstreamBuilder l = log();
             l << "repl: syncing from ";
             if( sourceName() != "main" ) {
                 l << "source:" << sourceName() << ' ';

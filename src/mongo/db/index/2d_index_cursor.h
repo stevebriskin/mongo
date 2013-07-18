@@ -57,12 +57,6 @@ namespace mongo {
          */
         virtual Status setOptions(const CursorOptions& options);
 
-        // Not implemented:
-        virtual Status seek(const vector<const BSONElement*>& position,
-                            const vector<bool>& inclusive) { return Status::OK(); }
-        virtual Status skip(const vector<const BSONElement*>& position,
-                            const vector<bool>& inclusive) { return Status::OK(); }
-
         // Implemented:
         virtual bool isEOF() const;
         virtual BSONObj getKey() const;
@@ -74,7 +68,6 @@ namespace mongo {
         virtual Status savePosition();
         virtual Status restorePosition();
 
-        virtual void aboutToDeleteBucket(const DiskLoc& bucket);
         virtual void explainDetails(BSONObjBuilder* b);
 
     private:

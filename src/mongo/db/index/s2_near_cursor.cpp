@@ -67,13 +67,16 @@ namespace mongo {
             ++_nearFieldIndex;
         }
 
+        _minDistance = max(0.0, _nearQuery.minDistance);
+        
         // _outerRadius can't be greater than (pi * r) or we wrap around the opposite
         // side of the world.
         _maxDistance = min(M_PI * _params.radius, _nearQuery.maxDistance);
+        uassert(16892, "$minDistance too large", _minDistance < _maxDistance);
 
         // Start with a conservative _radiusIncrement.
         _radiusIncrement = 5 * S2::kAvgEdge.GetValue(_params.finestIndexedLevel) * _params.radius;
-        _innerRadius = _outerRadius = 0;
+        _innerRadius = _outerRadius = _minDistance;
         // We might want to adjust the sizes of our coverings if our search
         // isn't local to the start point.
         // Set up _outerRadius with proper checks (maybe maxDistance is really small?)
@@ -84,16 +87,6 @@ namespace mongo {
     S2NearIndexCursor::~S2NearIndexCursor() { _annulus.Release(NULL); }
 
     Status S2NearIndexCursor::seek(const BSONObj& position) {
-        return Status::OK();
-    }
-
-    Status S2NearIndexCursor::seek(const vector<const BSONElement*>& position,
-                                   const vector<bool>& inclusive) {
-        return Status::OK();
-    }
-
-    Status S2NearIndexCursor::skip(const vector<const BSONElement*>& position,
-                                   const vector<bool>& inclusive) {
         return Status::OK();
     }
 
@@ -156,9 +149,9 @@ namespace mongo {
         // Caps are inclusive and inverting a cap includes the border.  This means that our
         // initial _innerRadius of 0 is OK -- we'll still find a point that is exactly at
         // the start of our search.
-        _innerCap = S2Cap::FromAxisAngle(_nearQuery.centroid,
+        _innerCap = S2Cap::FromAxisAngle(_nearQuery.centroid.point,
                 S1Angle::Radians(_innerRadius / _params.radius));
-        _outerCap = S2Cap::FromAxisAngle(_nearQuery.centroid,
+        _outerCap = S2Cap::FromAxisAngle(_nearQuery.centroid.point,
                 S1Angle::Radians(_outerRadius / _params.radius));
         double area = _outerCap.area() - _innerCap.area();
         _innerCap = _innerCap.Complement();
@@ -305,7 +298,15 @@ namespace mongo {
                 for (BSONElementSet::iterator oi = geoFieldElements.begin();
                         oi != geoFieldElements.end(); ++oi) {
                     if (!oi->isABSONObj()) { continue; }
-                    double dist = distanceTo(oi->Obj());
+                    BSONObj obj = oi->Obj();
+                    double dist;
+                    bool ret = S2SearchUtil::distanceBetween(_nearQuery.centroid.point,
+                                                             obj, _params, &dist);
+                    if (!ret) {
+                        warning() << "unknown geometry: " << obj.toString();
+                        dist = numeric_limits<double>::max();
+                    }
+
                     minDistance = min(dist, minDistance);
                 }
 
@@ -349,28 +350,6 @@ namespace mongo {
         verify(_innerRadius <= _outerRadius);
         LOG(1) << ") to (" << _innerRadius << ", " << _outerRadius << ")" << endl;
         ++_stats._numShells;
-    }
-
-    double S2NearIndexCursor::distanceTo(const BSONObj& obj) {
-        const S2Point &us = _nearQuery.centroid;
-        S2Point them;
-
-        S2Polygon polygon;
-        S2Polyline line;
-        S2Cell point;
-        if (GeoParser::parsePolygon(obj, &polygon)) {
-            them = polygon.Project(us);
-        } else if (GeoParser::parseLineString(obj, &line)) {
-            int tmp;
-            them = line.Project(us, &tmp);
-        } else if (GeoParser::parsePoint(obj, &point)) {
-            them = point.GetCenter();
-        } else {
-            warning() << "unknown geometry: " << obj.toString();
-            return numeric_limits<double>::max();
-        }
-        S1Angle angle(us, them);
-        return angle.radians() * _params.radius;
     }
 
 }  // namespace mongo

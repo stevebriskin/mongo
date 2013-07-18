@@ -31,7 +31,6 @@
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_update.h"
-#include "mongo/db/namespace-inl.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/util/scopeguard.h"
@@ -43,7 +42,7 @@ namespace mongo {
     const int DefaultIndexVersionNumber = 1;
 
     int removeFromSysIndexes(const char *ns, const char *idxName) {
-        string system_indexes = cc().database()->name + ".system.indexes";
+        string system_indexes = cc().database()->name() + ".system.indexes";
         BSONObjBuilder b;
         b.append("ns", ns);
         b.append("name", idxName); // e.g.: { name: "ts_1", ns: "foo.coll" }
@@ -55,8 +54,8 @@ namespace mongo {
        call. repair database is the clean solution, but this gives one a lighter weight
        partial option.  see dropIndexes()
     */
-    void assureSysIndexesEmptied(const char *ns, IndexDetails *idIndex) {
-        string system_indexes = cc().database()->name + ".system.indexes";
+    int assureSysIndexesEmptied(const char *ns, IndexDetails *idIndex) {
+        string system_indexes = cc().database()->name() + ".system.indexes";
         BSONObjBuilder b;
         b.append("ns", ns);
         if( idIndex ) {
@@ -67,6 +66,7 @@ namespace mongo {
         if( n ) {
             log() << "info: assureSysIndexesEmptied cleaned up " << n << " entries" << endl;
         }
+        return n;
     }
 
     int IndexDetails::keyPatternOffset( const string& key ) const {
@@ -83,6 +83,7 @@ namespace mongo {
 
     /* delete this index.  does NOT clean up the system catalog
        (system.indexes or system.namespaces) -- only NamespaceIndex.
+       TOOD: above comment is wrong, also, document durability assumptions
     */
     void IndexDetails::kill_idx() {
         string ns = indexNamespace(); // e.g. foo.coll.$ts_1
@@ -140,7 +141,7 @@ namespace mongo {
     }
 
     static void upgradeMinorVersionOrAssert(const string& newPluginName) {
-        const string systemIndexes = cc().database()->name + ".system.indexes";
+        const string systemIndexes = cc().database()->name() + ".system.indexes";
         shared_ptr<Cursor> cursor(theDataFileMgr.findAll(systemIndexes));
         for ( ; cursor && cursor->ok(); cursor->advance()) {
             const BSONObj index = cursor->current();
@@ -163,6 +164,39 @@ namespace mongo {
         getDur().writingInt(dfh->versionMinor) = PDFILE_VERSION_MINOR_24_AND_NEWER;
     }
 
+    /**
+     * @param newSpec the new index specification to check.
+     * @param existingDetails the currently existing index details to compare with.
+     *
+     * @return true if the given newSpec has the same options as the
+     *     existing index assuming the key spec matches.
+     */
+    bool areIndexOptionsEquivalent(const BSONObj& newSpec,
+                                   const IndexDetails& existingDetails) {
+        if (existingDetails.dropDups() != newSpec["dropDups"].trueValue()) {
+            return false;
+        }
+
+        const BSONElement sparseSpecs =
+                existingDetails.info.obj().getField("sparse");
+
+        if (sparseSpecs.trueValue() != newSpec["sparse"].trueValue()) {
+            return false;
+        }
+
+        // Note: { _id: 1 } or { _id: -1 } implies unique: true.
+        if (!existingDetails.isIdIndex() &&
+                existingDetails.unique() != newSpec["unique"].trueValue()) {
+            return false;
+        }
+
+        const BSONElement existingExpireSecs =
+                existingDetails.info.obj().getField("expireAfterSeconds");
+        const BSONElement newExpireSecs = newSpec["expireAfterSeconds"];
+
+        return existingExpireSecs == newExpireSecs;
+    }
+
     bool prepareToBuildIndex(const BSONObj& io,
                              bool mayInterrupt,
                              bool god,
@@ -174,8 +208,9 @@ namespace mongo {
         // the collection for which we are building an index
         sourceNS = io.getStringField("ns");
         uassert(10096, "invalid ns to index", sourceNS.find( '.' ) != string::npos);
-        massert(10097, str::stream() << "bad table to index name on add index attempt current db: " << cc().database()->name << "  source: " << sourceNS ,
-                cc().database()->name == nsToDatabase(sourceNS));
+        massert(10097, str::stream() << "bad table to index name on add index attempt current db: "
+                << cc().database()->name() << "  source: " << sourceNS,
+                cc().database()->name() == nsToDatabase(sourceNS));
 
         // logical name of the index.  todo: get rid of the name, we don't need it!
         const char *name = io.getStringField("name");
@@ -208,23 +243,50 @@ namespace mongo {
                 return false;
             }
             sourceCollection = nsdetails(sourceNS);
-            tlog() << "info: creating collection " << sourceNS << " on add index" << endl;
+            MONGO_TLOG(0) << "info: creating collection " << sourceNS << " on add index" << endl;
             verify( sourceCollection );
         }
 
-        // Check both existing and in-progress indexes (2nd param = true)
-        if ( sourceCollection->findIndexByName(name, true) >= 0 ) {
-            // index already exists.
-            return false;
+        {
+            // Check both existing and in-progress indexes (2nd param = true)
+            const int idx = sourceCollection->findIndexByName(name, true);
+            if (idx >= 0) {
+                // index already exists.
+                const IndexDetails& indexSpec(sourceCollection->idx(idx));
+                BSONObj existingKeyPattern(indexSpec.keyPattern());
+                uassert(16850, str::stream() << "Trying to create an index "
+                        << "with same name " << name
+                        << " with different key spec " << key
+                        << " vs existing spec " << existingKeyPattern,
+                        existingKeyPattern.equal(key));
+
+                uassert(16851, str::stream() << "Index with name: " << name
+                        << " already exists with different options",
+                        areIndexOptionsEquivalent(io, indexSpec));
+
+                // Index already exists with the same options, so no need to build a new
+                // one (not an error). Most likely requested by a client using ensureIndex.
+                return false;
+            }
         }
 
-        // Check both existing and in-progress indexes (2nd param = true)
-        if( sourceCollection->findIndexByKeyPattern(key, true) >= 0 ) {
-            LOG(2) << "index already exists with diff name " << name << ' ' << key.toString() << endl;
-            return false;
+        {
+            // Check both existing and in-progress indexes (2nd param = true)
+            const int idx = sourceCollection->findIndexByKeyPattern(key, true);
+            if (idx >= 0) {
+                LOG(2) << "index already exists with diff name " << name
+                        << ' ' << key.toString() << endl;
+
+                const IndexDetails& indexSpec(sourceCollection->idx(idx));
+                uassert(16852, str::stream() << "Index with pattern: " << key
+                        << " already exists with different options",
+                        areIndexOptionsEquivalent(io, indexSpec));
+
+                return false;
+            }
         }
 
-        if ( sourceCollection->nIndexes >= NamespaceDetails::NIndexesMax ) {
+        if ( sourceCollection->getTotalIndexCount() >= NamespaceDetails::NIndexesMax ) {
             stringstream ss;
             ss << "add index fails, too many indexes for " << sourceNS << " key:" << key.toString();
             string s = ss.str();

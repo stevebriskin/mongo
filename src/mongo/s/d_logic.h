@@ -21,9 +21,10 @@
 #include "mongo/pch.h"
 
 #include "mongo/db/jsobj.h"
-#include "mongo/s/d_chunk_manager.h"
+#include "mongo/s/collection_metadata.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/net/message.h"
 
 namespace mongo {
 
@@ -63,28 +64,29 @@ namespace mongo {
         const ChunkVersion getVersion( const string& ns ) const;
 
         /**
-         * Uninstalls the manager for a given collection. This should be used when the collection is dropped.
+         * Uninstalls the metadata for a given collection. This should be used when the collection
+         * is dropped.
          *
          * NOTE:
-         *   An existing collection with no chunks on this shard will have a manager on version 0, which is different than a
-         *   a dropped collection, which will not have a manager.
+         *   An existing collection with no chunks on this shard will have metadata on version 0,
+         *   which is different than a dropped collection, which will not have metadata.
          *
-         * TODO
-         *   When sharding state is enabled, absolutely all collections should have a manager. (The non-sharded ones are
-         *   a be degenerate case of one-chunk collections).
-         *   For now, a dropped collection and an non-sharded one are indistinguishable (SERVER-1849)
+         * TODO:
+         *   All collections should have metadata. (The non-sharded ones are a degenerate case of
+         *   one-chunk collections).
          *
          * @param ns the collection to be dropped
          */
         void resetVersion( const string& ns );
 
         /**
-         * Requests to access a collection at a certain version. If the collection's manager is not at that version it
-         * will try to update itself to the newest version. The request is only granted if the version is the current or
-         * the newest one.
+         * Requests to access a collection at a certain version. If the collection's metadata is not
+         * at that version it will try to update itself to the newest version. The request is only
+         * granted if the version is the current or the newest one.
          *
          * @param ns collection to be accessed
-         * @param version (IN) the client believe this collection is on and (OUT) the version the manager is actually in
+         * @param version (IN) the client believe this collection is on and (OUT) the version the
+         *  metadata is actually in
          * @return true if the access can be allowed at the provided version
          */
         bool trySetVersion( const string& ns , ChunkVersion& version );
@@ -93,49 +95,84 @@ namespace mongo {
 
         // querying support
 
-        bool needShardChunkManager( const string& ns ) const;
-        ShardChunkManagerPtr getShardChunkManager( const string& ns );
+        bool needCollectionMetadata( const string& ns ) const;
+        CollectionMetadataPtr getCollectionMetadata( const string& ns );
 
         // chunk migrate and split support
 
         /**
-         * Creates and installs a new chunk manager for a given collection by "forgetting" about one of its chunks.
-         * The new manager uses the provided version, which has to be higher than the current manager's.
-         * One exception: if the forgotten chunk is the last one in this shard for the collection, version has to be 0.
+         * Creates and installs a new chunk metadata for a given collection by "forgetting" about
+         * one of its chunks.  The new metadata uses the provided version, which has to be higher
+         * than the current metadata's shard version.
+         *
+         * One exception: if the forgotten chunk is the last one in this shard for the collection,
+         * version has to be 0.
          *
          * If it runs successfully, clients need to grab the new version to access the collection.
          *
          * @param ns the collection
-         * @param min max the chunk to eliminate from the current manager
-         * @param version at which the new manager should be at
+         * @param min max the chunk to eliminate from the current metadata
+         * @param version at which the new metadata should be at
          */
         void donateChunk( const string& ns , const BSONObj& min , const BSONObj& max , ChunkVersion version );
 
         /**
-         * Creates and installs a new chunk manager for a given collection by reclaiming a previously donated chunk.
-         * The previous manager's version has to be provided.
+         * Creates and installs new chunk metadata for a given collection by reclaiming a previously
+         * donated chunk.  The previous metadata's shard version has to be provided.
          *
-         * If it runs successfully, clients that became stale by the previous donateChunk will be able to access the
-         * collection again.
+         * If it runs successfully, clients that became stale by the previous donateChunk will be
+         * able to access the collection again.
          *
          * @param ns the collection
-         * @param min max the chunk to reclaim and add to the current manager
-         * @param version at which the new manager should be at
+         * @param min max the chunk to reclaim and add to the current metadata
+         * @param version at which the new metadata should be at
          */
         void undoDonateChunk( const string& ns , const BSONObj& min , const BSONObj& max , ChunkVersion version );
 
         /**
-         * Creates and installs a new chunk manager for a given collection by splitting one of its chunks in two or more.
-         * The version for the first split chunk should be provided. The subsequent chunks' version would be the latter with the
-         * minor portion incremented.
+         * Remembers a chunk range between 'min' and 'max' as a range which will have data migrated
+         * into it.  This data can then be protected against cleanup of orphaned data.
          *
-         * The effect on clients will depend on the version used. If the major portion is the same as the current shards,
-         * clients shouldn't perceive the split.
+         * Overlapping pending ranges will be removed, so it is only safe to use this when you know
+         * your metadata view is definitive, such as at the start of a migration.
+         *
+         * @return false with errMsg if the range is owned by this shard
+         */
+        bool notePending( const string& ns,
+                          const BSONObj& min,
+                          const BSONObj& max,
+                          string* errMsg );
+
+        /**
+         * Stops tracking a chunk range between 'min' and 'max' that previously was having data
+         * migrated into it.  This data is no longer protected against cleanup of orphaned data.
+         *
+         * To avoid removing pending ranges of other operations, ensure that this is only used when
+         * a migration is still active.
+         * TODO: Because migrations may currently be active when a collection drops, an epoch is
+         * necessary to ensure the pending metadata change is still applicable.
+         *
+         * @return false with errMsg if the range is owned by the shard or the epoch of the metadata
+         * has changed
+         */
+        bool forgetPending( const string& ns,
+                            const BSONObj& min,
+                            const BSONObj& max,
+                            const OID& epoch,
+                            string* errMsg );
+
+        /**
+         * Creates and installs a new chunk metadata for a given collection by splitting one of its
+         * chunks in two or more. The version for the first split chunk should be provided. The
+         * subsequent chunks' version would be the latter with the minor portion incremented.
+         *
+         * The effect on clients will depend on the version used. If the major portion is the same
+         * as the current shards, clients shouldn't perceive the split.
          *
          * @param ns the collection
          * @param min max the chunk that should be split
          * @param splitKeys point in which to split
-         * @param version at which the new manager should be at
+         * @param version at which the new metadata should be at
          */
         void splitChunk( const string& ns , const BSONObj& min , const BSONObj& max , const vector<BSONObj>& splitKeys ,
                          ChunkVersion version );
@@ -161,10 +198,9 @@ namespace mongo {
         // Using a ticket holder so we can have multiple redundant tries at any given time
         mutable TicketHolder _configServerTickets;
 
-        // map from a namespace into the ensemble of chunk ranges that are stored in this mongod
-        // a ShardChunkManager carries all state we need for a collection at this shard, including its version information
-        typedef map<string,ShardChunkManagerPtr> ChunkManagersMap;
-        ChunkManagersMap _chunks;
+        // Map from a namespace into the metadata we need for each collection on this shard
+        typedef map<string,CollectionMetadataPtr> CollectionMetadataMap;
+        CollectionMetadataMap _collMetadata;
     };
 
     extern ShardingState shardingState;

@@ -20,14 +20,46 @@
 #include <string>
 #include <vector>
 
-#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/client/sasl_client_authenticate.h"
 
+static bool authParamsSet = false;
 
 namespace mongo {
+
+    bool isInternalAuthSet() {
+       return authParamsSet; 
+    }
+
+    bool setInternalUserAuthParams(BSONObj authParams) {
+        if (!isInternalAuthSet()) {
+            internalSecurity.authParams = authParams.copy();
+            authParamsSet = true;
+            return true;
+        }
+        else {
+            log() << "Internal auth params have already been set" << endl;
+            return false;
+        }
+    }
+ 
+    bool authenticateInternalUser(DBClientWithCommands* conn){
+        if (!isInternalAuthSet()) {
+            log() << "ERROR: No authentication params set for internal user" << endl;
+            return false;
+        }
+        try {
+            conn->auth(internalSecurity.authParams); 
+            return true;
+        } catch(const UserException& ex) {
+            log() << "can't authenticate to " << conn->toString() << " as internal user, error: "
+                  << ex.what() << endl;
+            return false;
+        }
+    }
 
     bool setUpSecurityKey(const string& filename) {
         struct stat stats;
@@ -101,6 +133,13 @@ namespace mongo {
         DBClientConnection conn;
         internalSecurity.pwd = conn.createPasswordDigest(internalSecurity.user, str);
 
+        if (cmdLine.clusterAuthMode == "keyfile" || cmdLine.clusterAuthMode == "sendKeyfile") {
+            setInternalUserAuthParams(BSON(saslCommandMechanismFieldName << "MONGODB-CR" <<
+                                      saslCommandUserSourceFieldName << "local" <<
+                                      saslCommandUserFieldName << internalSecurity.user <<
+                                      saslCommandPasswordFieldName << internalSecurity.pwd <<
+                                      saslCommandDigestPasswordFieldName << false));
+        }
         return true;
     }
 

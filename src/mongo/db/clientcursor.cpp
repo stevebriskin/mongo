@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -79,7 +80,7 @@ namespace mongo {
         if ( L == _lastLoc )
             return;
 
-        CCByLoc& bl = byLoc();
+        CCByLoc& bl = _db->ccByLoc();
 
         if ( !_lastLoc.isNull() ) {
             bl.erase( ByLocKey( _lastLoc, _cursorid ) );
@@ -109,13 +110,13 @@ namespace mongo {
             //cout << "\nTEMP invalidate " << ns << endl;
             Database *db = cc().database();
             verify(db);
-            verify( str::startsWith(ns, db->name) );
+            verify( str::startsWith(ns, db->name()) );
 
             for( LockedIterator i; i.ok(); ) {
                 ClientCursor *cc = i.current();
 
                 bool shouldDelete = false;
-                if ( cc->_db == db ) {
+                if (cc->c()->shouldDestroyOnNSDeletion() && cc->_db == db) {
                     if (isDB) {
                         // already checked that db matched above
                         dassert( str::startsWith(cc->_ns.c_str(), ns) );
@@ -126,7 +127,7 @@ namespace mongo {
                             shouldDelete = true;
                     }
                 }
-                
+
                 if ( shouldDelete ) {
                     i.deleteAndAdvance();
                 }
@@ -207,23 +208,6 @@ namespace mongo {
         }
     }
 
-    /* must call when a btree bucket going away.
-       note this is potentially slow
-    */
-    void ClientCursor::informAboutToDeleteBucket(const DiskLoc& b) {
-        recursive_scoped_lock lock(ccmutex);
-        Database *db = cc().database();
-        CCByLoc& bl = db->ccByLoc;
-        RARELY if ( bl.size() > 70 ) {
-            log() << "perf warning: byLoc.size=" << bl.size() << " in aboutToDeleteBucket" << endl;
-        }
-        for ( CCByLoc::iterator i = bl.begin(); i != bl.end(); i++ )
-            i->second->_c->aboutToDeleteBucket(b);
-    }
-    void aboutToDeleteBucket(const DiskLoc& b) {
-        ClientCursor::informAboutToDeleteBucket(b);
-    }
-
     /* must call this on a delete so we clean up the cursors. */
     void ClientCursor::aboutToDelete( const StringData& ns,
                                       const NamespaceDetails* nsd,
@@ -238,7 +222,7 @@ namespace mongo {
 
         aboutToDeleteForSharding( ns, db, nsd, dl );
 
-        CCByLoc& bl = db->ccByLoc;
+        CCByLoc& bl = db->ccByLoc();
         CCByLoc::iterator j = bl.lower_bound(ByLocKey::min(dl));
         CCByLoc::iterator stop = bl.upper_bound(ByLocKey::max(dl));
         if ( j == stop )
@@ -328,7 +312,7 @@ namespace mongo {
         Lock::assertAtLeastReadLocked(ns);
 
         verify( _db );
-        verify( str::startsWith(_ns, _db->name) );
+        verify( _db->ownsNS( _ns ) );
         if( queryOptions & QueryOption_NoCursorTimeout )
             noTimeout();
         recursive_scoped_lock lock(ccmutex);
@@ -887,13 +871,25 @@ namespace mongo {
             recursive_scoped_lock lock(ccmutex);
             ClientCursor* cursor = find_inlock(id);
             if (!cursor) {
+                audit::logKillCursorsAuthzCheck(
+                        &cc(),
+                        NamespaceString(""),
+                        id,
+                        ErrorCodes::CursorNotFound);
                 return false;
             }
             ns = cursor->ns();
         }
 
         // Can't be in a lock when checking authorization
-        if (!cc().getAuthorizationSession()->checkAuthorization(ns, ActionType::killCursors)) {
+        const bool isAuthorized = cc().getAuthorizationSession()->checkAuthorization(
+                ns, ActionType::killCursors);
+        audit::logKillCursorsAuthzCheck(
+                &cc(),
+                NamespaceString(ns),
+                id,
+                isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+        if (!isAuthorized) {
             return false;
         }
 

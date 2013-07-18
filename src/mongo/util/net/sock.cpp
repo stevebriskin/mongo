@@ -56,7 +56,7 @@ namespace mongo {
         struct timeval tv;
         tv.tv_sec = (int)secs;
         tv.tv_usec = (int)((long long)(secs*1000*1000) % (1000*1000));
-        bool report = logLevel > 3; // solaris doesn't provide these
+        bool report = logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(4));
         DEV report = true;
 #if defined(_WIN32)
         tv.tv_sec *= 1000; // Windows timeout is a DWORD, in milliseconds.
@@ -194,7 +194,7 @@ namespace mongo {
                 if( target != "0.0.0.0" ) { // don't log if this as it is a 
                                             // CRT construction and log() may not work yet.
                     log() << "getaddrinfo(\"" << target << "\") failed: " << 
-                        gai_strerror(ret) << endl;
+                        getAddrInfoStrError(ret) << endl;
                 }
                 *this = SockAddr(port);
             }
@@ -392,13 +392,11 @@ namespace mongo {
     // ------------ Socket -----------------
     
     Socket::Socket(int fd , const SockAddr& remote) : 
-        _fd(fd), _remote(remote), _timeout(0), _lastValidityCheckAtSecs(time(0)) {
-        _logLevel = 0;
+        _fd(fd), _remote(remote), _timeout(0), _lastValidityCheckAtSecs(time(0)), _logLevel(logger::LogSeverity::Log()) {
         _init();
     }
 
-    Socket::Socket( double timeout, int ll ) {
-        _logLevel = ll;
+    Socket::Socket( double timeout, logger::LogSeverity ll ) : _logLevel(ll) {
         _fd = -1;
         _timeout = timeout;
         _lastValidityCheckAtSecs = time(0);
@@ -451,16 +449,14 @@ namespace mongo {
     void Socket::secureAccepted( SSLManagerInterface* ssl ) { 
         _sslManager = ssl;
     }
-#endif
 
-    void Socket::doSSLHandshake() {
-#ifdef MONGO_SSL
-        if (!_sslManager) return;
+    std::string Socket::doSSLHandshake() {
+        if (!_sslManager) return "";
         fassert(16506, _fd);
         _ssl = _sslManager->accept(_fd);
-        _sslManager->validatePeerCertificate(_ssl);
-#endif
+        return _sslManager->validatePeerCertificate(_ssl);
     }
+#endif
 
     class ConnectBG : public BackgroundJob {
     public:
@@ -659,9 +655,10 @@ namespace mongo {
                 continue;
             }
 
-            if ( len <= 4 && ret != len )
+            if ( len <= 4 && ret != len ) {
                 LOG(_logLevel) << "Socket recv() got " << ret <<
                     " bytes wanted len=" << len << endl;
+            }
             fassert(16508, ret <= len);
             len -= ret;
             buf += ret;
@@ -723,7 +720,7 @@ namespace mongo {
         // ret < 0
 #ifdef MONGO_SSL
         if (_ssl) {
-            LOG(_logLevel) << "SSL Error ret: " << ret
+            LOG(_logLevel) << "SSL Error ret when receiving: " << ret
                            << " err: " << _sslManager->SSL_get_error(_ssl , ret)
                            << " "
                            << _sslManager->ERR_error_string(_sslManager->ERR_get_error(), NULL)
@@ -874,15 +871,15 @@ namespace mongo {
         }
         else if ( pollInfo.revents & POLLHUP ) {
             // A hangup has occurred on this socket
-            LOG( _logLevel ) << "Socket hangup detected, no longer connected"
-                             << " (idle " << idleTimeSecs << " secs,"
-                             << " remote host " << remoteString() << ")" << endl;
+            LOG( 0 ) << "Socket hangup detected, no longer connected" << " (idle "
+                         << idleTimeSecs << " secs," << " remote host " << remoteString() << ")"
+                         << endl;
         }
         else if ( pollInfo.revents & POLLERR ) {
             // An error has occurred on this socket
-            LOG( _logLevel ) << "Socket error detected, no longer connected"
-                             << " (idle " << idleTimeSecs << " secs,"
-                             << " remote host " << remoteString() << ")" << endl;
+            LOG( 0 ) << "Socket error detected, no longer connected" << " (idle "
+                         << idleTimeSecs << " secs," << " remote host " << remoteString() << ")"
+                         << endl;
         }
         else if ( pollInfo.revents & POLLNVAL ) {
             // Socket descriptor itself is weird

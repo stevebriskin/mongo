@@ -16,6 +16,8 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <boost/algorithm/string.hpp>
+
 #include "mongo/pch.h"
 
 #include "mongo/db/cmdline.h"
@@ -39,6 +41,12 @@
 namespace po = boost::program_options;
 
 namespace mongo {
+
+#ifdef _WIN32
+    string dbpath = "\\data\\db\\";
+#else
+    string dbpath = "/data/db/";
+#endif
 
     static bool _isPasswordArgument(char const* argumentName);
     static bool _isPasswordSwitch(char const* switchName);
@@ -86,6 +94,9 @@ namespace {
         ("setParameter", po::value< std::vector<std::string> >()->composing(),
                 "Set a configurable parameter")
         ("httpinterface", "enable http interface")
+        ("clusterAuthMode", po::value<std::string>(&cmdLine.clusterAuthMode),
+         "Authentication mode used for cluster authentication."
+         " Alternatives are (keyfile|sendKeyfile|sendX509|x509)")
 #ifndef _WIN32
         ("nounixsocket", "disable listening on unix sockets")
         ("unixSocketPrefix", po::value<string>(), "alternative directory for UNIX domain sockets (defaults to /tmp)")
@@ -100,6 +111,10 @@ namespace {
         ("sslOnNormalPorts" , "use ssl on configured ports" )
         ("sslPEMKeyFile" , po::value<string>(&cmdLine.sslPEMKeyFile), "PEM file for ssl" )
         ("sslPEMKeyPassword" , new PasswordValue(&cmdLine.sslPEMKeyPassword) , "PEM file password" )
+        ("sslClusterFile", po::value<string>(&cmdLine.sslClusterFile), 
+         "Key file for internal SSL authentication" )
+        ("sslClusterPassword", new PasswordValue(&cmdLine.sslClusterPassword), 
+         "Internal authentication key file password" )
         ("sslCAFile", po::value<std::string>(&cmdLine.sslCAFile), 
          "Certificate Authority file for SSL")
         ("sslCRLFile", po::value<std::string>(&cmdLine.sslCRLFile),
@@ -290,12 +305,13 @@ namespace {
         }
 
         if (params.count("verbose")) {
-            logLevel = 1;
+            logger::globalLogDomain()->setMinimumLoggedSeverity(logger::LogSeverity::Debug(1));
         }
 
         for (string s = "vv"; s.length() <= 12; s.append("v")) {
             if (params.count(s)) {
-                logLevel = s.length();
+                logger::globalLogDomain()->setMinimumLoggedSeverity(
+                        logger::LogSeverity::Debug(s.length()));
             }
         }
 
@@ -408,6 +424,9 @@ namespace {
                 }
             }
         }
+        if (!params.count("clusterAuthMode")){
+            cmdLine.clusterAuthMode = "keyfile";
+        }
 
 #ifdef MONGO_SSL
         if (params.count("sslWeakCertificateValidation")) {
@@ -435,11 +454,31 @@ namespace {
         }
         else if (cmdLine.sslPEMKeyFile.size() || 
                  cmdLine.sslPEMKeyPassword.size() ||
+                 cmdLine.sslClusterFile.size() ||
+                 cmdLine.sslClusterPassword.size() ||
                  cmdLine.sslCAFile.size() ||
                  cmdLine.sslCRLFile.size() ||
                  cmdLine.sslWeakCertificateValidation ||
                  cmdLine.sslFIPSMode) {
             log() << "need to enable sslOnNormalPorts" << endl;
+            return false;
+        }
+        if (cmdLine.clusterAuthMode == "sendKeyfile" || 
+            cmdLine.clusterAuthMode == "sendX509" || 
+            cmdLine.clusterAuthMode == "x509") {
+            if (!cmdLine.sslOnNormalPorts){
+                log() << "need to enable sslOnNormalPorts" << endl;
+                return false;
+            }
+        }
+        else if (cmdLine.clusterAuthMode != "keyfile") {
+            log() << "unsupported value for clusterAuthMode " << cmdLine.clusterAuthMode << endl;
+            return false;
+        }
+#else // ifdef MONGO_SSL
+        // Keyfile is currently the only supported value if not using SSL 
+        if (cmdLine.clusterAuthMode != "keyfile") {
+            log() << "unsupported value for clusterAuthMode " << cmdLine.clusterAuthMode << endl;
             return false;
         }
 #endif

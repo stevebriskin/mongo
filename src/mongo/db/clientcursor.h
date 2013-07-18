@@ -37,8 +37,8 @@
 #include "dbhelpers.h"
 #include "matcher.h"
 #include "projection.h"
-#include "s/d_chunk_manager.h"
 #include "mongo/db/keypattern.h"
+#include "mongo/s/collection_metadata.h"
 #include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
@@ -288,8 +288,8 @@ namespace mongo {
             return _c->matcher()->matchesCurrent( _c.get() );
         }
 
-        void setChunkManager( ShardChunkManagerPtr manager ){ _chunkManager = manager; }
-        ShardChunkManagerPtr getChunkManager(){ return _chunkManager; }
+        void setCollMetadata( CollectionMetadataPtr metadata ){ _collMetadata = metadata; }
+        CollectionMetadataPtr getCollMetadata(){ return _collMetadata; }
 
     private:
         void setLastLoc_inlock(DiskLoc);
@@ -371,7 +371,6 @@ namespace mongo {
 
         static void appendStats( BSONObjBuilder& result );
         static unsigned numCursors() { return clientCursorsById.size(); }
-        static void informAboutToDeleteBucket(const DiskLoc& b);
         static void aboutToDelete( const StringData& ns,
                                    const NamespaceDetails* nsd,
                                    const DiskLoc& dl );
@@ -384,8 +383,6 @@ namespace mongo {
         // setting this prevents timeout of the cursor in question.
         void noTimeout() { _pinValue++; }
 
-        CCByLoc& byLoc() { return _db->ccByLoc; }
-        
         Record* _recordForYield( RecordNeeds need );
         static bool _erase_inlock(ClientCursor* cursor);
 
@@ -417,7 +414,7 @@ namespace mongo {
         bool _doingDeletes; // when true we are the delete and aboutToDelete shouldn't manipulate us
         ElapsedTracker _yieldSometimesTracker;
 
-        ShardChunkManagerPtr _chunkManager;
+        CollectionMetadataPtr _collMetadata;
 
     public:
         shared_ptr<ParsedQuery> pq;

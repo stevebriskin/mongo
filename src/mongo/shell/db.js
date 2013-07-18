@@ -63,8 +63,23 @@ DB.prototype.adminCommand = function( obj ){
 
 DB.prototype._adminCommand = DB.prototype.adminCommand; // alias old name
 
-DB.prototype._createUser = function(userObj, replicatedTo, timeout) {
+function printUserObj(userObj) {
+    var pwd = userObj.pwd;
+    delete userObj.pwd;
+    print(tojson(userObj));
+    userObj.pwd = pwd;
+}
+
+/**
+ * Used for creating users in systems with v1 style user information (ie MongoDB v2.4 and prior)
+ */
+DB.prototype._createUserV1 = function(userObj, replicatedTo, timeout) {
     var c = this.getCollection( "system.users" );
+    var oldPwd;
+    if (userObj.pwd != null) {
+        oldPwd = userObj.pwd;
+        userObj.pwd = _hashPassword(userObj.user, userObj.pwd);
+    }
     try {
         c.save(userObj);
     } catch (e) {
@@ -77,8 +92,11 @@ DB.prototype._createUser = function(userObj, replicatedTo, timeout) {
         } else {
             throw "Could not insert into system.users: " + tojson(e);
         }
+    } finally {
+        if (userObj.pwd != null)
+            userObj.pwd = oldPwd;
     }
-    print(tojson(userObj));
+    printUserObj(userObj);
 
     //
     // When saving users to replica sets, the shell user will want to know if the user hasn't
@@ -128,43 +146,60 @@ DB.prototype._createUser = function(userObj, replicatedTo, timeout) {
     throw "couldn't add user: " + le.err;
 }
 
+DB.prototype._createUser = function(userObj, replicatedTo, timeout) {
+    var cmdObj = {createUser:1};
+    cmdObj = Object.extend(cmdObj, userObj);
+
+    var res = this.runCommand(cmdObj);
+
+    if (res.ok) {
+        printUserObj(userObj);
+        return;
+    }
+
+    if (res.errmsg == "no such cmd: createUser") {
+        return this._createUserV1(userObj, replicatedTo, timeout);
+    }
+
+    // We can't detect replica set shards via mongos, so we'll sometimes get this error
+    // In this case though, we've already checked the local error before returning norepl, so
+    // the user has been written and we're happy
+    if (res.errmsg == "norepl" || res.errmsg == "noreplset") {
+        // nothing we can do
+        return;
+    }
+
+    if (res.errmsg == "timeout") {
+        throw "timed out while waiting for user authentication to replicate - " +
+              "database will not be fully secured until replication finishes"
+    }
+
+    throw "couldn't add user: " + res.errmsg;
+}
+
 function _hashPassword(username, password) {
     return hex_md5(username + ":mongo:" + password);
 }
 
 // For adding old-style user documents for backwards compatibily with pre-2.4 versions of MongoDB.
-DB.prototype._addUserV22 = function( username , pass, readOnly, replicatedTo, timeout ) {
+DB.prototype._addUserV0 = function( username , pass, readOnly, replicatedTo, timeout ) {
     if ( pass == null || pass.length == 0 )
         throw "password can't be empty";
 
     readOnly = readOnly || false;
     var c = this.getCollection( "system.users" );
-    var u = c.findOne({user : username, userSource:null}) || { user : username };
-    u.readOnly = readOnly;
-    u.pwd = _hashPassword(username, pass);
+    var u = { user : username, readOnly : readOnly, pwd : pass };
 
     this._createUser(u, replicatedTo, timeout);
 }
 
 DB.prototype._addUser = function(userObj, replicatedTo, timeout) {
-    var roles = userObj['roles'];
-    var oldPwd;
-
     // To prevent creating old-style privilege documents
-    if (roles == null) {
+    if (userObj['roles'] == null) {
         throw Error("'roles' field must be provided");
     }
 
-    if (userObj.pwd != null) {
-        oldPwd = userObj.pwd;
-        userObj.pwd = _hashPassword(userObj.user, userObj.pwd);
-    }
-    try {
-        this._createUser(userObj, replicatedTo, timeout);
-    } finally {
-        if (userObj.pwd != null)
-            userObj.pwd = oldPwd;
-    }
+    this._createUser(userObj, replicatedTo, timeout);
 }
 
 DB.prototype.addUser = function() {
@@ -174,18 +209,55 @@ DB.prototype.addUser = function() {
     if (typeof arguments[0] == "object") {
         this._addUser.apply(this, arguments);
     } else {
-        this._addUserV22.apply(this, arguments);
+        this._addUserV0.apply(this, arguments);
     }
 }
 
-DB.prototype.changeUserPassword = function(username, password) {
-    var hashedPassword = _hashPassword(username, password);
-    db.system.users.update({user : username, userSource : null}, {$set : {pwd : hashedPassword}});
+/**
+ * Used for updating users' passwords/extraData in systems with V1 style user information
+ * (ie MongoDB v2.4 and prior)
+ */
+DB.prototype._updateUserV1 = function(updateObject) {
+    var setObj = {};
+    if (updateObject.pwd) {
+        setObj["pwd"] = _hashPassword(updateObject.user, updateObject.pwd);
+    }
+    if (updateObject.extraData) {
+        setObj["extraData"] = updateObject.extraData;
+    }
+    db.system.users.update({user : updateObject.user, userSource : null},
+                           {$set : setObj});
     var err = db.getLastError();
     if (err) {
-        throw "Changing password failed: " + err;
+        throw Error("Updating user failed: " + err);
     }
-}
+};
+
+DB.prototype.updateUser = function(updateObject) {
+    var cmdObj = {updateUser:1};
+    cmdObj = Object.extend(cmdObj, updateObject);
+    var res = this.runCommand(cmdObj);
+    if (res.ok) {
+        return;
+    }
+
+    if (res.errmsg == "no such cmd: updateUser") {
+        this._updateUserV1(updateObject);
+        return;
+    }
+
+    if (res.errmsg == "noreplset") {
+        // nothing we can do
+        return;
+    }
+
+    throw Error("Updating user failed: " + res.errmsg);
+};
+
+DB.prototype.changeUserPassword = function(username, password) {
+    var updateObject = { user: username, pwd: password};
+    this.updateUser(updateObject);
+};
 
 DB.prototype.logout = function(){
     return this.getMongo().logout(this.getName());
@@ -864,23 +936,39 @@ DB.prototype.printReplicationInfo = function() {
 }
 
 DB.prototype.printSlaveReplicationInfo = function() {
+    var startOptimeDate = null;
+
     function getReplLag(st) {
-        var now = new Date();
-        print("\t syncedTo: " + st.toString() );
-        var ago = (now-st)/1000;
+        assert( startOptimeDate , "how could this be null (getReplLag startOptimeDate)" );
+        print("\tsyncedTo: " + st.toString() );
+        var ago = (startOptimeDate-st)/1000;
         var hrs = Math.round(ago/36)/100;
-        print("\t\t = " + Math.round(ago) + " secs ago (" + hrs + "hrs)");
+        print("\t" + Math.round(ago) + " secs (" + hrs + " hrs) behind the primary ");
     };
-    
+
+    function getMaster(members) {
+        var found;
+        members.forEach(function(row) {
+            if (row.self) {
+                found = row;
+                return false;
+            }
+        });
+
+        if (found) {
+            return found;
+        }
+    };
+
     function g(x) {
         assert( x , "how could this be null (printSlaveReplicationInfo gx)" )
-        print("source:   " + x.host);
+        print("source: " + x.host);
         if ( x.syncedTo ){
             var st = new Date( DB.tsToSeconds( x.syncedTo ) * 1000 );
             getReplLag(st);
         }
         else {
-            print( "\t doing initial sync" );
+            print( "\tdoing initial sync" );
         }
     };
 
@@ -890,12 +978,12 @@ DB.prototype.printSlaveReplicationInfo = function() {
             return;
         }
         
-        print("source:   " + x.name);
+        print("source: " + x.name);
         if ( x.optime ) {
             getReplLag(x.optimeDate);
         }
         else {
-            print( "\t no replication info, yet.  State: " + x.stateStr );
+            print( "\tno replication info, yet.  State: " + x.stateStr );
         }
     };
     
@@ -903,9 +991,11 @@ DB.prototype.printSlaveReplicationInfo = function() {
 
     if (L.system.replset.count() != 0) {
         var status = this.adminCommand({'replSetGetStatus' : 1});
+        startOptimeDate = getMaster(status.members).optimeDate; 
         status.members.forEach(r);
     }
     else if( L.sources.count() != 0 ) {
+        startOptimeDate = new Date();
         L.sources.find().forEach(g);
     }
     else {

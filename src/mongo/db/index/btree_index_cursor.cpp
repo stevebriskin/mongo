@@ -23,27 +23,43 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/index/index_cursor.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/platform/unordered_set.h"
 
 namespace mongo {
+
+    unordered_set<BtreeIndexCursor*> BtreeIndexCursor::_activeCursors;
+    SimpleMutex BtreeIndexCursor::_activeCursorsMutex("active_btree_index_cursors");
 
     // Go forward by default.
     BtreeIndexCursor::BtreeIndexCursor(IndexDescriptor *descriptor, Ordering ordering,
                                        BtreeInterface *interface)
         : _direction(1), _descriptor(descriptor), _ordering(ordering), _interface(interface),
-          _bucket(descriptor->getHead()), _keyOffset(0) { }
+          _bucket(descriptor->getHead()), _keyOffset(0) {
+
+        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
+        _activeCursors.insert(this);
+    }
+
+    BtreeIndexCursor::~BtreeIndexCursor() {
+        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
+        _activeCursors.erase(this);
+    }
 
     bool BtreeIndexCursor::isEOF() const { return _bucket.isNull(); }
 
-    // XXX SHORT TERM HACKS THAT MUST DIE: 2d index
+    // XXX TWO SHORT TERM HACKS THAT MUST DIE USED BY 2D INDEX:
     DiskLoc BtreeIndexCursor::getBucket() const { return _bucket; }
-
-    // XXX SHORT TERM HACKS THAT MUST DIE: 2d index
     int BtreeIndexCursor::getKeyOfs() const { return _keyOffset; }
 
-    // XXX SHORT TERM HACKS THAT MUST DIE: btree deletion
     void BtreeIndexCursor::aboutToDeleteBucket(const DiskLoc& bucket) {
-        if (bucket == _bucket) {
-            _keyOffset = -1;
+        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
+        for (unordered_set<BtreeIndexCursor*>::iterator i = _activeCursors.begin();
+             i != _activeCursors.end(); ++i) {
+
+            BtreeIndexCursor* ic = *i;
+            if (bucket == ic->_bucket) {
+                ic->_keyOffset = -1;
+            }
         }
     }
 
@@ -103,21 +119,21 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status BtreeIndexCursor::skip(const vector<const BSONElement*>& position,
-            const vector<bool>& inclusive) {
+    Status BtreeIndexCursor::skip(const BSONObj &keyBegin, int keyBeginLen, bool afterKey,
+                                  const vector<const BSONElement*>& keyEnd,
+                                  const vector<bool>& keyEndInclusive) {
         _interface->advanceTo(
-                _bucket,
-                _keyOffset,
-                _emptyObj,
-                0,
-                false,
-                position,
-                inclusive,
-                _ordering,
-                (int)_direction);
+            _bucket,
+            _keyOffset,
+            keyBegin,
+            keyBeginLen,
+            afterKey,
+            keyEnd,
+            keyEndInclusive,
+            _ordering,
+            (int)_direction);
 
         skipUnusedKeys();
-
         return Status::OK();
     }
 

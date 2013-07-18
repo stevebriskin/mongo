@@ -23,7 +23,7 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/map_util.h"
 
@@ -79,13 +79,13 @@ namespace {
             std::string user = query[AuthorizationManager::USER_NAME_FIELD_NAME].String();
             std::string userSource;
             if (!query[AuthorizationManager::USER_SOURCE_FIELD_NAME].trueValue()) {
-                userSource = nsstring.db;
+                userSource = nsstring.db().toString();
             }
             else {
                 userSource = query[AuthorizationManager::USER_SOURCE_FIELD_NAME].String();
             }
             *result = mapFindWithDefault(_privilegeDocs,
-                                         std::make_pair(nsstring.db,
+                                         std::make_pair(nsstring.db().toString(),
                                                         UserName(user, userSource)),
                                                         BSON("invalid" << 1));
             return  !(*result)["invalid"].trueValue();

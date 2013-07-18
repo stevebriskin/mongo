@@ -274,7 +274,9 @@ namespace mongo {
                 if( ok ) {
                     up(info, mem);
                 }
-                else if (!info["errmsg"].eoo() && info["errmsg"].str() == "unauthorized") {
+                else if (info["code"].numberInt() == ErrorCodes::Unauthorized ||
+                         info["errmsg"].str() == "unauthorized") {
+
                     authIssue(mem);
                 }
                 else {
@@ -438,6 +440,10 @@ namespace mongo {
             mem.lastHeartbeatMsg = info["hbmsg"].String();
             if (info.hasElement("syncingTo")) {
                 mem.syncingTo = info["syncingTo"].String();
+            }
+            else {
+                // empty out syncingTo since they are no longer syncing to anyone
+                mem.syncingTo = "";
             }
 
             if( info.hasElement("opTime") )

@@ -31,7 +31,7 @@
 #include "mongo/db/query_optimizer.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/scripting/engine.h"
-#include "mongo/s/d_chunk_manager.h"
+#include "mongo/s/collection_metadata.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
@@ -356,8 +356,8 @@ namespace mongo {
                     }
 
                     BSONObj indexToInsert = b.obj();
-                    Namespace tempNamespace(_config.tempNamespace.c_str());
-                    insert(tempNamespace.getSisterNS("system.indexes").c_str(), indexToInsert);
+                    NamespaceString tempNamespace(_config.tempNamespace);
+                    insert(tempNamespace.getSystemIndexesCollection(), indexToInsert);
                 }
 
             }
@@ -910,7 +910,7 @@ namespace mongo {
             {
                 dbtempreleasecond tl;
                 if ( ! tl.unlocked() )
-                    LOG( LL_WARNING ) << "map/reduce can't temp release" << endl;
+                    warning() << "map/reduce can't temp release" << endl;
                 // reduce and finalize last array
                 finalReduce( all );
             }
@@ -1119,13 +1119,13 @@ namespace mongo {
                 uassert( 16149 , "cannot run map reduce without the js engine", globalScriptEngine );
 
                 ClientCursor::Holder holdCursor;
-                ShardChunkManagerPtr chunkManager;
+                CollectionMetadataPtr collMetadata;
 
                 {
-                    // Get chunk manager before we check our version, to make sure it doesn't increment
+                    // Get metadata before we check our version, to make sure it doesn't increment
                     // in the meantime
-                    if ( shardingState.needShardChunkManager( config.ns ) ) {
-                        chunkManager = shardingState.getShardChunkManager( config.ns );
+                    if ( shardingState.needCollectionMetadata( config.ns ) ) {
+                        collMetadata = shardingState.getCollectionMetadata( config.ns );
                     }
 
                     // Check our version immediately, to avoid migrations happening in the meantime while we do prep
@@ -1195,6 +1195,11 @@ namespace mongo {
                         Timer mt;
                         // go through each doc
                         while ( cursor->ok() ) {
+                            if ( ! cursor->yieldSometimes( ClientCursor::WillNeed ) ) {
+                                cursor.release();
+                                break;
+                            }
+
                             if ( ! cursor->currentMatches() ) {
                                 cursor->advance();
                                 continue;
@@ -1212,9 +1217,9 @@ namespace mongo {
 
                             // check to see if this is a new object we don't own yet
                             // because of a chunk migration
-                            if ( chunkManager ) {
-                                KeyPattern kp( chunkManager->getKeyPattern() );
-                                if ( !chunkManager->keyBelongsToMe( kp.extractSingleKey( o ) ) ) {
+                            if ( collMetadata ) {
+                                KeyPattern kp( collMetadata->getKeyPattern() );
+                                if ( !collMetadata->keyBelongsToMe( kp.extractSingleKey( o ) ) ) {
                                     continue;
                                 }
                             }
@@ -1357,7 +1362,6 @@ namespace mongo {
                 ProgressMeterHolder pm(op->setMessage("m/r: merge sort and reduce",
                                                       "M/R Merge Sort and Reduce Progress"));
                 set<ServerAndQuery> servers;
-                vector< auto_ptr<DBClientCursor> > shardCursors;
 
                 {
                     // parse per shard results

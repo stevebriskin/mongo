@@ -21,10 +21,12 @@
 
 #ifndef USE_ASIO
 
+
 #include "mongo/db/cmdline.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/net/listen.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_port.h"
@@ -173,7 +175,7 @@ namespace mongo {
             }
 
             verify( inPort );
-            inPort->psock->setLogLevel(1);
+            inPort->psock->setLogLevel(logger::LogSeverity::Debug(1));
             scoped_ptr<MessagingPort> p( inPort );
 
             string otherSide;
@@ -185,7 +187,10 @@ namespace mongo {
 
                 otherSide = p->psock->remoteString();
 
-                p->psock->doSSLHandshake();
+#ifdef MONGO_SSL
+                std::string x509SubjectName = p->psock->doSSLHandshake();
+                inPort->setX509SubjectName(x509SubjectName);
+#endif 
                 handler->connected( p.get() );
 
                 while ( ! inShutdown() ) {

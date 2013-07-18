@@ -23,6 +23,7 @@
 #include "mongo/db/diskloc.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_details.h"
+#include "mongo/db/index/btree_index_cursor.h"
 #include "mongo/db/index/index_access_method.h"
 
 namespace mongo {
@@ -136,9 +137,6 @@ namespace mongo {
         virtual const DiskLoc getBucket() const;
         // XXX(hk): geo uses this too.  :(
         virtual int getKeyOfs() const;
-        // XXX(hk): deletions go through a lengthy, scary path (btree.cpp -> clientcursor.cpp ->
-        // cursor.cpp -> btreecursor.cpp) and this is part of it...for now.
-        virtual void aboutToDeleteBucket(const DiskLoc& b);
 
     private:
         BtreeCursor( NamespaceDetails* nsd, int theIndexNo, const IndexDetails& idxDetails );
@@ -206,7 +204,7 @@ namespace mongo {
         long long _nscanned;
 
         // These variables are for index traversal.
-        scoped_ptr<IndexCursor> _indexCursor;
+        scoped_ptr<BtreeIndexCursor> _indexCursor;
         scoped_ptr<IndexAccessMethod> _indexAM;
         scoped_ptr<IndexDescriptor> _indexDescriptor;
         bool _hitEnd;

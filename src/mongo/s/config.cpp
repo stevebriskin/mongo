@@ -751,11 +751,38 @@ namespace mongo {
 
         _config = configHosts;
 
+        string errmsg;
+        if( ! checkHostsAreUnique(configHosts, &errmsg) ) {
+            error() << errmsg << endl;;
+            return false;
+        }
+
         string fullString;
         joinStringDelim( configHosts, &fullString, ',' );
         _primary.setAddress( ConnectionString( fullString , ConnectionString::SYNC ) );
         LOG(1) << " config string : " << fullString << endl;
 
+        return true;
+    }
+
+    bool ConfigServer::checkHostsAreUnique( const vector<string>& configHosts, string* errmsg ) {
+
+        //If we have one host, its always unique
+        if ( configHosts.size() == 1 ) {
+            return true;
+        }
+
+        //Compare each host with all other hosts.
+        set<string> hostsTest;
+        pair<set<string>::iterator,bool> ret;
+        for ( size_t x=0; x < configHosts.size(); x++) {
+            ret = hostsTest.insert( configHosts[x] );
+            if ( ret.second == false ) {
+               *errmsg = str::stream() << "config servers " << configHosts[x]
+                                       << " exists twice in config listing.";
+               return false;
+            }
+        }
         return true;
     }
 
@@ -823,7 +850,7 @@ namespace mongo {
         }
 
         if ( up == 1 ) {
-            LOG( LL_WARNING ) << "only 1 config server reachable, continuing" << endl;
+            warning() << "only 1 config server reachable, continuing" << endl;
             return true;
         }
 
@@ -843,7 +870,7 @@ namespace mongo {
 
             stringstream ss;
             ss << "config servers " << _config[firstGood] << " and " << _config[i] << " differ";
-            LOG( LL_WARNING ) << ss.str() << endl;
+            warning() << ss.str() << endl;
             if ( tries <= 1 ) {
                 ss << "\n" << c1 << "\t" << c2 << "\n" << d1 << "\t" << d2;
                 errmsg = ss.str();
@@ -863,7 +890,7 @@ namespace mongo {
         if ( checkConsistency ) {
             string errmsg;
             if ( ! checkConfigServersConsistent( errmsg ) ) {
-                LOG( LL_ERROR ) << "could not verify that config servers are in sync" << causedBy(errmsg) << warnings;
+                error() << "could not verify that config servers are in sync" << causedBy(errmsg) << warnings;
                 return false;
             }
         }
