@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -22,19 +34,24 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/d_concurrency.h"
+#include "mongo/db/memconcept.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/storage/data_file.h"
+#include "mongo/db/storage/extent.h"
 #include "mongo/db/storage/extent_manager.h"
 
-// XXX-erh
 #include "mongo/db/pdfile.h"
 
 namespace mongo {
 
-    // XXX-ERH
-    extern bool directoryperdb;
-
-    ExtentManager::ExtentManager( const StringData& dbname, const StringData& path )
-        : _dbname( dbname.toString() ), _path( path.toString() ) {
+    ExtentManager::ExtentManager( const StringData& dbname,
+                                  const StringData& path,
+                                  NamespaceDetails* freeListDetails,
+                                  bool directoryPerDB )
+        : _dbname( dbname.toString() ),
+          _path( path.toString() ),
+          _freeListDetails( freeListDetails ),
+          _directoryPerDB( directoryPerDB ) {
     }
 
     ExtentManager::~ExtentManager() {
@@ -52,7 +69,7 @@ namespace mongo {
         stringstream ss;
         ss << _dbname << '.' << n;
         boost::filesystem::path fullName( _path );
-        if ( directoryperdb )
+        if ( _directoryPerDB )
             fullName /= _dbname;
         fullName /= ss.str();
         return fullName;
@@ -87,18 +104,28 @@ namespace mongo {
         return Status::OK();
     }
 
+    const DataFile* ExtentManager::_getOpenFile( int n ) const {
+        verify(this);
+        DEV Lock::assertAtLeastReadLocked( _dbname );
+        if ( n < 0 || n >= static_cast<int>(_files.size()) )
+            log() << "uh oh: " << n;
+        verify( n >= 0 && n < static_cast<int>(_files.size()) );
+        return _files[n];
+    }
+
+
     // todo: this is called a lot. streamline the common case
     DataFile* ExtentManager::getFile( int n, int sizeNeeded , bool preallocateOnly) {
         verify(this);
-        Lock::assertAtLeastReadLocked( _dbname );
+        DEV Lock::assertAtLeastReadLocked( _dbname );
 
         if ( n < 0 || n >= DiskLoc::MaxFiles ) {
-            out() << "getFile(): n=" << n << endl;
+            log() << "getFile(): n=" << n << endl;
             massert( 10295 , "getFile(): bad file number value (corrupt db?): run repair", false);
         }
         DEV {
             if ( n > 100 ) {
-                out() << "getFile(): n=" << n << endl;
+                log() << "getFile(): n=" << n << endl;
             }
         }
         DataFile* p = 0;
@@ -116,7 +143,7 @@ namespace mongo {
             p = _files[n];
         }
         if ( p == 0 ) {
-            Lock::assertWriteLocked( _dbname );
+            DEV Lock::assertWriteLocked( _dbname );
             boost::filesystem::path fullName = fileName( n );
             string fullNameString = fullName.string();
             p = new DataFile(n);
@@ -141,7 +168,7 @@ namespace mongo {
     }
 
     DataFile* ExtentManager::addAFile( int sizeNeeded, bool preallocateNextFile ) {
-        Lock::assertWriteLocked( _dbname );
+        DEV Lock::assertWriteLocked( _dbname );
         int n = (int) _files.size();
         DataFile *ret = getFile( n, sizeNeeded );
         if ( preallocateNextFile )
@@ -162,24 +189,42 @@ namespace mongo {
     }
 
     void ExtentManager::flushFiles( bool sync ) {
-        Lock::assertAtLeastReadLocked( _dbname );
+        DEV Lock::assertAtLeastReadLocked( _dbname );
         for( vector<DataFile*>::iterator i = _files.begin(); i != _files.end(); i++ ) {
             DataFile *f = *i;
             f->flush(sync);
         }
     }
 
-    Record* ExtentManager::recordFor( const DiskLoc& loc ) {
-        return getFile( loc.a() )->recordAt( loc );
+    Record* ExtentManager::recordFor( const DiskLoc& loc ) const {
+        loc.assertOk();
+        const DataFile* df = _getOpenFile( loc.a() );
+
+        int ofs = loc.getOfs();
+        if ( ofs < DataFileHeader::HeaderSize ) {
+            df->badOfs(ofs); // will uassert - external call to keep out of the normal code path
+        }
+
+        return reinterpret_cast<Record*>( df->p() + ofs );
     }
 
-    Extent* ExtentManager::extentFor( const DiskLoc& loc ) {
+    Extent* ExtentManager::extentFor( const DiskLoc& loc ) const {
         Record* record = recordFor( loc );
         DiskLoc extentLoc( loc.a(), record->extentOfs() );
-        return getFile( loc.a() )->getExtent( extentLoc );
+        return getExtent( extentLoc );
     }
 
-    DiskLoc ExtentManager::getNextRecordInExtent( const DiskLoc& loc ) {
+    Extent* ExtentManager::getExtent( const DiskLoc& loc, bool doSanityCheck ) const {
+        loc.assertOk();
+        Extent* e = reinterpret_cast<Extent*>( _getOpenFile( loc.a() )->p() + loc.getOfs() );
+        if ( doSanityCheck )
+            e->assertOk();
+        memconcept::is(e, memconcept::concept::extent);
+        return e;
+    }
+
+
+    DiskLoc ExtentManager::getNextRecordInExtent( const DiskLoc& loc ) const {
         int nextOffset = recordFor( loc )->nextOfs();
 
         if ( nextOffset == DiskLoc::NullOfs )
@@ -189,7 +234,7 @@ namespace mongo {
         return DiskLoc( loc.a(), nextOffset );
     }
 
-    DiskLoc ExtentManager::getNextRecord( const DiskLoc& loc ) {
+    DiskLoc ExtentManager::getNextRecord( const DiskLoc& loc ) const {
         DiskLoc next = getNextRecordInExtent( loc );
         if ( !next.isNull() )
             return next;
@@ -208,7 +253,7 @@ namespace mongo {
         return e->firstRecord;
     }
 
-    DiskLoc ExtentManager::getPrevRecordInExtent( const DiskLoc& loc ) {
+    DiskLoc ExtentManager::getPrevRecordInExtent( const DiskLoc& loc ) const {
         int prevOffset = recordFor( loc )->prevOfs();
 
         if ( prevOffset == DiskLoc::NullOfs )
@@ -218,7 +263,7 @@ namespace mongo {
         return DiskLoc( loc.a(), prevOffset );
     }
 
-    DiskLoc ExtentManager::getPrevRecord( const DiskLoc& loc ) {
+    DiskLoc ExtentManager::getPrevRecord( const DiskLoc& loc ) const {
         DiskLoc prev = getPrevRecordInExtent( loc );
         if ( !prev.isNull() )
             return prev;
@@ -234,7 +279,259 @@ namespace mongo {
                 break;
             // entire extent could be empty, keep looking
         }
-        return e->firstRecord;
+        return e->lastRecord;
+    }
+
+    Extent* ExtentManager::getNextExtent( Extent* e ) const {
+        if ( e->xnext.isNull() )
+            return NULL;
+        return getExtent( e->xnext );
+    }
+
+    Extent* ExtentManager::getPrevExtent( Extent* e ) const {
+        if ( e->xprev.isNull() )
+            return NULL;
+        return getExtent( e->xprev );
+    }
+
+    int ExtentManager::quantizeExtentSize( int size ) {
+
+        if ( size == Extent::maxSize() ) {
+            // no point doing quantizing for the entire file
+            return size;
+        }
+
+        verify( size <= Extent::maxSize() );
+
+        // make sizes align with VM page size
+        int newSize = (size + 0xfff) & 0xfffff000;
+
+        if ( newSize > Extent::maxSize() ) {
+            return Extent::maxSize();
+        }
+
+        if ( newSize < Extent::minSize() ) {
+            return Extent::minSize();
+        }
+
+        return newSize;
+    }
+
+    void _quotaExceeded() {
+        uasserted(12501, "quota exceeded");
+    }
+
+    DiskLoc ExtentManager::_createExtentInFile( int fileNo, DataFile* f,
+                                                int size, int maxFileNoForQuota ) {
+
+        size = ExtentManager::quantizeExtentSize( size );
+
+        if ( maxFileNoForQuota > 0 && fileNo - 1 >= maxFileNoForQuota ) {
+            if ( cc().hasWrittenThisPass() ) {
+                warning() << "quota exceeded, but can't assert" << endl;
+            }
+            else {
+                _quotaExceeded();
+            }
+        }
+
+        massert( 10358, "bad new extent size", size >= Extent::minSize() && size <= Extent::maxSize() );
+
+        DiskLoc loc = f->allocExtentArea( size );
+        loc.assertOk();
+
+        Extent *e = getExtent( loc, false );
+        verify( e );
+
+        getDur().writing(e)->init("", size, fileNo, loc.getOfs(), false);
+
+        return loc;
+    }
+
+
+    DiskLoc ExtentManager::createExtent( int size, int maxFileNoForQuota ) {
+        size = quantizeExtentSize( size );
+
+        if ( size > Extent::maxSize() )
+            size = Extent::maxSize();
+
+        verify( size < DataFile::maxSize() );
+
+        for ( int i = numFiles() - 1; i >= 0; i-- ) {
+            DataFile* f = getFile( i );
+            if ( f->getHeader()->unusedLength >= size ) {
+                return _createExtentInFile( i, f, size, maxFileNoForQuota );
+            }
+        }
+
+        if ( maxFileNoForQuota > 0 &&
+             static_cast<int>( numFiles() ) >= maxFileNoForQuota &&
+             !cc().hasWrittenThisPass() ) {
+            _quotaExceeded();
+        }
+
+
+        // no space in an existing file
+        // allocate files until we either get one big enough or hit maxSize
+        for ( int i = 0; i < 8; i++ ) {
+            DataFile* f = addAFile( size, false );
+
+            if ( f->getHeader()->unusedLength >= size ) {
+                return _createExtentInFile( numFiles() - 1, f, size, maxFileNoForQuota );
+            }
+
+        }
+
+        // callers don't check for null return code, so assert
+        msgasserted(14810, "couldn't allocate space for a new extent" );
+    }
+
+    void ExtentManager::init( NamespaceDetails* freeListDetails ) {
+        if ( !_freeListDetails ) {
+            _freeListDetails = freeListDetails;
+        }
+        else {
+            verify( _freeListDetails == freeListDetails );
+        }
+    }
+
+    DiskLoc ExtentManager::allocFromFreeList( int approxSize, bool capped ) {
+        if ( !_freeListDetails ) {
+            return DiskLoc();
+        }
+
+        // setup extent constraints
+
+        int low, high;
+        if ( capped ) {
+            // be strict about the size
+            low = approxSize;
+            if ( low > 2048 ) low -= 256;
+            high = (int) (approxSize * 1.05) + 256;
+        }
+        else {
+            low = (int) (approxSize * 0.8);
+            high = (int) (approxSize * 1.4);
+        }
+        if ( high <= 0 ) {
+            // overflowed
+            high = max(approxSize, Extent::maxSize());
+        }
+        if ( high <= Extent::minSize() ) {
+            // the minimum extent size is 4097
+            high = Extent::minSize() + 1;
+        }
+
+        // scan free list looking for something suitable
+
+        int n = 0;
+        Extent *best = 0;
+        int bestDiff = 0x7fffffff;
+        {
+            Timer t;
+            DiskLoc L = _freeListDetails->firstExtent();
+            while( !L.isNull() ) {
+                Extent * e = L.ext();
+                if ( e->length >= low && e->length <= high ) {
+                    int diff = abs(e->length - approxSize);
+                    if ( diff < bestDiff ) {
+                        bestDiff = diff;
+                        best = e;
+                        if ( ((double) diff) / approxSize < 0.1 ) {
+                            // close enough
+                            break;
+                        }
+                        if ( t.seconds() >= 2 ) {
+                            // have spent lots of time in write lock, and we are in [low,high], so close enough
+                            // could come into play if extent freelist is very long
+                            break;
+                        }
+                    }
+                    else {
+                        OCCASIONALLY {
+                            if ( high < 64 * 1024 && t.seconds() >= 2 ) {
+                                // be less picky if it is taking a long time
+                                high = 64 * 1024;
+                            }
+                        }
+                    }
+                }
+                L = e->xnext;
+                ++n;
+            }
+            if ( t.seconds() >= 10 ) {
+                log() << "warning: slow scan in allocFromFreeList (in write lock)" << endl;
+            }
+        }
+
+        if ( n > 128 ) { LOG( n < 512 ? 1 : 0 ) << "warning: newExtent " << n << " scanned\n"; }
+
+        if ( !best )
+            return DiskLoc();
+
+        // remove from the free list
+        if ( !best->xprev.isNull() )
+            getExtent( best->xprev )->xnext.writing() = best->xnext;
+        if ( !best->xnext.isNull() )
+            getExtent( best->xnext )->xprev.writing() = best->xprev;
+        if ( _freeListDetails->firstExtent() == best->myLoc )
+            _freeListDetails->setFirstExtent( best->xnext );
+        if ( _freeListDetails->lastExtent() == best->myLoc )
+            _freeListDetails->setLastExtent( best->xprev );
+
+        return best->myLoc;
+    }
+
+    void ExtentManager::freeExtents(DiskLoc firstExt, DiskLoc lastExt) {
+
+        if ( firstExt.isNull() && lastExt.isNull() )
+            return;
+
+        {
+            verify( !firstExt.isNull() && !lastExt.isNull() );
+            Extent *f = getExtent( firstExt );
+            Extent *l = getExtent( lastExt );
+            verify( f->xprev.isNull() );
+            verify( l->xnext.isNull() );
+            verify( f==l || !f->xnext.isNull() );
+            verify( f==l || !l->xprev.isNull() );
+        }
+
+        verify( _freeListDetails );
+
+        if( _freeListDetails->firstExtent().isNull() ) {
+            _freeListDetails->setFirstExtent( firstExt );
+            _freeListDetails->setLastExtent( lastExt );
+        }
+        else {
+            DiskLoc a = _freeListDetails->firstExtent();
+            verify( getExtent( a )->xprev.isNull() );
+            getDur().writingDiskLoc( getExtent( a )->xprev ) = lastExt;
+            getDur().writingDiskLoc( getExtent( lastExt )->xnext ) = a;
+            _freeListDetails->setFirstExtent( firstExt );
+        }
+
+    }
+
+
+    void ExtentManager::printFreeList() const {
+        log() << "dump freelist " << _dbname << endl;
+
+        if ( _freeListDetails == NULL ) {
+            log() << "  _freeListDetails is null" << endl;
+            return;
+        }
+
+        DiskLoc a = _freeListDetails->firstExtent();
+        while( !a.isNull() ) {
+            Extent *e = getExtent( a );
+            log() << "  extent " << a.toString()
+                  << " len:" << e->length
+                  << " prev:" << e->xprev.toString() << endl;
+            a = e->xnext;
+        }
+
+        log() << "end freelist" << endl;
     }
 
 

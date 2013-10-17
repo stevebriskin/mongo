@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 /*
@@ -60,7 +72,6 @@
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/client.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/dur.h"
@@ -68,6 +79,7 @@
 #include "mongo/db/dur_journal.h"
 #include "mongo/db/dur_recover.h"
 #include "mongo/db/dur_stats.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/server.h"
 #include "mongo/util/concurrency/race.h"
 #include "mongo/util/mongoutils/hash.h"
@@ -150,8 +162,8 @@ namespace mongo {
                              "writeToDataFiles" << (unsigned) (_writeToDataFilesMicros/1000) <<
                              "remapPrivateView" << (unsigned) (_remapPrivateViewMicros/1000)
                            );
-            if( cmdLine.journalCommitInterval != 0 )
-                b << "journalCommitIntervalMs" << cmdLine.journalCommitInterval;
+            if (storageGlobalParams.journalCommitInterval != 0)
+                b << "journalCommitIntervalMs" << storageGlobalParams.journalCommitInterval;
             return b.obj();
         }
 
@@ -338,7 +350,7 @@ namespace mongo {
             static int n;
             ++n;
 
-            verify(debug && cmdLine.dur);
+            verify(debug && storageGlobalParams.dur);
             if (commitJob.writes().empty())
                 return;
             const WriteIntent &i = commitJob.lastWrite();
@@ -437,7 +449,7 @@ namespace mongo {
         /** (SLOW) diagnostic to check that the private view and the non-private view are in sync.
         */
         void debugValidateAllMapsMatch() {
-            if( ! (cmdLine.durOptions & CmdLine::DurParanoid) )
+            if (!(storageGlobalParams.durOptions & StorageGlobalParams::DurParanoid))
                 return;
 
             unsigned long long bytes = 0;
@@ -466,7 +478,7 @@ namespace mongo {
             // remapping.
             unsigned long long now = curTimeMicros64();
             double fraction = (now-lastRemap)/2000000.0;
-            if( cmdLine.durOptions & CmdLine::DurAlwaysRemap )
+            if (storageGlobalParams.durOptions & StorageGlobalParams::DurAlwaysRemap)
                 fraction = 1;
             lastRemap = now;
 
@@ -734,7 +746,9 @@ namespace mongo {
 
             const int N = 10;
             static int n;
-            if( privateMapBytes < UncommittedBytesLimit && ++n % N && (cmdLine.durOptions&CmdLine::DurAlwaysRemap)==0 ) {
+            if (privateMapBytes < UncommittedBytesLimit && ++n % N &&
+                (storageGlobalParams.durOptions &
+                 StorageGlobalParams::DurAlwaysRemap) == 0) {
                 // limited locks version doesn't do any remapprivateview at all, so only try this if privateMapBytes
                 // is in an acceptable range.  also every Nth commit, we do everything so we can do some remapping;
                 // remapping a lot all at once could cause jitter from a large amount of copy-on-writes all at once.
@@ -755,7 +769,7 @@ namespace mongo {
             views disappear
         */
         void closingFileNotification() {
-            if (!cmdLine.dur)
+            if (!storageGlobalParams.dur)
                 return;
 
             if( Lock::isLocked() ) {
@@ -777,7 +791,8 @@ namespace mongo {
 
             bool samePartition = true;
             try {
-                const string dbpathDir = boost::filesystem::path(dbpath).string();
+                const std::string dbpathDir =
+                    boost::filesystem::path(storageGlobalParams.dbpath).string();
                 samePartition = onSamePartition(getJournalDir().string(), dbpathDir);
             }
             catch(...) {
@@ -786,7 +801,7 @@ namespace mongo {
             while( !inShutdown() ) {
                 RACECHECK
 
-                unsigned ms = cmdLine.journalCommitInterval;
+                unsigned ms = storageGlobalParams.journalCommitInterval;
                 if( ms == 0 ) { 
                     // use default
                     ms = samePartition ? 100 : 30;
@@ -829,17 +844,17 @@ namespace mongo {
 
         /** at startup, recover, and then start the journal threads */
         void startup() {
-            if( !cmdLine.dur )
+            if (!storageGlobalParams.dur)
                 return;
 
 #if defined(_DURABLEDEFAULTON)
             DEV { 
                 if( time(0) & 1 ) {
-                    cmdLine.durOptions |= CmdLine::DurAlwaysCommit;
+                    storageGlobalParams.durOptions |= StorageGlobalParams::DurAlwaysCommit;
                     log() << "_DEBUG _DURABLEDEFAULTON : forcing DurAlwaysCommit mode for this run" << endl;
                 }
                 if( time(0) & 2 ) {
-                    cmdLine.durOptions |= CmdLine::DurAlwaysRemap;
+                    storageGlobalParams.durOptions |= StorageGlobalParams::DurAlwaysRemap;
                     log() << "_DEBUG _DURABLEDEFAULTON : forcing DurAlwaysRemap mode for this run" << endl;
                 }
             }
@@ -892,7 +907,7 @@ namespace mongo {
             virtual bool includeByDefault() const { return true; }
             
             BSONObj generateSection(const BSONElement& configElement) const {
-                if ( ! cmdLine.dur )
+                if (!storageGlobalParams.dur)
                     return BSONObj();
                 return dur::stats.asObj();
             }

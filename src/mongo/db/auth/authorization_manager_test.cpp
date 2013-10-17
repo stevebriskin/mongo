@@ -18,6 +18,7 @@
  */
 
 #include "mongo/base/status.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authz_session_external_state_mock.h"
@@ -35,616 +36,267 @@
 namespace mongo {
 namespace {
 
+    TEST(RoleParsingTest, BuildRoleBSON) {
+        RoleGraph graph;
+        RoleName roleA("roleA", "dbA");
+        RoleName roleB("roleB", "dbB");
+        RoleName roleC("roleC", "dbC");
+        ActionSet actions;
+        actions.addAction(ActionType::find);
+        actions.addAction(ActionType::insert);
+
+        ASSERT_OK(graph.createRole(roleA));
+        ASSERT_OK(graph.createRole(roleB));
+        ASSERT_OK(graph.createRole(roleC));
+
+        ASSERT_OK(graph.addRoleToRole(roleA, roleC));
+        ASSERT_OK(graph.addRoleToRole(roleA, roleB));
+        ASSERT_OK(graph.addRoleToRole(roleB, roleC));
+
+        ASSERT_OK(graph.addPrivilegeToRole(
+                roleA, Privilege(ResourcePattern::forAnyNormalResource(), actions)));
+        ASSERT_OK(graph.addPrivilegeToRole(
+                roleB, Privilege(ResourcePattern::forExactNamespace(NamespaceString("dbB.foo")),
+                                 actions)));
+        ASSERT_OK(graph.addPrivilegeToRole(
+                roleC, Privilege(ResourcePattern::forClusterResource(), actions)));
+        ASSERT_OK(graph.recomputePrivilegeData());
+
+
+        // Role A
+        mutablebson::Document doc;
+        ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleA, doc.root()));
+        BSONObj roleDoc = doc.getObject();
+
+        ASSERT_EQUALS("dbA.roleA", roleDoc["_id"].String());
+        ASSERT_EQUALS("roleA", roleDoc["role"].String());
+        ASSERT_EQUALS("dbA", roleDoc["db"].String());
+
+        vector<BSONElement> privs = roleDoc["privileges"].Array();
+        ASSERT_EQUALS(1U, privs.size());
+        ASSERT_EQUALS("", privs[0].Obj()["resource"].Obj()["db"].String());
+        ASSERT_EQUALS("", privs[0].Obj()["resource"].Obj()["collection"].String());
+        ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].eoo());
+        vector<BSONElement> actionElements = privs[0].Obj()["actions"].Array();
+        ASSERT_EQUALS(2U, actionElements.size());
+        ASSERT_EQUALS("find", actionElements[0].String());
+        ASSERT_EQUALS("insert", actionElements[1].String());
+
+        vector<BSONElement> roles = roleDoc["roles"].Array();
+        ASSERT_EQUALS(2U, roles.size());
+        ASSERT_EQUALS("roleC", roles[0].Obj()["role"].String());
+        ASSERT_EQUALS("dbC", roles[0].Obj()["db"].String());
+        ASSERT_EQUALS("roleB", roles[1].Obj()["role"].String());
+        ASSERT_EQUALS("dbB", roles[1].Obj()["db"].String());
+
+        // Role B
+        doc.reset();
+        ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleB, doc.root()));
+        roleDoc = doc.getObject();
+
+        ASSERT_EQUALS("dbB.roleB", roleDoc["_id"].String());
+        ASSERT_EQUALS("roleB", roleDoc["role"].String());
+        ASSERT_EQUALS("dbB", roleDoc["db"].String());
+
+        privs = roleDoc["privileges"].Array();
+        ASSERT_EQUALS(1U, privs.size());
+        ASSERT_EQUALS("dbB", privs[0].Obj()["resource"].Obj()["db"].String());
+        ASSERT_EQUALS("foo", privs[0].Obj()["resource"].Obj()["collection"].String());
+        ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].eoo());
+        actionElements = privs[0].Obj()["actions"].Array();
+        ASSERT_EQUALS(2U, actionElements.size());
+        ASSERT_EQUALS("find", actionElements[0].String());
+        ASSERT_EQUALS("insert", actionElements[1].String());
+
+        roles = roleDoc["roles"].Array();
+        ASSERT_EQUALS(1U, roles.size());
+        ASSERT_EQUALS("roleC", roles[0].Obj()["role"].String());
+        ASSERT_EQUALS("dbC", roles[0].Obj()["db"].String());
+
+        // Role C
+        doc.reset();
+        ASSERT_OK(AuthorizationManager::getBSONForRole(&graph, roleC, doc.root()));
+        roleDoc = doc.getObject();
+
+        ASSERT_EQUALS("dbC.roleC", roleDoc["_id"].String());
+        ASSERT_EQUALS("roleC", roleDoc["role"].String());
+        ASSERT_EQUALS("dbC", roleDoc["db"].String());
+
+        privs = roleDoc["privileges"].Array();
+        ASSERT_EQUALS(1U, privs.size());
+        ASSERT(privs[0].Obj()["resource"].Obj()["cluster"].Bool());
+        ASSERT(privs[0].Obj()["resource"].Obj()["db"].eoo());
+        ASSERT(privs[0].Obj()["resource"].Obj()["collection"].eoo());
+        actionElements = privs[0].Obj()["actions"].Array();
+        ASSERT_EQUALS(2U, actionElements.size());
+        ASSERT_EQUALS("find", actionElements[0].String());
+        ASSERT_EQUALS("insert", actionElements[1].String());
+
+        roles = roleDoc["roles"].Array();
+        ASSERT_EQUALS(0U, roles.size());
+    }
+
     class AuthorizationManagerTest : public ::mongo::unittest::Test {
     public:
-        scoped_ptr<AuthorizationManager> authzManager;
-        AuthzManagerExternalStateMock* externalState;
+        virtual ~AuthorizationManagerTest() {
+            authzManager->invalidateUserCache();
+        }
+
         void setUp() {
             externalState = new AuthzManagerExternalStateMock();
             authzManager.reset(new AuthorizationManager(externalState));
+            authzManager->setAuthEnabled(true);
+            // This duplicates the behavior from the server that adds the internal user at process
+            // startup via a MONGO_INITIALIZER
+            authzManager->addInternalUser(internalSecurity.user);
         }
+
+        scoped_ptr<AuthorizationManager> authzManager;
+        AuthzManagerExternalStateMock* externalState;
     };
 
-    TEST_F(AuthorizationManagerTest, GetPrivilegesFromPrivilegeDocumentCompatible) {
-        UserName user("Spencer", "test");
-        BSONObj invalid;
-        BSONObj readWrite = BSON("user" << "Spencer" << "pwd" << "passwordHash");
-        BSONObj readOnly = BSON("user" << "Spencer" << "pwd" << "passwordHash" <<
-                                "readOnly" << true);
+    TEST_F(AuthorizationManagerTest, testAcquireV0User) {
+        return;  // TODO Reenable as part of SERVER-9516
+        authzManager->setAuthorizationVersion(1);
 
-        PrivilegeSet privilegeSet;
-        ASSERT_EQUALS(ErrorCodes::UnsupportedFormat,
-                      authzManager->buildPrivilegeSet("test",
-                                                      user,
-                                                      invalid,
-                                                      &privilegeSet).code());
+        ASSERT_OK(externalState->insert(NamespaceString("test.system.users"),
+                                        BSON("user" << "v0RW" << "pwd" << "password"),
+                                        BSONObj()));
+        ASSERT_OK(externalState->insert(NamespaceString("admin.system.users"),
+                                        BSON("user" << "v0AdminRO" <<
+                                             "pwd" << "password" <<
+                                             "readOnly" << true),
+                                        BSONObj()));
 
-        ASSERT_OK(authzManager->buildPrivilegeSet("test",
-                                                  user,
-                                                  readOnly,
-                                                  &privilegeSet));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::insert)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-
-        ASSERT_OK(authzManager->buildPrivilegeSet("test",
-                                                  user,
-                                                  readWrite,
-                                                  &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::insert)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::userAdmin)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::compact)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::shutdown)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::addShard)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("*", ActionType::find)));
-
-        ASSERT_OK(authzManager->buildPrivilegeSet("admin",
-                                                  user,
-                                                  readOnly,
-                                                  &privilegeSet));
-        // Should grant privileges on *.
-        ASSERT(privilegeSet.hasPrivilege(Privilege("*", ActionType::find)));
-
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::insert)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("*", ActionType::insert)));
-
-        ASSERT_OK(authzManager->buildPrivilegeSet("admin",
-                                                  user,
-                                                  readWrite,
-                                                  &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("*", ActionType::insert)));
-    }
-
-    class PrivilegeDocumentParsing : public AuthorizationManagerTest {
-    public:
-        PrivilegeDocumentParsing() : user("spencer", "test") {}
-
-        UserName user;
-        PrivilegeSet privilegeSet;
-    };
-
-    TEST_F(PrivilegeDocumentParsing, VerifyRolesFieldMustBeAnArray) {
-        ASSERT_NOT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << "read"),
-                              &privilegeSet));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyInvalidRoleGrantsNoPrivileges) {
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("frim")),
-                              &privilegeSet));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyInvalidRoleStillAllowsOtherRoles) {
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read" << "frim")),
-                              &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyCannotGrantClusterAdminRoleFromNonAdminDatabase) {
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read" << "clusterAdmin")),
-                              &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::shutdown)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::dropDatabase)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyCannotGrantClusterReadFromNonAdminDatabase) {
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read" << "readAnyDatabase")),
-                              &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::find)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyCannotGrantClusterReadWriteFromNonAdminDatabase) {
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read" << "readWriteAnyDatabase")),
-                              &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::insert)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::insert)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyCannotGrantClusterUserAdminFromNonAdminDatabase) {
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read" << "userAdminAnyDatabase")),
-                              &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::userAdmin)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::userAdmin)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyCannotGrantClusterDBAdminFromNonAdminDatabase) {
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read" << "dbAdminAnyDatabase")),
-                              &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::clean)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::clean)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyOtherDBRolesMustBeAnObjectOfArraysOfStrings) {
-        ASSERT_NOT_OK(authzManager->buildPrivilegeSet(
-                              "admin",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read") <<
-                                   "otherDBRoles" << BSON_ARRAY("read")),
-                              &privilegeSet));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::find)));
-
-        ASSERT_NOT_OK(authzManager->buildPrivilegeSet(
-                              "admin",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read") <<
-                                   "otherDBRoles" << BSON("test2" << "read")),
-                              &privilegeSet));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::find)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, VerifyCannotGrantPrivilegesOnOtherDatabasesNormally) {
-        // Cannot grant privileges on other databases, except from admin database.
-        ASSERT_NOT_OK(authzManager->buildPrivilegeSet(
-                              "test",
-                              user,
-                              BSON("user" << "spencer" << "pwd" << "" <<
-                                   "roles" << BSON_ARRAY("read") <<
-                                   "otherDBRoles" << BSON("test2" << BSON_ARRAY("read"))),
-                              &privilegeSet));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::find)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, SuccessfulSimpleReadGrant) {
-        // Grant read on test.
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                          "test",
-                          user,
-                          BSON("user" << "spencer" << "pwd" << "" << "roles" << BSON_ARRAY("read")),
-                          &privilegeSet));
-
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::find)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, SuccessfulSimpleUserAdminTest) {
-        // Grant userAdmin on "test" database.
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                          "test",
-                          user,
-                          BSON("user" << "spencer" << "pwd" << "" <<
-                               "roles" << BSON_ARRAY("userAdmin")),
-                          &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::userAdmin)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::userAdmin)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::userAdmin)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, GrantUserAdminOnAdmin) {
-        // Grant userAdmin on admin.
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                          "admin",
-                          user,
-                          BSON("user" << "spencer" << "pwd" << "" <<
-                               "roles" << BSON_ARRAY("userAdmin")),
-                          &privilegeSet));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::userAdmin)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::userAdmin)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("admin", ActionType::userAdmin)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, GrantUserAdminOnTestViaAdmin) {
-        // Grant userAdmin on test via admin.
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                          "admin",
-                          user,
-                          BSON("user" << "spencer" << "pwd" << "" <<
-                               "roles" << BSONArrayBuilder().arr() <<
-                               "otherDBRoles" << BSON("test" << BSON_ARRAY("userAdmin"))),
-                          &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::userAdmin)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::userAdmin)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::userAdmin)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, SuccessfulClusterAdminTest) {
-        // Grant userAdminAnyDatabase.
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                          "admin",
-                          user,
-                          BSON("user" << "spencer" << "pwd" << "" <<
-                               "roles" << BSON_ARRAY("userAdminAnyDatabase")),
-                          &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::userAdmin)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test2", ActionType::userAdmin)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("admin", ActionType::userAdmin)));
-    }
-
-
-    TEST_F(PrivilegeDocumentParsing, GrantClusterReadWrite) {
-        // Grant readWrite on everything via the admin database.
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                          "admin",
-                          user,
-                          BSON("user" << "spencer" << "pwd" << "" <<
-                               "roles" << BSON_ARRAY("readWriteAnyDatabase")),
-                          &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test2", ActionType::find)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("admin", ActionType::find)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::insert)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test2", ActionType::insert)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("admin", ActionType::insert)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, ProhibitGrantOnWildcard) {
-        // Cannot grant readWrite to everythign using "otherDBRoles".
-        ASSERT_NOT_OK(authzManager->buildPrivilegeSet(
-                          "admin",
-                          user,
-                          BSON("user" << "spencer" << "pwd" << "" <<
-                               "roles" << BSONArrayBuilder().arr() <<
-                               "otherDBRoles" << BSON("*" << BSON_ARRAY("readWrite"))),
-                          &privilegeSet));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::find)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test", ActionType::insert)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("test2", ActionType::insert)));
-        ASSERT(!privilegeSet.hasPrivilege(Privilege("admin", ActionType::insert)));
-    }
-
-    TEST_F(PrivilegeDocumentParsing, GrantClusterAdmin) {
-        // Grant cluster admin
-        ASSERT_OK(authzManager->buildPrivilegeSet(
-                          "admin",
-                          user,
-                          BSON("user" << "spencer" << "pwd" << "" <<
-                               "roles" << BSON_ARRAY("clusterAdmin")),
-                          &privilegeSet));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test", ActionType::dropDatabase)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("test2", ActionType::dropDatabase)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("admin", ActionType::dropDatabase)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("$SERVER", ActionType::shutdown)));
-        ASSERT(privilegeSet.hasPrivilege(Privilege("$CLUSTER", ActionType::moveChunk)));
-    }
-
-    TEST_F(AuthorizationManagerTest, GetPrivilegesFromPrivilegeDocumentInvalid) {
-        BSONObj oldAndNewMixed = BSON("user" << "spencer" <<
-                                      "pwd" << "passwordHash" <<
-                                      "readOnly" << false <<
-                                      "roles" << BSON_ARRAY("write" << "userAdmin"));
-
-        UserName user("spencer", "anydb");
-        PrivilegeSet result;
-        ASSERT_NOT_OK(authzManager->buildPrivilegeSet("anydb", user, oldAndNewMixed, &result));
-    }
-
-    TEST_F(AuthorizationManagerTest, DocumentValidationCompatibility) {
-
-        // Good documents, with and without "readOnly" fields.
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << "andy" << "pwd" << "a")));
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << "andy" << "pwd" << "a" << "readOnly" << 1)));
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << "andy" << "pwd" << "a" << "readOnly" << false)));
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << "andy" << "pwd" << "a" << "readOnly" << "yes")));
-
-        // Must have a "pwd" field.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << "andy")));
-
-        // "pwd" field must be a string.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << "andy" << "pwd" << 100)));
-
-        // "pwd" field string must not be empty.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << "andy" << "pwd" << "")));
-
-        // Must have a "user" field.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("pwd" << "a")));
-
-        // "user" field must be a string.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << 100 << "pwd" << "a")));
-
-        // "user" field string must not be empty.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument(
-                "test", BSON("user" << "" << "pwd" << "a")));
-    }
-
-
-    class CompatibilityModeDisabler {
-    public:
-        CompatibilityModeDisabler() {
-            AuthorizationManager::setSupportOldStylePrivilegeDocuments(false);
-        }
-        ~CompatibilityModeDisabler() {
-            AuthorizationManager::setSupportOldStylePrivilegeDocuments(true);
-        }
-    };
-
-    TEST_F(AuthorizationManagerTest, DisableCompatibilityMode) {
-        CompatibilityModeDisabler disabler;
-
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a")));
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" << "readOnly" << 1)));
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" << "readOnly" << false)));
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" << "readOnly" << "yes")));
-
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" <<
-                     "roles" << BSON_ARRAY("dbAdmin" << "read"))));
-    }
-
-    TEST_F(AuthorizationManagerTest, DocumentValidationExtended) {
-        // Document describing new-style user on "test".
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" << "roles" << BSON_ARRAY("read"))));
-
-        // Document giving roles on "test" to a user from "test2".
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "userSource" << "test2" <<
-                     "roles" << BSON_ARRAY("read"))));
-
-        // Cannot have "userSource" field value == dbname.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "userSource" << "test" <<
-                     "roles" << BSON_ARRAY("read"))));
-
-        // Cannot have both "userSource" and "pwd"
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "userSource" << "test2" << "pwd" << "a" <<
-                     "roles" << BSON_ARRAY("read"))));
-
-        // Cannot have an otherDBRoles field except in the admin database.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                            BSON("user" << "andy" << "userSource" << "test2" <<
-                                 "roles" << BSON_ARRAY("read") <<
-                                 "otherDBRoles" << BSON("test2" << BSON_ARRAY("readWrite")))));
-
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument("admin",
-                        BSON("user" << "andy" << "userSource" << "test2" <<
-                             "roles" << BSON_ARRAY("read") <<
-                             "otherDBRoles" << BSON("test2" << BSON_ARRAY("readWrite")))));
-
-        // Must have "roles" to have "otherDBRoles".
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("admin",
-                            BSON("user" << "andy" << "pwd" << "a" <<
-                                 "otherDBRoles" << BSON("test2" << BSON_ARRAY("readWrite")))));
-
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument("admin",
-                        BSON("user" << "andy" << "pwd" << "a" <<
-                             "roles" << BSONArrayBuilder().arr() <<
-                             "otherDBRoles" << BSON("test2" << BSON_ARRAY("readWrite")))));
-
-        // "otherDBRoles" may be empty.
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument("admin",
-                        BSON("user" << "andy" << "pwd" << "a" <<
-                             "roles" << BSONArrayBuilder().arr() <<
-                             "otherDBRoles" << BSONObjBuilder().obj())));
-
-        // Cannot omit "roles" if "userSource" is present.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "userSource" << "test2")));
-
-        // Cannot have both "roles" and "readOnly".
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" << "readOnly" << 1 <<
-                     "roles" << BSON_ARRAY("read"))));
-
-        // Roles must be strings, not empty.
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" <<
-                     "roles" << BSON_ARRAY("read" << ""))));
-
-        ASSERT_NOT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" <<
-                     "roles" << BSON_ARRAY(1 << "read"))));
-
-        // Multiple roles OK.
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" <<
-                     "roles" << BSON_ARRAY("dbAdmin" << "read"))));
-
-        // Empty roles list OK.
-        ASSERT_OK(authzManager->checkValidPrivilegeDocument("test",
-                BSON("user" << "andy" << "pwd" << "a" <<
-                     "roles" << BSONArrayBuilder().arr())));
-    }
-
-    TEST_F(AuthorizationManagerTest, testAquireV0User) {
-        externalState->insertPrivilegeDocument("test",
-                                               BSON("user" << "v0RW" <<
-                                                    "pwd" << "password"));
-        externalState->insertPrivilegeDocument("admin",
-                                               BSON("user" << "v0AdminRO" <<
-                                                    "pwd" << "password" <<
-                                                    "readOnly" << true));
-
+        ASSERT_OK(authzManager->initialize());
         User* v0RW;
         ASSERT_OK(authzManager->acquireUser(UserName("v0RW", "test"), &v0RW));
-        ASSERT(UserName("v0RW", "test") == v0RW->getName());
+        ASSERT_EQUALS(UserName("v0RW", "test"), v0RW->getName());
         ASSERT(v0RW->isValid());
-        ASSERT_EQUALS((uint32_t)1, v0RW->getRefCount());
-        RoleNameIterator it = v0RW->getRoles();
-        ASSERT(it.more());
-        RoleName roleName = it.next();
-        ASSERT_EQUALS("test", roleName.getDB());
-        ASSERT_EQUALS("oldReadWrite", roleName.getRole());
-        ASSERT_FALSE(it.more());
-        ActionSet actions = v0RW->getActionsForResource("test");
-        ASSERT(actions.contains(ActionType::find));
-        ASSERT(actions.contains(ActionType::insert));
-        ASSERT_FALSE(actions.contains(ActionType::shutdown));
-        actions = v0RW->getActionsForResource("test2");
-        ASSERT(actions.empty());
-        actions = v0RW->getActionsForResource("admin");
-        ASSERT(actions.empty());
+        ASSERT_EQUALS(1U, v0RW->getRefCount());
+        const User::RoleDataMap& roles = v0RW->getRoles();
+        ASSERT_EQUALS(1U, roles.size());
+        User::RoleData role = roles.begin()->second;
+        ASSERT_EQUALS(RoleName("dbOwner", "test"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(v0RW);
 
         User* v0AdminRO;
         ASSERT_OK(authzManager->acquireUser(UserName("v0AdminRO", "admin"), &v0AdminRO));
         ASSERT(UserName("v0AdminRO", "admin") == v0AdminRO->getName());
         ASSERT(v0AdminRO->isValid());
         ASSERT_EQUALS((uint32_t)1, v0AdminRO->getRefCount());
-        it = v0AdminRO->getRoles();
-        ASSERT(it.more());
-        roleName = it.next();
-        ASSERT_EQUALS("admin", roleName.getDB());
-        ASSERT_EQUALS("oldAdminRead", roleName.getRole());
-        ASSERT_FALSE(it.more());
-        actions = v0AdminRO->getActionsForResource("*");
-        ASSERT(actions.contains(ActionType::find));
-        ASSERT(actions.contains(ActionType::listDatabases));
-        ASSERT_FALSE(actions.contains(ActionType::insert));
-        ASSERT_FALSE(actions.contains(ActionType::dropDatabase));
+        const User::RoleDataMap& adminRoles = v0AdminRO->getRoles();
+        ASSERT_EQUALS(1U, adminRoles.size());
+        role = adminRoles.begin()->second;
+        ASSERT_EQUALS(RoleName("readAnyDatabase", "admin"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(v0AdminRO);
     }
 
-    TEST_F(AuthorizationManagerTest, testAquireV1User) {
-        externalState->insertPrivilegeDocument("test",
-                                               BSON("user" << "v1read" <<
-                                                    "pwd" << "password" <<
-                                                    "roles" << BSON_ARRAY("read")));
-        externalState->insertPrivilegeDocument("admin",
-                                               BSON("user" << "v1cluster" <<
-                                                    "pwd" << "password" <<
-                                                    "roles" << BSON_ARRAY("clusterAdmin")));
+    TEST_F(AuthorizationManagerTest, testAcquireV1User) {
+        return;  // TODO Reenable as part of SERVER-9516
+        authzManager->setAuthorizationVersion(1);
+
+        ASSERT_OK(externalState->insert(NamespaceString("test.system.users"),
+                                        BSON("user" << "v1read" <<
+                                             "pwd" << "password" <<
+                                             "roles" << BSON_ARRAY("read")),
+                                        BSONObj()));
+        ASSERT_OK(externalState->insert(NamespaceString("admin.system.users"),
+                                        BSON("user" << "v1cluster" <<
+                                             "pwd" << "password" <<
+                                             "roles" << BSON_ARRAY("clusterAdmin")),
+                                        BSONObj()));
 
         User* v1read;
         ASSERT_OK(authzManager->acquireUser(UserName("v1read", "test"), &v1read));
-        ASSERT(UserName("v1read", "test") == v1read->getName());
+        ASSERT_EQUALS(UserName("v1read", "test"), v1read->getName());
         ASSERT(v1read->isValid());
         ASSERT_EQUALS((uint32_t)1, v1read->getRefCount());
-        RoleNameIterator it = v1read->getRoles();
-        ASSERT(it.more());
-        RoleName roleName = it.next();
-        ASSERT_EQUALS("test", roleName.getDB());
-        ASSERT_EQUALS("read", roleName.getRole());
-        ASSERT_FALSE(it.more());
-        ActionSet actions = v1read->getActionsForResource("test");
-        ASSERT(actions.contains(ActionType::find));
-        ASSERT_FALSE(actions.contains(ActionType::insert));
-        actions = v1read->getActionsForResource("test2");
-        ASSERT(actions.empty());
-        actions = v1read->getActionsForResource("admin");
-        ASSERT(actions.empty());
+
+        const User::RoleDataMap& roles = v1read->getRoles();
+        ASSERT_EQUALS(1U, roles.size());
+        User::RoleData role = roles.begin()->second;
+        ASSERT_EQUALS(RoleName("read", "test"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(v1read);
 
         User* v1cluster;
         ASSERT_OK(authzManager->acquireUser(UserName("v1cluster", "admin"), &v1cluster));
-        ASSERT(UserName("v1cluster", "admin") == v1cluster->getName());
+        ASSERT_EQUALS(UserName("v1cluster", "admin"), v1cluster->getName());
         ASSERT(v1cluster->isValid());
         ASSERT_EQUALS((uint32_t)1, v1cluster->getRefCount());
-        it = v1cluster->getRoles();
-        ASSERT(it.more());
-        roleName = it.next();
-        ASSERT_EQUALS("admin", roleName.getDB());
-        ASSERT_EQUALS("clusterAdmin", roleName.getRole());
-        ASSERT_FALSE(it.more());
-        actions = v1cluster->getActionsForResource("*");
-        ASSERT(actions.contains(ActionType::listDatabases));
-        ASSERT(actions.contains(ActionType::dropDatabase));
-        ASSERT_FALSE(actions.contains(ActionType::find));
+        const User::RoleDataMap& clusterRoles = v1cluster->getRoles();
+        ASSERT_EQUALS(1U, clusterRoles.size());
+        role = clusterRoles.begin()->second;
+        ASSERT_EQUALS(RoleName("clusterAdmin", "admin"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(v1cluster);
     }
 
-    TEST_F(AuthorizationManagerTest, initilizeAllV1UserData) {
-        externalState->insertPrivilegeDocument("test",
-                                               BSON("user" << "readOnly" <<
-                                                    "pwd" << "password" <<
-                                                    "roles" << BSON_ARRAY("read")));
-        externalState->insertPrivilegeDocument("admin",
-                                               BSON("user" << "clusterAdmin" <<
-                                                    "userSource" << "$external" <<
-                                                    "roles" << BSON_ARRAY("clusterAdmin")));
-        externalState->insertPrivilegeDocument("test",
-                                               BSON("user" << "readWriteMultiDB" <<
-                                                    "pwd" << "password" <<
-                                                    "roles" << BSON_ARRAY("readWrite")));
-        externalState->insertPrivilegeDocument("test2",
-                                               BSON("user" << "readWriteMultiDB" <<
-                                                    "userSource" << "test" <<
-                                                    "roles" << BSON_ARRAY("readWrite")));
+    TEST_F(AuthorizationManagerTest, initializeAllV1UserData) {
+        authzManager->setAuthorizationVersion(1);
 
-        Status status = authzManager->initilizeAllV1UserData();
+        ASSERT_OK(externalState->insert(NamespaceString("test.system.users"),
+                                        BSON("user" << "readOnly" <<
+                                             "pwd" << "password" <<
+                                             "roles" << BSON_ARRAY("read")),
+                                        BSONObj()));
+        ASSERT_OK(externalState->insert(NamespaceString("admin.system.users"),
+                                        BSON("user" << "clusterAdmin" <<
+                                             "userSource" << "$external" <<
+                                             "roles" << BSON_ARRAY("clusterAdmin")),
+                                        BSONObj()));
+        ASSERT_OK(externalState->insert(NamespaceString("test.system.users"),
+                                        BSON("user" << "readWriteMultiDB" <<
+                                             "pwd" << "password" <<
+                                             "roles" << BSON_ARRAY("readWrite")),
+                                        BSONObj()));
+        ASSERT_OK(externalState->insert(NamespaceString("test2.system.users"),
+                                        BSON("user" << "readWriteMultiDB" <<
+                                             "userSource" << "test" <<
+                                             "roles" << BSON_ARRAY("readWrite")),
+                                        BSONObj()));
+
+        Status status = authzManager->initialize();
         ASSERT_OK(status);
 
         User* readOnly;
         ASSERT_OK(authzManager->acquireUser(UserName("readOnly", "test"), &readOnly));
-        ASSERT(UserName("readOnly", "test") == readOnly->getName());
+        ASSERT_EQUALS(UserName("readOnly", "test"), readOnly->getName());
         ASSERT(readOnly->isValid());
         ASSERT_EQUALS((uint32_t)2, readOnly->getRefCount());
-        RoleNameIterator it = readOnly->getRoles();
-        ASSERT(it.more());
-        RoleName roleName = it.next();
-        ASSERT_EQUALS("test", roleName.getDB());
-        ASSERT_EQUALS("read", roleName.getRole());
-        ASSERT_FALSE(it.more());
-        ActionSet actions = readOnly->getActionsForResource("test");
-        ASSERT(actions.contains(ActionType::find));
-        ASSERT_FALSE(actions.contains(ActionType::insert));
-        actions = readOnly->getActionsForResource("test2");
-        ASSERT(actions.empty());
-        actions = readOnly->getActionsForResource("admin");
-        ASSERT(actions.empty());
+        const User::RoleDataMap& roles = readOnly->getRoles();
+        ASSERT_EQUALS(1U, roles.size());
+        User::RoleData role = roles.begin()->second;
+        ASSERT_EQUALS(RoleName("read", "test"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(readOnly);
 
         User* clusterAdmin;
         ASSERT_OK(authzManager->acquireUser(UserName("clusterAdmin", "$external"), &clusterAdmin));
-        ASSERT(UserName("clusterAdmin", "$external") == clusterAdmin->getName());
+        ASSERT_EQUALS(UserName("clusterAdmin", "$external"), clusterAdmin->getName());
         ASSERT(clusterAdmin->isValid());
         ASSERT_EQUALS((uint32_t)2, clusterAdmin->getRefCount());
-        it = clusterAdmin->getRoles();
-        ASSERT(it.more());
-        roleName = it.next();
-        ASSERT_EQUALS("admin", roleName.getDB());
-        ASSERT_EQUALS("clusterAdmin", roleName.getRole());
-        ASSERT_FALSE(it.more());
-        actions = clusterAdmin->getActionsForResource("*");
-        ASSERT(actions.contains(ActionType::listDatabases));
-        ASSERT(actions.contains(ActionType::dropDatabase));
-        ASSERT_FALSE(actions.contains(ActionType::find));
+        const User::RoleDataMap& clusterRoles = clusterAdmin->getRoles();
+        ASSERT_EQUALS(1U, clusterRoles.size());
+        role = clusterRoles.begin()->second;
+        ASSERT_EQUALS(RoleName("clusterAdmin", "admin"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(clusterAdmin);
 
         User* multiDB;
         status = authzManager->acquireUser(UserName("readWriteMultiDB", "test2"), &multiDB);
@@ -652,39 +304,226 @@ namespace {
         ASSERT(status.code() == ErrorCodes::UserNotFound);
 
         ASSERT_OK(authzManager->acquireUser(UserName("readWriteMultiDB", "test"), &multiDB));
-        ASSERT(UserName("readWriteMultiDB", "test") == multiDB->getName());
+        ASSERT_EQUALS(UserName("readWriteMultiDB", "test"), multiDB->getName());
         ASSERT(multiDB->isValid());
         ASSERT_EQUALS((uint32_t)2, multiDB->getRefCount());
-        it = multiDB->getRoles();
 
-        bool hasRoleOnTest = false;
-        bool hasRoleOnTest2 = false;
-        int numRoles = 0;
-        while(it.more()) {
-            ++numRoles;
-            RoleName roleName = it.next();
-            ASSERT_EQUALS("readWrite", roleName.getRole());
-            if (roleName.getDB() == "test") {
-                hasRoleOnTest = true;
-            } else {
-                ASSERT_EQUALS("test2", roleName.getDB());
-                hasRoleOnTest2 = true;
-            }
-        }
-        ASSERT_EQUALS(2, numRoles);
-        ASSERT(hasRoleOnTest);
-        ASSERT(hasRoleOnTest2);
+        const User::RoleDataMap& multiDBRoles = multiDB->getRoles();
+        ASSERT_EQUALS(2U, multiDBRoles.size());
+        role = mapFindWithDefault(multiDBRoles, RoleName("readWrite", "test"), User::RoleData());
+        ASSERT_EQUALS(RoleName("readWrite", "test"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
+        role = mapFindWithDefault(multiDBRoles, RoleName("readWrite", "test2"), User::RoleData());
+        ASSERT_EQUALS(RoleName("readWrite", "test2"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
 
-        actions = multiDB->getActionsForResource("test");
-        ASSERT(actions.contains(ActionType::find));
-        ASSERT(actions.contains(ActionType::insert));
-        ASSERT_FALSE(actions.contains(ActionType::shutdown));
-        actions = multiDB->getActionsForResource("test2");
-        ASSERT(actions.contains(ActionType::find));
-        ASSERT(actions.contains(ActionType::insert));
-        ASSERT_FALSE(actions.contains(ActionType::shutdown));
-        actions = multiDB->getActionsForResource("admin");
-        ASSERT(actions.empty());
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(multiDB);
+
+
+        // initializeAllV1UserData() pins the users by adding 1 to their refCount, so need to
+        // release each user an extra time to bring their refCounts to 0.
+        authzManager->releaseUser(readOnly);
+        authzManager->releaseUser(clusterAdmin);
+        authzManager->releaseUser(multiDB);
     }
+
+
+    TEST_F(AuthorizationManagerTest, testAcquireV2User) {
+        authzManager->setAuthorizationVersion(2);
+
+        ASSERT_OK(externalState->insertPrivilegeDocument(
+                "admin",
+                BSON("user" << "v2read" <<
+                     "db" << "test" <<
+                     "credentials" << BSON("MONGODB-CR" << "password") <<
+                     "roles" << BSON_ARRAY(BSON("role" << "read" <<
+                                                "db" << "test" <<
+                                                "canDelegate" << false <<
+                                                "hasRole" << true))),
+                BSONObj()));
+        ASSERT_OK(externalState->insertPrivilegeDocument(
+                "admin",
+                BSON("user" << "v2cluster" <<
+                     "db" << "admin" <<
+                     "credentials" << BSON("MONGODB-CR" << "password") <<
+                     "roles" << BSON_ARRAY(BSON("role" << "clusterAdmin" <<
+                                                "db" << "admin" <<
+                                                "canDelegate" << true <<
+                                                "hasRole" << true))),
+                BSONObj()));
+
+        User* v2read;
+        ASSERT_OK(authzManager->acquireUser(UserName("v2read", "test"), &v2read));
+        ASSERT_EQUALS(UserName("v2read", "test"), v2read->getName());
+        ASSERT(v2read->isValid());
+        ASSERT_EQUALS((uint32_t)1, v2read->getRefCount());
+        const User::RoleDataMap& roles = v2read->getRoles();
+        ASSERT_EQUALS(1U, roles.size());
+        User::RoleData role = roles.begin()->second;
+        ASSERT_EQUALS(RoleName("read", "test"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(!role.canDelegate);
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(v2read);
+
+        User* v2cluster;
+        ASSERT_OK(authzManager->acquireUser(UserName("v2cluster", "admin"), &v2cluster));
+        ASSERT_EQUALS(UserName("v2cluster", "admin"), v2cluster->getName());
+        ASSERT(v2cluster->isValid());
+        ASSERT_EQUALS((uint32_t)1, v2cluster->getRefCount());
+        const User::RoleDataMap& clusterRoles = v2cluster->getRoles();
+        ASSERT_EQUALS(1U, clusterRoles.size());
+        role = clusterRoles.begin()->second;
+        ASSERT_EQUALS(RoleName("clusterAdmin", "admin"), role.name);
+        ASSERT(role.hasRole);
+        ASSERT(role.canDelegate);
+        // Make sure user's refCount is 0 at the end of the test to avoid an assertion failure
+        authzManager->releaseUser(v2cluster);
+    }
+
+    class AuthzUpgradeTest : public AuthorizationManagerTest {
+    public:
+        static const NamespaceString versionCollectionName;
+        static const NamespaceString usersCollectionName;
+        static const NamespaceString backupUsersCollectionName;
+        static const NamespaceString newUsersCollectioName;
+
+        void setUpV1UserData() {
+            ASSERT_OK(externalState->insert(NamespaceString("test.system.users"),
+                              BSON("user" << "readOnly" <<
+                                   "pwd" << "password" <<
+                                   "roles" << BSON_ARRAY("read")),
+                              BSONObj()));
+            ASSERT_OK(externalState->insert(NamespaceString("admin.system.users"),
+                              BSON("user" << "clusterAdmin" <<
+                                   "userSource" << "$external" <<
+                                   "roles" << BSON_ARRAY("clusterAdmin")),
+                              BSONObj()));
+            ASSERT_OK(externalState->insert(NamespaceString("test.system.users"),
+                              BSON("user" << "readWriteMultiDB" <<
+                                   "pwd" << "password" <<
+                                   "roles" << BSON_ARRAY("readWrite")),
+                              BSONObj()));
+            ASSERT_OK(externalState->insert(NamespaceString("test2.system.users"),
+                              BSON("user" << "readWriteMultiDB" <<
+                                   "userSource" << "test" <<
+                                   "roles" << BSON_ARRAY("readWrite")),
+                              BSONObj()));
+
+            ASSERT_OK(authzManager->initialize());
+        }
+
+        void validateV1AdminUserData(const NamespaceString& collectionName) {
+            BSONObj doc;
+
+            // Verify that the expected users are present.
+            ASSERT_EQUALS(1U, externalState->getCollectionContents(collectionName).size());
+            ASSERT_OK(externalState->findOne(collectionName,
+                                             BSON("user" << "clusterAdmin" <<
+                                                  "userSource" << "$external"),
+                                             &doc));
+            ASSERT_EQUALS("clusterAdmin", doc["user"].str());
+            ASSERT_EQUALS("$external", doc["userSource"].str());
+            ASSERT_TRUE(doc["pwd"].eoo());
+            ASSERT_EQUALS(1U, doc["roles"].Array().size());
+            ASSERT_EQUALS("clusterAdmin", doc["roles"].Array()[0].str());
+        }
+
+        void validateV2UserData() {
+            BSONObj doc;
+
+            // Verify that the admin.system.version document reflects correct upgrade.
+            ASSERT_OK(externalState->findOne(versionCollectionName,
+                                             BSON("_id" << 1 << "currentVersion" << 2),
+                                             &doc));
+            ASSERT_EQUALS(2, doc.nFields());
+            ASSERT_EQUALS(1U, externalState->getCollectionContents(versionCollectionName).size());
+
+            // Verify that the admin._newusers collection was dropped.
+            ASSERT_EQUALS(0U, externalState->getCollectionContents(newUsersCollectioName).size());
+
+            // Verify that the expected users are present.
+            ASSERT_EQUALS(3U, externalState->getCollectionContents(usersCollectionName).size());
+            ASSERT_OK(externalState->findOne(usersCollectionName,
+                                             BSON("user" << "readOnly" << "db" << "test"),
+                                             &doc));
+            ASSERT_EQUALS("readOnly", doc["user"].str());
+            ASSERT_EQUALS("test", doc["db"].str());
+            ASSERT_EQUALS("password", doc["credentials"]["MONGODB-CR"].str());
+            ASSERT_EQUALS(1U, doc["roles"].Array().size());
+
+            ASSERT_OK(externalState->findOne(
+                              usersCollectionName,
+                              BSON("user" << "clusterAdmin" << "db" << "$external"),
+                              &doc));
+            ASSERT_EQUALS("clusterAdmin", doc["user"].str());
+            ASSERT_EQUALS("$external", doc["db"].str());
+            ASSERT_EQUALS(1U, doc["roles"].Array().size());
+
+            ASSERT_OK(externalState->findOne(
+                              usersCollectionName,
+                              BSON("user" << "readWriteMultiDB" << "db" << "test"),
+                              &doc));
+            ASSERT_EQUALS("readWriteMultiDB", doc["user"].str());
+            ASSERT_EQUALS("test", doc["db"].str());
+            ASSERT_EQUALS("password", doc["credentials"]["MONGODB-CR"].str());
+            ASSERT_EQUALS(2U, doc["roles"].Array().size());
+        }
+    };
+
+    const NamespaceString AuthzUpgradeTest::versionCollectionName("admin.system.version");
+    const NamespaceString AuthzUpgradeTest::usersCollectionName("admin.system.users");
+    const NamespaceString AuthzUpgradeTest::backupUsersCollectionName("admin.backup.users");
+    const NamespaceString AuthzUpgradeTest::newUsersCollectioName("admin._newusers");
+
+    TEST_F(AuthzUpgradeTest, upgradeUserDataFromV1ToV2Clean) {
+        authzManager->setAuthorizationVersion(1);
+        setUpV1UserData();
+        ASSERT_OK(authzManager->upgradeAuthCollections());
+
+        validateV2UserData();
+        validateV1AdminUserData(backupUsersCollectionName);
+    }
+
+    TEST_F(AuthzUpgradeTest, upgradeUserDataFromV1ToV2WithSysVerDoc) {
+        authzManager->setAuthorizationVersion(1);
+        setUpV1UserData();
+        ASSERT_OK(externalState->insert(versionCollectionName,
+                                        BSON("_id" << 1 << "currentVersion" << 1),
+                                        BSONObj()));
+        ASSERT_OK(authzManager->upgradeAuthCollections());
+
+        validateV1AdminUserData(backupUsersCollectionName);
+        validateV2UserData();
+    }
+
+    TEST_F(AuthzUpgradeTest, upgradeUserDataFromV1ToV2FailsWithBadInitialVersionDoc) {
+        authzManager->setAuthorizationVersion(1);
+        setUpV1UserData();
+        ASSERT_OK(externalState->insert(versionCollectionName,
+                                        BSON("_id" << 1 << "currentVersion" << 3),
+                                        BSONObj()));
+        ASSERT_NOT_OK(authzManager->upgradeAuthCollections());
+        validateV1AdminUserData(usersCollectionName);
+        int numRemoved;
+        ASSERT_OK(externalState->remove(versionCollectionName, BSONObj(), BSONObj(), &numRemoved));
+        ASSERT_OK(authzManager->upgradeAuthCollections());
+        validateV1AdminUserData(backupUsersCollectionName);
+        validateV2UserData();
+    }
+
+    TEST_F(AuthzUpgradeTest, upgradeUserDataFromV1ToV2FailsWithVersionDocMispatch) {
+        authzManager->setAuthorizationVersion(1);
+        setUpV1UserData();
+        ASSERT_OK(externalState->insert(versionCollectionName,
+                                        BSON("_id" << 1 << "currentVersion" << 2),
+                                        BSONObj()));
+        ASSERT_NOT_OK(authzManager->upgradeAuthCollections());
+        validateV1AdminUserData(usersCollectionName);
+    }
+
 }  // namespace
 }  // namespace mongo

@@ -8,6 +8,7 @@ chatty = function(s){
         print( s );
 }
 
+// Please consider using bsonWoCompare instead of this as much as possible.
 friendlyEqual = function( a , b ){
     if ( a == b )
         return true;
@@ -205,6 +206,8 @@ if ( typeof _threadInject != "undefined" ){
                                    "jstests/extent.js",
                                    "jstests/indexb.js",
                                    "jstests/profile1.js",
+                                   "jstests/profile3.js",
+                                   "jstests/profile4.js",
                                    "jstests/mr3.js",
                                    "jstests/indexh.js",
                                    "jstests/apitest_db.js",
@@ -225,11 +228,16 @@ if ( typeof _threadInject != "undefined" ){
                                    "jstests/connections_opened.js", // counts connections, globally
                                    "jstests/opcounters.js",
                                    "jstests/currentop.js", // SERVER-8673, plus rwlock yielding issues
-                                   "jstests/set_param1.js" // changes global state
+                                   "jstests/set_param1.js", // changes global state
+                                   "jstests/geo_update_btree2.js" // SERVER-11132 test disables table scans
                                   ] );
         
         // some tests can't be run in parallel with each other
-        var serialTestsArr = [ "jstests/fsync.js"
+        var serialTestsArr = [ "jstests/fsync.js",
+                               "jstests/auth1.js",
+                               "jstests/auth_copydb2.js",
+                               "jstests/connection_status.js",
+                               "jstests/validate_user_documents.js"
 //                              ,"jstests/fsync2.js" // SERVER-4243
                               ];
         var serialTests = makeKeys( serialTestsArr );
@@ -375,7 +383,9 @@ jsTestOptions = function(){
                               authPassword : TestData.keyFileData,
                               authMechanism : TestData.authMechanism,
                               adminUser : TestData.adminUser || "admin",
-                              adminPassword : TestData.adminPassword || "password" });
+                              adminPassword : TestData.adminPassword || "password",
+                              useSSL : TestData.useSSL,
+                              useX509 : TestData.useX509});
     }
     return _jsTestOptions;
 }
@@ -396,6 +406,9 @@ jsTest.path = jsTestPath
 jsTest.options = jsTestOptions
 jsTest.setOption = setJsTestOption
 jsTest.log = jsTestLog
+jsTest.readOnlyUserRoles = ["read"]
+jsTest.basicUserRoles = ["dbOwner"]
+jsTest.adminUserRoles = ["root"]
 
 jsTest.dir = function(){
     return jsTest.path().replace( /\/[^\/]+$/, "/" )
@@ -423,12 +436,14 @@ jsTest.addAuth = function(conn) {
         localconn = new Mongo(hosts.join(','));
     }
     print ("Adding admin user on connection: " + localconn);
-    return localconn.getDB('admin').addUser(jsTestOptions().adminUser, jsTestOptions().adminPassword,
-                                            false, 'majority', 60000);
+    return localconn.getDB('admin').addUser({user: jsTestOptions().adminUser,
+                                             pwd: jsTestOptions().adminPassword,
+                                             roles: ["__system"]},
+                                            'majority', 60000);
 }
 
 jsTest.authenticate = function(conn) {
-    if (!jsTest.options().auth && !jsTest.options().keyFile) {
+    if (!jsTest.options().auth && !jsTest.options().keyFile && !jsTest.options().useX509) {
         conn.authenticated = true;
         return true;
     }
@@ -475,6 +490,62 @@ jsTest.isMongos = function(conn) {
     return conn.getDB('admin').isMaster().msg=='isdbgrid';
 }
 
+defaultPrompt = function() {
+    var status = db.getMongo().authStatus;
+    try {
+        // try to use repl set prompt -- no status or auth detected yet
+        if (!status || !status.authRequired) {
+            try {
+                var prompt = replSetMemberStatePrompt();
+                // set our status that it was good
+                db.getMongo().authStatus = {replSetGetStatus:true, isMaster: true};
+                return prompt;
+            } catch (e) {
+                // don't have permission to run that, or requires auth
+                //print(e);
+                status = {authRequired: true, replSetGetStatus: false, isMaster: true};
+            }
+        }
+        // auth detected
+
+        // try to use replSetGetStatus?
+        if (status.replSetGetStatus) {
+            try {
+                var prompt = replSetMemberStatePrompt();
+                // set our status that it was good
+                status.replSetGetStatus = true;
+                db.getMongo().authStatus = status;
+                return prompt;
+            } catch (e) {
+                // don't have permission to run that, or requires auth
+                //print(e);
+                status.authRequired = true;
+                status.replSetGetStatus = false;
+            }
+        }
+
+        // try to use isMaster?
+        if (status.isMaster) {
+            try {
+                var prompt = isMasterStatePrompt();
+                status.isMaster = true;
+                db.getMongo().authStatus = status;
+                return prompt;
+            } catch (e) {
+                status.authRequired = true;
+                status.isMaster = false;
+            }
+        }
+    } catch (ex) {
+        printjson(ex);
+        // reset status and let it figure it out next time.
+        status = {isMaster:true};
+    }
+
+    db.getMongo().authStatus = status;
+    return "> ";
+}
+
 replSetMemberStatePrompt = function() {
     var state = '';
     var stateInfo = db.getSiblingDB( 'admin' ).runCommand( { replSetGetStatus:1, forShell:1 } );
@@ -490,12 +561,42 @@ replSetMemberStatePrompt = function() {
             state = stateInfo.myState;
         }
         state = '' + stateInfo.set + ':' + state;
+    } else {
+         var info = stateInfo.info;
+         if ( info && info.length < 20 ) {
+             state = info; // "mongos", "configsvr"
+         } else {
+             throw Error("Failed:" + info);
+         }
     }
-    else {
-        var info = stateInfo.info;
-        if ( info && info.length < 20 ) {
-            state = info; // "mongos", "configsvr"
+    return state + '> ';
+}
+
+isMasterStatePrompt = function() {
+    var state = '';
+    var isMaster = db.runCommand({isMaster:1, forShell:1});
+    if ( isMaster.ok ) {
+        var role = "";
+
+        if (isMaster.msg == "isdbgrid") {
+            role = "mongos";
         }
+
+        if (isMaster.setName) {
+            if (isMaster.ismaster)
+                role = "PRIMARY";
+            else if (isMaster.secondary)
+                role = "SECONDARY";
+            else if (isMaster.arbiterOnly)
+                role = "ARBITER";
+            else {
+                role = "OTHER"
+            }
+            state = isMaster.setName + ':';
+        }
+        state = state + role;
+    } else {
+        throw Error("Failed: " + tojson(isMaster));
     }
     return state + '> ';
 }
@@ -985,6 +1086,60 @@ Geo.sphereDistance = function( a , b ){
 
 rs = function () { return "try rs.help()"; }
 
+/**
+ * This method is intended to aid in the writing of tests. It takes a host's address, desired state,
+ * and replicaset and waits either timeout milliseconds or until that reaches the desired state.
+ *
+ * It should be used instead of awaitRSClientHost when there is no MongoS with a connection to the
+ * replica set.
+ */
+_awaitRSHostViaRSMonitor = function(hostAddr, desiredState, rsName, timeout) {
+    timeout = timeout || 60 * 1000;
+
+    if (desiredState == undefined) {
+        desiredState = {ok: true};
+    }
+
+    print("Awaiting " + hostAddr + " to be " + tojson(desiredState) + " in " + " rs " + rsName)
+
+    var tests = 0;
+    assert.soon(function() {
+        var stats = _replMonitorStats(rsName);
+        if (tests++ % 10 == 0) {
+            printjson(stats);
+        }
+
+        for (var i=0; i<stats.length; i++) {
+            var node = stats[i]
+            printjson(node);
+            if (node["addr"] !== hostAddr)
+                continue;
+
+            // Check that *all* hostAddr properties match desiredState properties
+            var stateReached = true;
+            for(var prop in desiredState) {
+                if (isObject(desiredState[prop])) {
+                    if (!friendlyEqual(desiredState[prop], node[prop])) {
+                        stateReached = false;
+                        break;
+                    }
+                }
+                else if (node[prop] !== desiredState[prop]) {
+                    stateReached = false;
+                    break;
+                }
+            }
+            if (stateReached) {
+                printjson(stats);
+                return true;
+            }
+        }
+        return false;
+    }, "timed out waiting for replica set member: " + hostAddr + " to reach state: " +
+            tojson(desiredState),
+    timeout);
+}
+
 rs.help = function () {
     print("\trs.status()                     { replSetGetStatus : 1 } checks repl set status");
     print("\trs.initiate()                   { replSetInitiate : null } initiates set with default settings");
@@ -1000,8 +1155,9 @@ rs.help = function () {
     print("\trs.remove(hostportstr)          remove a host from the replica set (disconnects)");
     print("\trs.slaveOk()                    shorthand for db.getMongo().setSlaveOk()");
     print();
+    print("\trs.printReplicationInfo()       check oplog size and time range");
+    print("\trs.printSlaveReplicationInfo()  check replica set members and replication lag");
     print("\tdb.isMaster()                   check who is primary");
-    print("\tdb.printReplicationInfo()       check oplog size and time range");
     print();
     print("\treconfiguration helpers disconnect from the database so the shell will display");
     print("\tan error, even if the command succeeds.");
@@ -1011,6 +1167,8 @@ rs.slaveOk = function (value) { return db.getMongo().setSlaveOk(value); }
 rs.status = function () { return db._adminCommand("replSetGetStatus"); }
 rs.isMaster = function () { return db.isMaster(); }
 rs.initiate = function (c) { return db._adminCommand({ replSetInitiate: c }); }
+rs.printSlaveReplicationInfo = function () { return db.printSlaveReplicationInfo() };
+rs.printReplicationInfo = function () { return db.printReplicationInfo() };
 rs._runCmd = function (c) {
     // after the command, catch the disconnect and reconnect if necessary
     var res = null;

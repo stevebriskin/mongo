@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/field_ref.h"
@@ -33,24 +45,35 @@ namespace mongo {
         }
 
         // We guarantee that accesses through getPart() will be valid while 'this' is. So we
-        // take a copy. We're going to be "chopping" up the copy into c-strings.
-        _fieldBase.reset(new char[dottedField.size()+1]);
-        dottedField.copyTo( _fieldBase.get(), true );
+        // keep a copy in a local sting.
+
+        _dotted = dottedField.toString();
 
         // Separate the field parts using '.' as a delimiter.
-        char* beg = _fieldBase.get();
-        char* cur = beg;
-        char* end = beg + dottedField.size();
+        std::string::iterator beg = _dotted.begin();
+        std::string::iterator cur = beg;
+        const std::string::iterator end = _dotted.end();
         while (true) {
             if (cur != end && *cur != '.') {
                 cur++;
                 continue;
             }
 
-            appendPart(StringData(beg, cur - beg));
+            // If cur != beg then we advanced cur in the loop above, so we have a real sequence
+            // of characters to add as a new part. Otherwise, we may be parsing something odd,
+            // like "..", and we need to add an empty StringData piece to represent the "part"
+            // in-between the dots. This also handles the case where 'beg' and 'cur' are both
+            // at 'end', which can happen if we are parsing anything with a terminal "."
+            // character. In that case, we still need to add an empty part, but we will break
+            // out of the loop below since we will not execute the guarded 'continue' and will
+            // instead reach the break statement.
+
+            if (cur != beg)
+                appendPart(StringData(&*beg, cur - beg));
+            else
+                appendPart(StringData());
 
             if (cur != end) {
-                *cur = '\0';
                 beg = ++cur;
                 continue;
             }
@@ -83,6 +106,43 @@ namespace mongo {
             _variable.push_back(part);
         }
         return ++_size;
+    }
+
+    void FieldRef::reserialize() const {
+        std::string nextDotted;
+        // Reserve some space in the string. We know we will have, at minimum, a character for
+        // each component we are writing, and a dot for each component, less one. We don't want
+        // to reserve more, since we don't want to forfeit the SSO if it is applicable.
+        nextDotted.reserve((_size * 2) - 1);
+
+        // Concatenate the fields to a new string
+        for (size_t i = 0; i != _size; ++i) {
+            if (i > 0)
+                nextDotted.append(1, '.');
+            const StringData part = getPart(i);
+            nextDotted.append(part.rawData(), part.size());
+        }
+
+        // Make the new string our contents
+        _dotted.swap(nextDotted);
+
+        // Fixup the parts to refer to the new string
+        std::string::const_iterator where = _dotted.begin();
+        const std::string::const_iterator end = _dotted.end();
+        for (size_t i = 0; i != _size; ++i) {
+            StringData& part = (i < kReserveAhead) ? _fixed[i] : _variable[getIndex(i)];
+            const size_t size = part.size();
+            part = StringData(&*where, size);
+            where += size;
+            // skip over '.' unless we are at the end.
+            if (where != end) {
+                dassert(*where == '.');
+                ++where;
+            }
+        }
+
+        // Drop any replacements
+        _replacements.clear();
     }
 
     StringData FieldRef::getPart(size_t i) const {
@@ -129,20 +189,26 @@ namespace mongo {
         return prefixSize;
     }
 
-    std::string FieldRef::dottedField( size_t offset ) const {
-        std::string res;
+    StringData FieldRef::dottedField( size_t offset ) const {
+        if (_size == 0 || offset >= numParts() )
+            return StringData();
 
-        if (_size == 0 || offset >= numParts() ) {
-            return res;
+        if (!_replacements.empty())
+            reserialize();
+        dassert(_replacements.empty());
+
+        // Assume we want the whole thing
+        StringData result(_dotted);
+
+        // Strip off any leading parts we were asked to ignore
+        for (size_t i = 0; i < offset; ++i) {
+            const StringData part = getPart(i);
+            result = StringData(
+                result.rawData() + part.size() + 1,
+                result.size() - part.size() - 1);
         }
 
-        for (size_t i=offset; i<_size; i++) {
-            if ( i > offset )
-                res.append(1, '.');
-            StringData part = getPart(i);
-            res.append(part.rawData(), part.size());
-        }
-        return res;
+        return result;
     }
 
     bool FieldRef::equalsDottedField( const StringData& other ) const {
@@ -196,18 +262,8 @@ namespace mongo {
     void FieldRef::clear() {
         _size = 0;
         _variable.clear();
-        _fieldBase.reset();
+        _dotted.clear();
         _replacements.clear();
-    }
-
-    size_t FieldRef::numReplaced() const {
-        size_t res = 0;
-        for (size_t i = 0; i < _replacements.size(); i++) {
-            if (!_replacements[i].empty()) {
-                res++;
-            }
-        }
-        return res;
     }
 
     std::ostream& operator<<(std::ostream& stream, const FieldRef& field) {

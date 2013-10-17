@@ -21,7 +21,6 @@
 
 #include <boost/filesystem/operations.hpp>
 
-#include "mongo/db/cmdline.h"
 #include "mongo/util/concurrency/rwlock.h"
 #include "mongo/util/map_util.h"
 #include "mongo/util/mongoutils/str.h"
@@ -117,7 +116,7 @@ namespace {
 
         LockMongoFilesExclusive lk;
 
-        ProgressMeter pm(mmfiles.size(), 2, 1, "File Closing Progress");
+        ProgressMeter pm(mmfiles.size(), 2, 1, "files", "File Closing Progress");
         set<MongoFile*> temp = mmfiles;
         for ( set<MongoFile*>::iterator i = temp.begin(); i != temp.end(); i++ ) {
             (*i)->close(); // close() now removes from mmfiles

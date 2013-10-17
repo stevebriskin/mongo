@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -32,7 +44,9 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_update.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/structure/collection.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -41,28 +55,28 @@ namespace mongo {
     // What's the default version of our indices?
     const int DefaultIndexVersionNumber = 1;
 
-    int removeFromSysIndexes(const char *ns, const char *idxName) {
+    int removeFromSysIndexes(const StringData& ns, const StringData& idxName) {
         string system_indexes = cc().database()->name() + ".system.indexes";
         BSONObjBuilder b;
         b.append("ns", ns);
         b.append("name", idxName); // e.g.: { name: "ts_1", ns: "foo.coll" }
         BSONObj cond = b.done();
-        return (int) deleteObjects(system_indexes.c_str(), cond, false, false, true);
+        return (int) deleteObjects(system_indexes, cond, false, false, true);
     }
 
     /* this is just an attempt to clean up old orphaned stuff on a delete all indexes
        call. repair database is the clean solution, but this gives one a lighter weight
        partial option.  see dropIndexes()
     */
-    int assureSysIndexesEmptied(const char *ns, IndexDetails *idIndex) {
-        string system_indexes = cc().database()->name() + ".system.indexes";
+    int assureSysIndexesEmptied(const StringData& ns, IndexDetails *idIndex) {
+        string system_indexes = cc().database()->name() + ".system.indexes"; // TODO
         BSONObjBuilder b;
         b.append("ns", ns);
         if( idIndex ) {
             b.append("name", BSON( "$ne" << idIndex->indexName().c_str() ));
         }
         BSONObj cond = b.done();
-        int n = (int) deleteObjects(system_indexes.c_str(), cond, false, false, true);
+        int n = (int) deleteObjects(system_indexes, cond, false, false, true);
         if( n ) {
             log() << "info: assureSysIndexesEmptied cleaned up " << n << " entries" << endl;
         }
@@ -90,26 +104,29 @@ namespace mongo {
         try {
 
             string pns = parentNS(); // note we need a copy, as parentNS() won't work after the drop() below
+            string name = indexName(); // ts_1
+
+            Database* db = cc().database();
+
+            Collection* parentCollection = db->getCollection( pns );
 
             // clean up parent namespace index cache
-            NamespaceDetailsTransient::get( pns.c_str() ).deletedIndex();
+            if ( parentCollection )
+                parentCollection->infoCache()->reset();
 
-            string name = indexName();
+            Status s = db->_dropNS( ns );
+            if ( !s.isOK() ) {
+                LOG(2) << "IndexDetails::kill(): couldn't drop ns " << ns;
+            }
 
-            /* important to catch exception here so we can finish cleanup below. */
-            try {
-                dropNS(ns.c_str());
-            }
-            catch(DBException& ) {
-                LOG(2) << "IndexDetails::kill(): couldn't drop ns " << ns << endl;
-            }
             head.setInvalid();
             info.setInvalid();
 
             // clean up in system.indexes.  we do this last on purpose.
-            int n = removeFromSysIndexes(pns.c_str(), name.c_str());
+            int n = removeFromSysIndexes(pns, name);
             wassert( n == 1 );
 
+            db->_clearCollectionCache( ns );
         }
         catch ( DBException &e ) {
             log() << "exception in kill_idx: " << e << ", ns: " << ns << endl;
@@ -142,9 +159,10 @@ namespace mongo {
 
     static void upgradeMinorVersionOrAssert(const string& newPluginName) {
         const string systemIndexes = cc().database()->name() + ".system.indexes";
-        shared_ptr<Cursor> cursor(theDataFileMgr.findAll(systemIndexes));
-        for ( ; cursor && cursor->ok(); cursor->advance()) {
-            const BSONObj index = cursor->current();
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(systemIndexes));
+        BSONObj index;
+        Runner::RunnerState state;
+        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&index, NULL))) {
             const BSONObj key = index.getObjectField("key");
             const string plugin = IndexNames::findPluginName(key);
             if (IndexNames::existedBefore24(plugin))
@@ -158,6 +176,10 @@ namespace mongo {
 
             error() << errmsg << endl;
             uasserted(16738, errmsg);
+        }
+
+        if (Runner::RUNNER_EOF != state) {
+            warning() << "Internal error while reading collection " << systemIndexes << endl;
         }
 
         DataFileHeader* dfh = cc().database()->getFile(0)->getHeader();
@@ -207,10 +229,13 @@ namespace mongo {
 
         // the collection for which we are building an index
         sourceNS = io.getStringField("ns");
+        NamespaceString nss(sourceNS);
         uassert(10096, "invalid ns to index", sourceNS.find( '.' ) != string::npos);
+        uassert(17072, "cannot create indexes on the system.indexes collection",
+                !nss.isSystemDotIndexes());
         massert(10097, str::stream() << "bad table to index name on add index attempt current db: "
                 << cc().database()->name() << "  source: " << sourceNS,
-                cc().database()->name() == nsToDatabase(sourceNS));
+                cc().database()->name() == nss.db());
 
         // logical name of the index.  todo: get rid of the name, we don't need it!
         const char *name = io.getStringField("name");

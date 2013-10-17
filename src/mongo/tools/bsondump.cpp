@@ -16,18 +16,16 @@
 
 #include "mongo/pch.h"
 
-#include <boost/program_options.hpp>
 #include <fcntl.h>
 
-#include "mongo/base/initializer.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/tools/bsondump_options.h"
 #include "mongo/tools/tool.h"
 #include "mongo/util/mmap.h"
+#include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/text.h"
 
 using namespace mongo;
-
-namespace po = boost::program_options;
 
 class BSONDump : public BSONTool {
 
@@ -35,38 +33,27 @@ class BSONDump : public BSONTool {
 
 public:
 
-    BSONDump() : BSONTool( "bsondump", NONE ) {
-        add_options()
-        ("type" , po::value<string>()->default_value("json") , "type of output: json,debug" )
-        ;
-        add_hidden_options()
-        ("file" , po::value<string>() , ".bson file" )
-        ;
-        addPositionArg( "file" , 1 );
-        _noconnection = true;
-    }
+    BSONDump() : BSONTool() { }
 
-    virtual void printExtraHelp(ostream& out) {
-        out << "Display BSON objects in a data file.\n" << endl;
-        out << "usage: " << _name << " [options] <bson filename>" << endl;
+    virtual void printHelp(ostream& out) {
+        printBSONDumpHelp(&out);
     }
 
     virtual int doRun() {
         {
-            string t = getParam( "type" );
-            if ( t == "json" )
+            if (bsonDumpGlobalParams.type == "json")
                 _type = JSON;
-            else if ( t == "debug" )
+            else if (bsonDumpGlobalParams.type == "debug")
                 _type = DEBUG;
             else {
-                cerr << "bad type: " << t << endl;
+                cerr << "bad type: " << bsonDumpGlobalParams.type << endl;
                 return 1;
             }
         }
 
-        boost::filesystem::path root = getParam( "file" );
+        boost::filesystem::path root = bsonDumpGlobalParams.file;
         if ( root == "" ) {
-            printExtraHelp(cout);
+            printBSONDumpHelp(&std::cout);
             return 1;
         }
 
@@ -140,26 +127,4 @@ public:
     }
 };
 
-int toolMain( int argc , char ** argv, char **envp ) {
-    mongo::runGlobalInitializersOrDie(argc, argv, envp);
-    BSONDump dump;
-    return dump.main( argc , argv );
-}
-
-#if defined(_WIN32)
-// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
-// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
-// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
-// and makes them available through the argv() and envp() members.  This enables toolMain()
-// to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = toolMain(argc, wcl.argv(), wcl.envp());
-    ::_exit(exitCode);
-}
-#else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = toolMain(argc, argv, envp);
-    ::_exit(exitCode);
-}
-#endif
+REGISTER_MONGO_TOOL(BSONDump);

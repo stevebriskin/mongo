@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -21,12 +33,16 @@
 #include <algorithm>
 #include <list>
 
+#include "mongo/db/audit.h"
+#include "mongo/db/clientcursor.h"
 #include "mongo/db/db.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/json.h"
 #include "mongo/db/storage/durable_mapped_file.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/structure/collection.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/hashtab.h"
 #include "mongo/util/startup_test.h"
@@ -76,7 +92,7 @@ namespace mongo {
 
 #if defined(_DEBUG)
     void NamespaceDetails::dump(const Namespace& k) {
-        if( !cmdLine.dur )
+        if (!storageGlobalParams.dur)
             cout << "ns offsets which follow will not display correctly with --journal disabled" << endl;
 
         size_t ofs = 1; // 1 is sentinel that the find call below failed
@@ -444,7 +460,9 @@ namespace mongo {
             *getDur().writing(&_multiKeyIndexBits) &= mask;
         }
 
-        NamespaceDetailsTransient::get(thisns).clearQueryCache();
+        Collection* collection = cc().database()->getCollection( thisns );
+        if ( collection )
+            collection->infoCache()->clearQueryCache();
     }
 
     IndexDetails& NamespaceDetails::getNextIndexDetails(const char* thisns) {
@@ -460,8 +478,7 @@ namespace mongo {
     }
 
     /* you MUST call when adding an index.  see pdfile.cpp */
-    void NamespaceDetails::addIndex(const char* thisns) {
-        NamespaceDetailsTransient::get(thisns).addedIndex();
+    void NamespaceDetails::addIndex() {
         (*getDur().writing(&_nIndexes))++;
     }
 
@@ -562,92 +579,6 @@ namespace mongo {
 
     /* ------------------------------------------------------------------------- */
 
-    SimpleMutex NamespaceDetailsTransient::_qcMutex("qc");
-    NamespaceDetailsTransient::DMap NamespaceDetailsTransient::_nsdMap;
-
-    void NamespaceDetailsTransient::reset() {
-        Lock::assertWriteLocked(_ns); 
-        clearQueryCache();
-        _keysComputed = false;
-    }
-
-    NamespaceDetailsTransient::CMap& NamespaceDetailsTransient::get_cmap_inlock(const string& ns) {
-        CMap*& m = _nsdMap[ns];
-        if ( ! m )
-            m = new CMap();
-        return *m;
-    }
-
-    /*static*/ NOINLINE_DECL NamespaceDetailsTransient& NamespaceDetailsTransient::make_inlock(const string& ns) {
-        shared_ptr< NamespaceDetailsTransient > &t = get_cmap_inlock(ns)[ ns ];
-        verify( t.get() == 0 );
-        Database *database = cc().database();
-        verify( database );
-        if( _nsdMap.size() % 20000 == 10000 ) { 
-            // so we notice if insanely large #s
-            log() << "opening namespace " << ns << endl;
-            log() << _nsdMap.size() << " namespaces in nsdMap" << endl;
-        }
-        t.reset( new NamespaceDetailsTransient(database, ns) );
-        return *t;
-    }
-
-    // note with repair there could be two databases with the same ns name.
-    // that is NOT handled here yet!  TODO
-    // repair may not use nsdt though not sure.  anyway, requires work.
-    NamespaceDetailsTransient::NamespaceDetailsTransient(Database *db, const string& ns) : 
-        _ns(ns), _keysComputed(false), _qcWriteCount() 
-    {
-        dassert(db);
-    }
-
-    NamespaceDetailsTransient::~NamespaceDetailsTransient() { 
-    }
-    
-    void NamespaceDetailsTransient::resetCollection(const string& ns ) {
-        SimpleMutex::scoped_lock lk(_qcMutex);
-        Lock::assertWriteLocked(ns);
-        get_cmap_inlock(ns)[ns].reset();
-    }
-        
-    void NamespaceDetailsTransient::eraseDB(const string& db) {
-        SimpleMutex::scoped_lock lk(_qcMutex);
-        Lock::assertWriteLocked(db);
-        
-        DMap::iterator i = _nsdMap.find( db );
-        if ( i != _nsdMap.end() ) {
-            delete i->second;
-            _nsdMap.erase( i );
-        }
-    }
-    
-    void NamespaceDetailsTransient::eraseCollection(const string& ns) {
-        SimpleMutex::scoped_lock lk(_qcMutex);
-        Lock::assertWriteLocked(ns);
-        get_cmap_inlock(ns).erase(ns);
-    }
-
-
-    void NamespaceDetailsTransient::computeIndexKeys() {
-        _indexedPaths.clear();
-
-        NamespaceDetails *d = nsdetails(_ns);
-        if ( ! d )
-            return;
-
-        NamespaceDetails::IndexIterator i = d->ii( true );
-        while( i.more() ) {
-            BSONObj key = i.next().keyPattern();
-            BSONObjIterator j( key );
-            while ( j.more() ) {
-                BSONElement e = j.next();
-                _indexedPaths.addPath( e.fieldName() );
-            }
-        }
-
-        _keysComputed = true;
-    }
-
     void NamespaceDetails::updateTTLIndex( int idxNo , const BSONElement& newExpireSecs ) {
         // Need to get the actual DiskLoc of the index to update. This is embedded in the 'info'
         // object inside the IndexDetails.
@@ -736,7 +667,7 @@ namespace mongo {
         verify( Helpers::findOne( system_namespaces , BSON( "name" << ns ) , oldEntry ) );
         BSONObj newEntry = applyUpdateOperators( oldEntry , BSON( "$set" << BSON( "options.flags" << userFlags() ) ) );
         
-        verify( 1 == deleteObjects( system_namespaces.c_str() , oldEntry , true , false , true ) );
+        verify( 1 == deleteObjects( system_namespaces , oldEntry , true , false , true ) );
         theDataFileMgr.insert( system_namespaces.c_str(),
                                newEntry.objdata(),
                                newEntry.objsize(),
@@ -838,6 +769,11 @@ namespace mongo {
         NamespaceDetails* d = writingWithExtra();
 
         IndexDetails *id = &d->idx(idxNumber);
+
+        string indexNamespace = id->indexNamespace();
+
+        audit::logDropIndex( currentClient.get(), indexNamespace, id->parentNS() );
+
         id->kill_idx();
 
         // fix the _multiKeyIndexBits, by moving all bits above me down one
@@ -852,6 +788,8 @@ namespace mongo {
             d->idx(i) = d->idx(i+1);
 
         d->idx( getTotalIndexCount() ) = IndexDetails();
+
+        cc().database()->_clearCollectionCache( indexNamespace );
     }
 
     BSONObj NamespaceDetails::prepOneUnfinishedIndex() {
@@ -901,116 +839,13 @@ namespace mongo {
 
     /* ------------------------------------------------------------------------- */
 
-    /* add a new namespace to the system catalog (<dbname>.system.namespaces).
-       options: { capped : ..., size : ... }
-    */
-    void addNewNamespaceToCatalog(const char *ns, const BSONObj *options = 0) {
-        LOG(1) << "New namespace: " << ns << endl;
-        if ( strstr(ns, "system.namespaces") ) {
-            // system.namespaces holds all the others, so it is not explicitly listed in the catalog.
-            // TODO: fix above should not be strstr!
-            return;
-        }
-        
-        BSONObjBuilder b;
-        b.append("name", ns);
-        if ( options )
-            b.append("options", *options);
-        BSONObj j = b.done();
-        char database[256];
-        nsToDatabase(ns, database);
-        string s = string(database) + ".system.namespaces";
-        theDataFileMgr.insert(s.c_str(), j.objdata(), j.objsize(), false, true);
-    }
-
-    void renameNamespace( const char *from, const char *to, bool stayTemp) {
-        NamespaceIndex *ni = nsindex( from );
-        verify( ni );
-        verify( ni->details( from ) );
-        verify( ! ni->details( to ) );
-
-        // Our namespace and index details will move to a different
-        // memory location.  The only references to namespace and
-        // index details across commands are in cursors and nsd
-        // transient (including query cache) so clear these.
-        ClientCursor::invalidate( from );
-        NamespaceDetailsTransient::eraseCollection( from );
-
-        NamespaceDetails *details = ni->details( from );
-        ni->add_ns( to, details );
-        NamespaceDetails *todetails = ni->details( to );
-        try {
-            todetails->copyingFrom(to, details); // fixes extraOffset
-        }
-        catch( DBException& ) {
-            // could end up here if .ns is full - if so try to clean up / roll back a little
-            ni->kill_ns(to);
-            throw;
-        }
-        ni->kill_ns( from );
-        details = todetails;
-
-        BSONObj oldSpec;
-        char database[MaxDatabaseNameLen];
-        nsToDatabase(from, database);
-        string s = database;
-        s += ".system.namespaces";
-        verify( Helpers::findOne( s.c_str(), BSON( "name" << from ), oldSpec ) );
-
-        BSONObjBuilder newSpecB;
-        BSONObjIterator i( oldSpec.getObjectField( "options" ) );
-        while( i.more() ) {
-            BSONElement e = i.next();
-            if ( strcmp( e.fieldName(), "create" ) != 0 ) {
-                if (stayTemp || (strcmp(e.fieldName(), "temp") != 0))
-                    newSpecB.append( e );
-            }
-            else {
-                newSpecB << "create" << to;
-            }
-        }
-        BSONObj newSpec = newSpecB.done();
-        addNewNamespaceToCatalog( to, newSpec.isEmpty() ? 0 : &newSpec );
-
-        deleteObjects( s.c_str(), BSON( "name" << from ), false, false, true );
-        // oldSpec variable no longer valid memory
-
-        BSONObj oldIndexSpec;
-        s = database;
-        s += ".system.indexes";
-        while( Helpers::findOne( s.c_str(), BSON( "ns" << from ), oldIndexSpec ) ) {
-            BSONObjBuilder newIndexSpecB;
-            BSONObjIterator i( oldIndexSpec );
-            while( i.more() ) {
-                BSONElement e = i.next();
-                if ( strcmp( e.fieldName(), "ns" ) != 0 )
-                    newIndexSpecB.append( e );
-                else
-                    newIndexSpecB << "ns" << to;
-            }
-            BSONObj newIndexSpec = newIndexSpecB.done();
-            DiskLoc newIndexSpecLoc = theDataFileMgr.insert( s.c_str(),
-                                                             newIndexSpec.objdata(),
-                                                             newIndexSpec.objsize(),
-                                                             false,
-                                                             true,
-                                                             false );
-            int indexI = details->findIndexByName( oldIndexSpec.getStringField( "name" ) );
-            IndexDetails &indexDetails = details->idx(indexI);
-            string oldIndexNs = indexDetails.indexNamespace();
-            indexDetails.info = newIndexSpecLoc;
-            string newIndexNs = indexDetails.indexNamespace();
-
-            renameNamespace( oldIndexNs.c_str(), newIndexNs.c_str(), false );
-            deleteObjects( s.c_str(), oldIndexSpec.getOwned(), true, false, true );
-        }
-    }
-
-    bool legalClientSystemNS( const string& ns , bool write ) {
+    bool legalClientSystemNS( const StringData& ns , bool write ) {
         if( ns == "local.system.replset" ) return true;
 
         if ( ns.find( ".system.users" ) != string::npos )
             return true;
+
+        if ( ns == "admin.system.roles" ) return true;
 
         if ( ns.find( ".system.js" ) != string::npos ) {
             if ( write )

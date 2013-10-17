@@ -35,17 +35,19 @@
     //
     // Preliminary set up.
     //
-    admin.addUser('admin', 'a');
+    admin.addUser({user:'admin', pwd: 'a', roles: jsTest.adminUserRoles});
     admin.auth('admin', 'a');
 
     //
-    // Add users named "__system" with no privileges on "test", "admin" and "local".  The one in
-    // "local" is shadowed by the keyfile.
+    // Add users named "__system" with no privileges on "test" and "admin", and make sure you can't
+    // add one on "local"
     //
 
     test.addUser({user: '__system', pwd: 'a', roles: []});
     admin.addUser({user: '__system', pwd: 'a', roles: []});
-    local.addUser({user: '__system', pwd: 'a', roles: []});
+    assert.throws(function() {
+        local.addUser({user: '__system', pwd: 'a', roles: []});
+    });
 
     //
     // Add some data to count.
@@ -84,7 +86,7 @@
     assertCountUnauthorized(conn, "test", "foo");
 
     //
-    // Validate that __system@test is not shadowed by the keyfile __system user.
+    // Validate that __system@admin is not shadowed by the keyfile __system user.
     //
     admin.auth('__system', 'a');
     assertCountUnauthorized(conn, "admin", "foo");

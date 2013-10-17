@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/modifier_set.h"
@@ -19,10 +31,13 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/ops/field_checker.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/db/ops/path_support.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+    namespace str = mongoutils::str;
 
     struct ModifierSet::PreparedState {
 
@@ -31,15 +46,15 @@ namespace mongo {
             , idxFound(0)
             , elemFound(doc.end())
             , boundDollar("")
-            , inPlace(false)
-            , noOp(false) {
+            , noOp(false)
+            , elemIsBlocking(false) {
         }
 
         // Document that is going to be changed.
         mutablebson::Document& doc;
 
         // Index in _fieldRef for which an Element exist in the document.
-        int32_t idxFound;
+        size_t idxFound;
 
         // Element corresponding to _fieldRef[0.._idxFound].
         mutablebson::Element elemFound;
@@ -47,11 +62,11 @@ namespace mongo {
         // Value to bind to a $-positional field, if one is provided.
         std::string boundDollar;
 
-        // Could this mod be applied in place?
-        bool inPlace;
-
         // This $set is a no-op?
         bool noOp;
+
+        // The element we find during a replication operation that blocks our update path
+        bool elemIsBlocking;
 
     };
 
@@ -59,13 +74,14 @@ namespace mongo {
         : _fieldRef()
         , _posDollar(0)
         , _setMode(mode)
-        , _val() {
+        , _val()
+        , _modOptions() {
     }
 
     ModifierSet::~ModifierSet() {
     }
 
-    Status ModifierSet::init(const BSONElement& modExpr) {
+    Status ModifierSet::init(const BSONElement& modExpr, const Options& opts) {
 
         //
         // field name analysis
@@ -84,7 +100,9 @@ namespace mongo {
         size_t foundCount;
         bool foundDollar = fieldchecker::isPositional(_fieldRef, &_posDollar, &foundCount);
         if (foundDollar && foundCount > 1) {
-            return Status(ErrorCodes::BadValue, "too many positional($) elements found.");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "Too many positional (i.e. '$') elements found in path '"
+                                        << _fieldRef.dottedField() << "'");
         }
 
         //
@@ -99,8 +117,10 @@ namespace mongo {
 
         case Object:
         case Array:
-            if (! modExpr.Obj().okForStorage()) {
-                return Status(ErrorCodes::BadValue, "cannot use '$' as values");
+            if (opts.enforceOkForStorage) {
+                Status s = modExpr.Obj().storageValidEmbedded();
+                if (!s.isOK())
+                    return s;
             }
             break;
 
@@ -109,6 +129,7 @@ namespace mongo {
         }
 
         _val = modExpr;
+        _modOptions = opts;
 
         return Status::OK();
     }
@@ -143,6 +164,11 @@ namespace mongo {
         if (status.code() == ErrorCodes::NonExistentPath) {
             _preparedState->elemFound = root.getDocument().end();
         }
+        else if (_modOptions.fromReplication && status.code() == ErrorCodes::PathNotViable) {
+            // If we are coming from replication and it is an invalid path,
+            // then push on indicating that we had a blocking element, which we stopped at
+            _preparedState->elemIsBlocking = true;
+        }
         else if (!status.isOK()) {
             return status;
         }
@@ -162,22 +188,14 @@ namespace mongo {
         // If the field path is not fully present, then this mod cannot be in place, nor is a
         // noOp.
         if (!_preparedState->elemFound.ok() ||
-            _preparedState->idxFound < static_cast<int32_t>(_fieldRef.numParts()-1)) {
+            _preparedState->idxFound < (_fieldRef.numParts()-1)) {
             return Status::OK();
-        }
-
-        // We may allow this $set to be in place if the value being set and the existing one
-        // have the same size.
-        if (_val.isNumber() &&
-            (_preparedState->elemFound != root.getDocument().end()) &&
-            (_val.type() == _preparedState->elemFound.getType())) {
-            execInfo->inPlace = _preparedState->inPlace = true;
         }
 
         // If the value being $set is the same as the one already in the doc, than this is a
         // noOp.
         if (_preparedState->elemFound.ok() &&
-            _preparedState->idxFound == static_cast<int32_t>(_fieldRef.numParts()-1) &&
+            _preparedState->idxFound == (_fieldRef.numParts()-1) &&
             _preparedState->elemFound.compareWithBSONElement(_val, false /*ignore field*/) == 0) {
             execInfo->noOp = _preparedState->noOp = true;
         }
@@ -188,14 +206,13 @@ namespace mongo {
     Status ModifierSet::apply() const {
         dassert(!_preparedState->noOp);
 
+        const bool destExists = _preparedState->elemFound.ok() &&
+                                _preparedState->idxFound == (_fieldRef.numParts()-1);
         // If there's no need to create any further field part, the $set is simply a value
         // assignment.
-        if (_preparedState->elemFound.ok() &&
-            _preparedState->idxFound == static_cast<int32_t>(_fieldRef.numParts()-1)) {
+        if (destExists) {
             return _preparedState->elemFound.setValueBSONElement(_val);
         }
-
-        dassert(!_preparedState->inPlace);
 
         //
         // Complete document path logic
@@ -220,6 +237,41 @@ namespace mongo {
             _preparedState->idxFound++;
         }
 
+        // Remove the blocking element, if we are from replication applier. See comment below.
+        if (_modOptions.fromReplication && !destExists && _preparedState->elemFound.ok() &&
+            _preparedState->elemIsBlocking &&
+            (!(_preparedState->elemFound.isType(Array)) ||
+             !(_preparedState->elemFound.isType(Object)))
+           ) {
+
+            /**
+             * With replication we want to be able to remove blocking elements for $set (only).
+             * The reason they are blocking elements is that they are not embedded documents
+             * (objects) nor an array (a special type of an embedded doc) and we cannot
+             * add children to them (because the $set path requires adding children past
+             * the blocking element).
+             *
+             * Imagine that we started with this:
+             * {_id:1, a:1} + {$set : {"a.b.c" : 1}} -> {_id:1, a: {b: {c:1}}}
+             * Above we found that element (a:1) is blocking at position 1. We now will replace
+             * it with an empty object so the normal logic below can be
+             * applied from the root (in this example case).
+             *
+             * Here is an array example:
+             * {_id:1, a:[1, 2]} + {$set : {"a.0.c" : 1}} -> {_id:1, a: [ {c:1}, 2]}
+             * The blocking element is "a.0" since it is a number, non-object, and we must
+             * then replace it with an empty object so we can add c:1 to that empty object
+             */
+
+            mutablebson::Element blockingElem = _preparedState->elemFound;
+            BSONObj newObj;
+            // Replace blocking non-object with an empty object
+            Status status = blockingElem.setValueObject(newObj);
+            if (!status.isOK()) {
+                return status;
+            }
+        }
+
         // createPathAt() will complete the path and attach 'elemToSet' at the end of it.
         return pathsupport::createPathAt(_fieldRef,
                                          _preparedState->idxFound,
@@ -227,34 +279,24 @@ namespace mongo {
                                          elemToSet);
     }
 
-    Status ModifierSet::log(mutablebson::Element logRoot) const {
+    Status ModifierSet::log(LogBuilder* logBuilder) const {
 
         // We'd like to create an entry such as {$set: {<fieldname>: <value>}} under 'logRoot'.
         // We start by creating the {$set: ...} Element.
-        mutablebson::Document& doc = logRoot.getDocument();
-        mutablebson::Element setElement = doc.makeElementObject("$set");
-        if (!setElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot create log entry for $set mod");
-        }
+        mutablebson::Document& doc = logBuilder->getDocument();
 
-        // Then we create the {<fieldname>: <value>} Element. Note that we log the mod with a
+        // Create the {<fieldname>: <value>} Element. Note that we log the mod with a
         // dotted field, if it was applied over a dotted field. The rationale is that the
         // secondary may be in a different state than the primary and thus make different
         // decisions about creating the intermediate path in _fieldRef or not.
-        mutablebson::Element logElement = doc.makeElementWithNewFieldName(_fieldRef.dottedField(),
-                                                                          _val);
+        mutablebson::Element logElement = doc.makeElementWithNewFieldName(
+            _fieldRef.dottedField(), _val);
+
         if (!logElement.ok()) {
             return Status(ErrorCodes::InternalError, "cannot create details for $set mod");
         }
 
-        // Now, we attach the {<fieldname>: <value>} Element under the {$set: ...} one.
-        Status status = setElement.pushBack(logElement);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        // And attach the result under the 'logRoot' Element provided.
-        return logRoot.pushBack(setElement);
+        return logBuilder->addToSets(logElement);
     }
 
 } // namespace mongo

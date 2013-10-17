@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -22,32 +34,27 @@
 
 #include <boost/filesystem/operations.hpp>
 
-#include "mongo/db/cmdline.h"
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/dur.h"
 #include "mongo/db/lockstate.h"
-#include "mongo/db/pdfile.h"
-#include "mongo/db/storage/extent.h"
 #include "mongo/util/file_allocator.h"
 
 namespace mongo {
 
+    BOOST_STATIC_ASSERT( sizeof(DataFileHeader)-4 == 8192 );
 
-    // XXX-ERH
-    void addNewExtentToNamespace(const char *ns, Extent *e, DiskLoc eloc, DiskLoc emptyLoc, bool capped);
-
-    static void data_file_check(void *_mb) { 
+    static void data_file_check(void *_mb) {
         if( sizeof(char *) == 4 )
-            uassert( 10084 , "can't map file memory - mongo requires 64 bit build for larger datasets", _mb != 0);
+            uassert( 10084, "can't map file memory - mongo requires 64 bit build for larger datasets", _mb != 0);
         else
-            uassert( 10085 , "can't map file memory", _mb != 0);
+            uassert( 10085, "can't map file memory", _mb != 0);
     }
 
     int DataFile::maxSize() {
         if ( sizeof( int* ) == 4 ) {
             return 512 * 1024 * 1024;
         }
-        else if ( cmdLine.smallfiles ) {
+        else if (storageGlobalParams.smallfiles) {
             return 0x7ff00000 >> 2;
         }
         else {
@@ -73,7 +80,7 @@ namespace mongo {
             size = (64*1024*1024) << fileNo;
         else
             size = 0x7ff00000;
-        if ( cmdLine.smallfiles ) {
+        if (storageGlobalParams.smallfiles) {
             size = size >> 2;
         }
         return size;
@@ -93,9 +100,10 @@ namespace mongo {
         unsigned long long sz = mmf.length();
         verify( sz <= 0x7fffffff );
         verify( sz % 4096 == 0 );
-        if( sz < 64*1024*1024 && !cmdLine.smallfiles ) {
+        if (sz < 64*1024*1024 && !storageGlobalParams.smallfiles) {
             if( sz >= 16*1024*1024 && sz % (1024*1024) == 0 ) {
-                log() << "info openExisting file size " << sz << " but cmdLine.smallfiles=false: "
+                log() << "info openExisting file size " << sz
+                      << " but storageGlobalParams.smallfiles=false: "
                       << filename << endl;
             }
             else {
@@ -121,11 +129,11 @@ namespace mongo {
         if ( size > maxSize() )
             size = maxSize();
 
-        verify( size >= 64*1024*1024 || cmdLine.smallfiles );
+        verify(size >= 64*1024*1024 || storageGlobalParams.smallfiles);
         verify( size % 4096 == 0 );
 
         if ( preallocateOnly ) {
-            if ( cmdLine.prealloc ) {
+            if (storageGlobalParams.prealloc) {
                 FileAllocator::get()->requestAllocation( filename, size );
             }
             return;
@@ -147,41 +155,20 @@ namespace mongo {
         mmf.flush( sync );
     }
 
-    Extent* DataFile::createExtent(const char *ns, int approxSize, bool newCapped, int loops) {
-        verify( approxSize <= Extent::maxSize() );
-        {
-            // make sizes align with VM page size
-            int newSize = (approxSize + 0xfff) & 0xfffff000;
-            verify( newSize >= 0 );
-            if( newSize < Extent::maxSize() )
-                approxSize = newSize;
-        }
-        massert( 10357 ,  "shutdown in progress", ! inShutdown() );
-        massert( 10358 ,  "bad new extent size", approxSize >= Extent::minSize() && approxSize <= Extent::maxSize() );
-        massert( 10359 ,  "header==0 on new extent: 32 bit mmap space exceeded?", header() ); // null if file open failed
-        int ExtentSize = min(header()->unusedLength, approxSize);
+    DiskLoc DataFile::allocExtentArea( int size ) {
 
-        verify( ExtentSize >= Extent::minSize() ); // TODO: maybe return NULL
+        massert( 10357, "shutdown in progress", !inShutdown() );
+        massert( 10359, "header==0 on new extent: 32 bit mmap space exceeded?", header() ); // null if file open failed
+
+        verify( size <= header()->unusedLength );
 
         int offset = header()->unused.getOfs();
 
         DataFileHeader *h = header();
-        h->unused.writing().set( fileNo, offset + ExtentSize );
-        getDur().writingInt(h->unusedLength) = h->unusedLength - ExtentSize;
+        h->unused.writing().set( fileNo, offset + size );
+        getDur().writingInt(h->unusedLength) = h->unusedLength - size;
 
-        DiskLoc loc;
-        loc.set(fileNo, offset);
-        Extent *e = _getExtent(loc);
-        DiskLoc emptyLoc = getDur().writing(e)->init(ns, ExtentSize, fileNo, offset, newCapped);
-
-        addNewExtentToNamespace(ns, e, loc, emptyLoc, newCapped);
-
-        DEV {
-            MONGO_TLOG(1) << "new extent " << ns << " size: 0x" << hex << ExtentSize << " loc: 0x"
-                          << hex << offset << " emptyLoc:" << hex << emptyLoc.getOfs() << dec
-                          << endl;
-        }
-        return e;
+        return DiskLoc( fileNo, offset );
     }
 
     // -------------------------------------------------------------------------------

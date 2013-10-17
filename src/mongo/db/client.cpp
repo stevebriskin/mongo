@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 /* Client represents a connection to the database (the server-side) and corresponds
@@ -44,6 +56,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
@@ -53,6 +66,15 @@
 #include "mongo/util/mongoutils/checksum.h"
 #include "mongo/util/mongoutils/str.h"
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+#define ASAN_ENABLED __has_feature(address_sanitizer)
+#define MSAN_ENABLED __has_feature(memory_sanitizer)
+#define TSAN_ENABLED __has_feature(thread_sanitizer)
+#define XSAN_ENABLED (ASAN_ENABLED || MSAN_ENABLED || TSAN_ENABLED)
+
 namespace mongo {
 
     mongo::mutex& Client::clientsMutex = *(new mutex("clientsMutex"));
@@ -60,7 +82,7 @@ namespace mongo {
 
     TSP_DEFINE(Client, currentClient)
 
-#if defined(_DEBUG)
+#if defined(_DEBUG) && !defined(MONGO_OPTIMIZED_BUILD) && !XSAN_ENABLED
     struct StackChecker;
     ThreadLocalValue<StackChecker *> checker;
 
@@ -113,7 +135,7 @@ namespace mongo {
        call this when your thread starts.
     */
     Client& Client::initThread(const char *desc, AbstractMessagingPort *mp) {
-#if defined(_DEBUG)
+#if defined(_DEBUG) && !defined(MONGO_OPTIMIZED_BUILD) && !XSAN_ENABLED
         {
             if( sizeof(void*) == 8 ) {
                 StackChecker sc;
@@ -209,7 +231,7 @@ namespace mongo {
     }
 
     bool Client::shutdown() {
-#if defined(_DEBUG)
+#if defined(_DEBUG) && !defined(MONGO_OPTIMIZED_BUILD) && !XSAN_ENABLED
         {
             if( sizeof(void*) == 8 ) {
                 StackChecker::check( desc() );
@@ -231,7 +253,8 @@ namespace mongo {
     Client::Context::Context(const std::string& ns , Database * db) :
         _client( currentClient.get() ), 
         _oldContext( _client->_context ),
-        _path( mongo::dbpath ), // is this right? could be a different db? may need a dassert for this
+        _path(storageGlobalParams.dbpath), // is this right? could be a different db?
+                                               // may need a dassert for this
         _justCreated(false),
         _doVersion( true ),
         _ns( ns ), 
@@ -440,7 +463,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::handshake);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             Client& c = cc();
@@ -544,6 +567,7 @@ namespace mongo {
         idhack = false;
         scanAndOrder = false;
         nupdated = -1;
+        nupdateNoops = -1;
         ninserted = -1;
         ndeleted = -1;
         nmoved = -1;
@@ -610,7 +634,7 @@ namespace mongo {
         }
 
         if ( curop.numYields() )
-            s << " numYields: " << curop.numYields();
+            s << " numYields:" << curop.numYields();
         
         s << " ";
         curop.lockStat().report( s );

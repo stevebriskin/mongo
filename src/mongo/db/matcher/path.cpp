@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/pch.h"
@@ -73,8 +85,11 @@ namespace mongo {
 
 
     // ------
+    BSONElementIterator::BSONElementIterator() {
+        _path = NULL;
+    }
 
-    BSONElementIterator::BSONElementIterator( const ElementPath& path, const BSONObj& context )
+    BSONElementIterator::BSONElementIterator( const ElementPath* path, const BSONObj& context )
         : _path( path ), _context( context ) {
         _state = BEGIN;
         //log() << "path: " << path.fieldRef().dottedField() << " context: " << context << endl;
@@ -83,8 +98,19 @@ namespace mongo {
     BSONElementIterator::~BSONElementIterator() {
     }
 
+    void BSONElementIterator::reset( const ElementPath* path, const BSONObj& context ) {
+        _path = path;
+        _context = context;
+        _state = BEGIN;
+        _next.reset();
+
+        _subCursor.reset();
+        _subCursorPath.reset();
+    }
+
+
     void BSONElementIterator::ArrayIterationState::reset( const FieldRef& ref, int start ) {
-        restOfPath = ref.dottedField( start );
+        restOfPath = ref.dottedField( start ).toString();
         hasMore = restOfPath.size() > 0;
         if ( hasMore ) {
             nextPieceOfPath = ref.getPart( start );
@@ -134,8 +160,8 @@ namespace mongo {
 
                 _subCursorPath.reset( new ElementPath() );
                 _subCursorPath->init( _arrayIterationState.restOfPath.substr( _arrayIterationState.nextPieceOfPath.size() + 1 ) );
-                _subCursorPath->setTraverseLeafArray( _path.shouldTraverseLeafArray() );
-                _subCursor.reset( new BSONElementIterator( *_subCursorPath, _arrayIterationState._current.Obj() ) );
+                _subCursorPath->setTraverseLeafArray( _path->shouldTraverseLeafArray() );
+                _subCursor.reset( new BSONElementIterator( _subCursorPath.get(), _arrayIterationState._current.Obj() ) );
                 _arrayIterationState._current = BSONElement();
                 return more();
             }
@@ -151,7 +177,7 @@ namespace mongo {
 
         if ( _state == BEGIN ) {
             size_t idxPath = 0;
-            BSONElement e = getFieldDottedOrArray( _context, _path.fieldRef(), &idxPath );
+            BSONElement e = getFieldDottedOrArray( _context, _path->fieldRef(), &idxPath );
 
             if ( e.type() != Array ) {
                 _next.reset( e, BSONElement(), false );
@@ -161,9 +187,9 @@ namespace mongo {
 
             // its an array
 
-            _arrayIterationState.reset( _path.fieldRef(), idxPath + 1 );
+            _arrayIterationState.reset( _path->fieldRef(), idxPath + 1 );
 
-            if ( !_arrayIterationState.hasMore && !_path.shouldTraverseLeafArray() ) {
+            if ( !_arrayIterationState.hasMore && !_path->shouldTraverseLeafArray() ) {
                 _next.reset( e, BSONElement(), true );
                 _state = DONE;
                 return true;
@@ -189,9 +215,9 @@ namespace mongo {
                 if ( x.type() == Object ) {
                     _subCursorPath.reset( new ElementPath() );
                     _subCursorPath->init( _arrayIterationState.restOfPath );
-                    _subCursorPath->setTraverseLeafArray( _path.shouldTraverseLeafArray() );
+                    _subCursorPath->setTraverseLeafArray( _path->shouldTraverseLeafArray() );
 
-                    _subCursor.reset( new BSONElementIterator( *_subCursorPath, x.Obj() ) );
+                    _subCursor.reset( new BSONElementIterator( _subCursorPath.get(), x.Obj() ) );
                     return more();
                 }
 
@@ -206,8 +232,8 @@ namespace mongo {
                     if ( x.isABSONObj() ) {
                         _subCursorPath.reset( new ElementPath() );
                         _subCursorPath->init( _arrayIterationState.restOfPath.substr( _arrayIterationState.nextPieceOfPath.size() + 1 ) );
-                        _subCursorPath->setTraverseLeafArray( _path.shouldTraverseLeafArray() );
-                        BSONElementIterator* real = new BSONElementIterator( *_subCursorPath, _arrayIterationState._current.Obj() );
+                        _subCursorPath->setTraverseLeafArray( _path->shouldTraverseLeafArray() );
+                        BSONElementIterator* real = new BSONElementIterator( _subCursorPath.get(), _arrayIterationState._current.Obj() );
                         _subCursor.reset( real );
                         real->_arrayIterationState.reset( _subCursorPath->fieldRef(), 0 );
                         real->_arrayIterationState.startIterator( x );

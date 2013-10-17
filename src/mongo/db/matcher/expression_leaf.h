@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -28,6 +40,19 @@
 
 namespace mongo {
 
+    /**
+     * This file contains leaves in the parse tree that are not array-based.
+     *
+     * LeafMatchExpression: REGEX MOD EXISTS MATCH_IN
+     * ComparisonMatchExpression: EQ LTE LT GT GTE
+     * MatchExpression: TYPE_OPERATOR
+     */
+
+    /**
+     * Many operators subclass from this:
+     * REGEX, MOD, EXISTS, IN
+     * Everything that inherits from ComparisonMatchExpression.
+     */
     class LeafMatchExpression : public MatchExpression {
     public:
         LeafMatchExpression( MatchType matchType )
@@ -36,13 +61,11 @@ namespace mongo {
 
         virtual ~LeafMatchExpression(){}
 
-        virtual LeafMatchExpression* shallowClone() const = 0;
-
         virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
 
         virtual bool matchesSingleElement( const BSONElement& e ) const = 0;
 
-        const StringData path() const { return _path; }
+        virtual const StringData path() const { return _path; }
 
     protected:
         Status initPath( const StringData& path );
@@ -52,8 +75,9 @@ namespace mongo {
         ElementPath _elementPath;
     };
 
-    // -----
-
+    /**
+     * EQ, LTE, LT, GT, GTE subclass from ComparisonMatchExpression.
+     */
     class ComparisonMatchExpression : public LeafMatchExpression {
     public:
         ComparisonMatchExpression( MatchType type ) : LeafMatchExpression( type ){}
@@ -70,9 +94,15 @@ namespace mongo {
 
         virtual bool equivalent( const MatchExpression* other ) const;
 
+        const BSONElement& getData() const { return _rhs; }
+
     protected:
         BSONElement _rhs;
     };
+
+    //
+    // ComparisonMatchExpression inheritors
+    //
 
     class EqualityMatchExpression : public ComparisonMatchExpression {
     public:
@@ -80,6 +110,9 @@ namespace mongo {
         virtual LeafMatchExpression* shallowClone() const {
             ComparisonMatchExpression* e = new EqualityMatchExpression();
             e->init( path(), _rhs  );
+            if ( getTag() ) {
+                e->setTag(getTag()->clone());
+            }
             return e;
         }
     };
@@ -90,6 +123,9 @@ namespace mongo {
         virtual LeafMatchExpression* shallowClone() const {
             ComparisonMatchExpression* e = new LTEMatchExpression();
             e->init( path(), _rhs  );
+            if ( getTag() ) {
+                e->setTag(getTag()->clone());
+            }
             return e;
         }
 
@@ -101,6 +137,9 @@ namespace mongo {
         virtual LeafMatchExpression* shallowClone() const {
             ComparisonMatchExpression* e = new LTMatchExpression();
             e->init( path(), _rhs  );
+            if ( getTag() ) {
+                e->setTag(getTag()->clone());
+            }
             return e;
         }
 
@@ -112,6 +151,9 @@ namespace mongo {
         virtual LeafMatchExpression* shallowClone() const {
             ComparisonMatchExpression* e = new GTMatchExpression();
             e->init( path(), _rhs  );
+            if ( getTag() ) {
+                e->setTag(getTag()->clone());
+            }
             return e;
         }
 
@@ -123,10 +165,17 @@ namespace mongo {
         virtual LeafMatchExpression* shallowClone() const {
             ComparisonMatchExpression* e = new GTEMatchExpression();
             e->init( path(), _rhs  );
+            if ( getTag() ) {
+                e->setTag(getTag()->clone());
+            }
             return e;
         }
 
     };
+
+    //
+    // LeafMatchExpression inheritors
+    //
 
     class RegexMatchExpression : public LeafMatchExpression {
     public:
@@ -145,6 +194,9 @@ namespace mongo {
         virtual LeafMatchExpression* shallowClone() const {
             RegexMatchExpression* e = new RegexMatchExpression();
             e->init( path(), _regex, _flags );
+            if ( getTag() ) {
+                e->setTag(getTag()->clone());
+            }
             return e;
         }
 
@@ -153,6 +205,9 @@ namespace mongo {
         virtual void debugString( StringBuilder& debug, int level ) const;
 
         virtual bool equivalent( const MatchExpression* other ) const;
+
+        const string& getString() const { return _regex; }
+        const string& getFlags() const { return _flags; }
 
     private:
         std::string _regex;
@@ -169,6 +224,9 @@ namespace mongo {
         virtual LeafMatchExpression* shallowClone() const {
             ModMatchExpression* m = new ModMatchExpression();
             m->init( path(), _divisor, _remainder );
+            if ( getTag() ) {
+                m->setTag(getTag()->clone());
+            }
             return m;
         }
 
@@ -177,6 +235,9 @@ namespace mongo {
         virtual void debugString( StringBuilder& debug, int level ) const;
 
         virtual bool equivalent( const MatchExpression* other ) const;
+
+        int getDivisor() const { return _divisor; }
+        int getRemainder() const { return _remainder; }
 
     private:
         int _divisor;
@@ -192,6 +253,9 @@ namespace mongo {
         virtual LeafMatchExpression* shallowClone() const {
             ExistsMatchExpression* e = new ExistsMatchExpression();
             e->init( path() );
+            if ( getTag() ) {
+                e->setTag(getTag()->clone());
+            }
             return e;
         }
 
@@ -200,29 +264,6 @@ namespace mongo {
         virtual void debugString( StringBuilder& debug, int level ) const;
 
         virtual bool equivalent( const MatchExpression* other ) const;
-    };
-
-    class TypeMatchExpression : public MatchExpression {
-    public:
-        TypeMatchExpression() : MatchExpression( TYPE_OPERATOR ){}
-
-        Status init( const StringData& path, int type );
-
-        virtual bool matchesSingleElement( const BSONElement& e ) const;
-
-        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
-
-        virtual void debugString( StringBuilder& debug, int level ) const;
-
-        virtual bool equivalent( const MatchExpression* other ) const;
-    private:
-        bool _matches( const StringData& path,
-                       const MatchableDocument* doc,
-                       MatchDetails* details = 0 ) const;
-
-        StringData _path;
-        ElementPath _elementPath;
-        int _type;
     };
 
     /**
@@ -254,6 +295,7 @@ namespace mongo {
         bool equivalent( const ArrayFilterEntries& other ) const;
 
         void copyTo( ArrayFilterEntries& toFillIn ) const;
+
     private:
         bool _hasNull; // if _equalities has a jstNULL element in it
         bool _hasEmptyArray;
@@ -281,10 +323,59 @@ namespace mongo {
 
         void copyTo( InMatchExpression* toFillIn ) const;
 
+        const ArrayFilterEntries& getData() const { return _arrayEntries; }
+
     private:
         bool _matchesRealElement( const BSONElement& e ) const;
         ArrayFilterEntries _arrayEntries;
     };
 
+    //
+    // The odd duck out, TYPE_OPERATOR.
+    //
 
-}
+    /**
+     * Type has some odd semantics with arrays and as such it can't inherit from
+     * LeafMatchExpression.
+     */
+    class TypeMatchExpression : public MatchExpression {
+    public:
+        TypeMatchExpression() : MatchExpression( TYPE_OPERATOR ){}
+
+        Status init( const StringData& path, int type );
+
+        virtual MatchExpression* shallowClone() const {
+            TypeMatchExpression* e = new TypeMatchExpression();
+            e->init(_path, _type);
+            if ( getTag() ) {
+                e->setTag(getTag()->clone());
+            }
+            return e;
+        }
+
+        virtual bool matchesSingleElement( const BSONElement& e ) const;
+
+        virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
+
+        virtual void debugString( StringBuilder& debug, int level ) const;
+
+        virtual bool equivalent( const MatchExpression* other ) const;
+
+        /**
+         * What is the type we're matching against?
+         */
+        int getData() const { return _type; }
+
+        virtual const StringData path() const { return _path; }
+
+    private:
+        bool _matches( const StringData& path,
+                       const MatchableDocument* doc,
+                       MatchDetails* details = 0 ) const;
+
+        StringData _path;
+        ElementPath _elementPath;
+        int _type;
+    };
+
+}  // namespace mongo

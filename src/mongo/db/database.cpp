@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -23,12 +35,20 @@
 #include <algorithm>
 #include <boost/filesystem/operations.hpp>
 
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/auth_index_d.h"
+#include "mongo/db/background.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/database_holder.h"
+#include "mongo/db/index.h"
+#include "mongo/db/index_update.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/ops/delete.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/db/structure/collection.h"
 
 namespace mongo {
 
@@ -40,6 +60,11 @@ namespace mongo {
             log() << "\n\n\nWARNING: ccByLoc not empty on database close! "
                   << _ccByLoc.size() << ' ' << _name << endl;
         }
+
+        for ( CollectionMap::iterator i = _collections.begin(); i != _collections.end(); ++i ) {
+            delete i->second;
+        }
+        _collections.clear();
     }
 
     Status Database::validateDBName( const StringData& dbname ) {
@@ -80,8 +105,11 @@ namespace mongo {
     Database::Database(const char *nm, bool& newDb, const string& path )
         : _name(nm), _path(path),
           _namespaceIndex( _path, _name ),
-          _extentManager( _name, _path ),
-          _profileName(_name + ".system.profile")
+          _extentManager(_name, _path, 0, storageGlobalParams.directoryperdb),
+          _profileName(_name + ".system.profile"),
+          _namespacesName(_name + ".system.namespaces"),
+          _extentFreelistName( _name + ".$freelist" ),
+          _collectionLock( "Database::_collectionLock" )
     {
         Status status = validateDBName( _name );
         if ( !status.isOK() ) {
@@ -91,13 +119,14 @@ namespace mongo {
 
         try {
             newDb = _namespaceIndex.exists();
-            _profile = cmdLine.defaultProfile;
+            _profile = serverGlobalParams.defaultProfile;
             checkDuplicateUncasedNames(true);
 
             // If already exists, open.  Otherwise behave as if empty until
             // there's a write, then open.
             if (!newDb) {
                 _namespaceIndex.init();
+                _extentManager.init( _namespaceIndex.details( _extentFreelistName ) );
                 openAllFiles();
             }
             _magic = 781231;
@@ -161,55 +190,6 @@ namespace mongo {
         return "";
     }
 
-    /*
-    bool Database::openExistingFile( int n ) {
-        verify(this);
-        Lock::assertWriteLocked(_name);
-        {
-            // must not yet be visible to others as we aren't in the db's write lock and
-            // we will write to _files vector - thus this assert.
-            bool loaded = dbHolder().__isLoaded(_name, _path);
-            verify( !loaded );
-        }
-        // additionally must be in the dbholder mutex (no assert for that yet)
-
-        // todo: why here? that could be bad as we may be read locked only here
-        _namespaceIndex.init();
-
-        if ( n < 0 || n >= DiskLoc::MaxFiles ) {
-            massert( 15924 , str::stream() << "getFile(): bad file number value " << n << " (corrupt db?): run repair", false);
-        }
-
-        {
-            if( n < (int) _files.size() && _files[n] ) {
-                MONGO_DLOG(2) << "openExistingFile " << n << " is already open" << endl;
-                return true;
-            }
-        }
-
-        {
-            boost::filesystem::path fullName = fileName( n );
-            string fullNameString = fullName.string();
-            DataFile *df = new DataFile(n);
-            try {
-                if( !df->openExisting( fullNameString.c_str() ) ) { 
-                    delete df;
-                    return false;
-                }
-            }
-            catch ( AssertionException& ) {
-                delete df;
-                throw;
-            }
-            while ( n >= (int) _files.size() ) {
-                _files.push_back(0);
-            }
-            _files[n] = df;
-        }
-
-        return true;
-    }
-    */
     // todo : we stop once a datafile dne.
     //        if one datafile were missing we should keep going for
     //        repair purposes yet we do not.
@@ -232,11 +212,10 @@ namespace mongo {
         // to avoid modifying the system.namespaces collection while iterating over it since that
         // would corrupt the cursor.
         vector<string> toDelete;
-        shared_ptr<Cursor> cursor = theDataFileMgr.findAll(systemNamespaces);
-        while ( cursor && cursor->ok() ) {
-            BSONObj nsObj = cursor->current();
-            cursor->advance();
-
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(systemNamespaces));
+        BSONObj nsObj;
+        Runner::RunnerState state;
+        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&nsObj, NULL))) {
             BSONElement e = nsObj.getFieldDotted( "options.temp" );
             if ( !e.trueValue() )
                 continue;
@@ -250,81 +229,18 @@ namespace mongo {
             toDelete.push_back(ns);
         }
 
+        if (Runner::RUNNER_EOF != state) {
+            warning() << "Internal error while reading collection " << systemNamespaces << endl;
+        }
+
         for (size_t i=0; i < toDelete.size(); i++) {
-            const string& ns = toDelete[i];
-
-            string errmsg;
-            BSONObjBuilder result;
-            dropCollection(ns, errmsg, result);
-
-            if ( errmsg.size() > 0 ) {
-                warning() << "could not delete temp collection: " << ns
-                          << " because of: " << errmsg << endl;
-            }
+            BSONObj info;
+            // using DBDirectClient to ensure this ends up in opLog
+            bool ok = DBDirectClient().dropCollection(toDelete[i], &info);
+            if (!ok)
+                warning() << "could not drop temp collection '" << toDelete[i] << "': " << info;
         }
     }
-
-    bool fileIndexExceedsQuota( const char *ns, int fileIndex, bool enforceQuota ) {
-        return
-            cmdLine.quota &&
-            enforceQuota &&
-            fileIndex >= cmdLine.quotaFiles &&
-            // we don't enforce the quota on "special" namespaces as that could lead to problems -- e.g.
-            // rejecting an index insert after inserting the main record.
-            !NamespaceString::special( ns ) &&
-            nsToDatabaseSubstring( ns ) != "local";
-    }
-
-    DataFile* Database::suitableFile( const char *ns, int sizeNeeded, bool preallocate, bool enforceQuota ) {
-
-        // check existing files
-        for ( int i=numFiles()-1; i>=0; i-- ) {
-            DataFile* f = getFile( i );
-            if ( f->getHeader()->unusedLength >= sizeNeeded ) {
-                if ( fileIndexExceedsQuota( ns, i-1, enforceQuota ) ) // NOTE i-1 is the value used historically for this check.
-                    ;
-                else
-                    return f;
-            }
-        }
-
-        if ( fileIndexExceedsQuota( ns, numFiles(), enforceQuota ) ) {
-            if ( cc().hasWrittenThisPass() ) {
-                warning() << "quota exceeded, but can't assert, probably going over quota for: " << ns << endl;
-            }
-            else {
-                log() << "quota exceeded for namespace: " << ns << endl;
-                uasserted(12501, "quota exceeded");
-            }
-        }
-
-        // allocate files until we either get one big enough or hit maxSize
-        for ( int i = 0; i < 8; i++ ) {
-            DataFile* f = addAFile( sizeNeeded, preallocate );
-
-            if ( f->getHeader()->unusedLength >= sizeNeeded )
-                return f;
-
-            if ( f->getHeader()->fileLength >= DataFile::maxSize() ) // this is as big as they get so might as well stop
-                return f;
-        }
-
-        uasserted(14810, "couldn't allocate space (suitableFile)"); // callers don't check for null return code
-        return 0;
-    }
-
-    Extent* Database::allocExtent( const char *ns, int size, bool capped, bool enforceQuota ) {
-        // todo: when profiling, these may be worth logging into profile collection
-        bool fromFreeList = true;
-        Extent *e = DataFileMgr::allocFromFreeList( ns, size, capped );
-        if( e == 0 ) {
-            fromFreeList = false;
-            e = suitableFile( ns, size, !capped, enforceQuota )->createExtent( ns, size, capped );
-        }
-        LOG(1) << "allocExtent " << ns << " size " << size << ' ' << fromFreeList << endl; 
-        return e;
-    }
-
 
     bool Database::setProfilingLevel( int newLevel , string& errmsg ) {
         if ( _profile == newLevel )
@@ -349,5 +265,364 @@ namespace mongo {
         return true;
     }
 
+    Status Database::dropCollection( const StringData& fullns ) {
+        LOG(1) << "dropCollection: " << fullns << endl;
+
+        Collection* collection = getCollection( fullns );
+        if ( !collection ) {
+            // collection doesn't exist
+            return Status::OK();
+        }
+
+        _initForWrites();
+
+        {
+            NamespaceString s( fullns );
+            verify( s.db() == _name );
+
+            if( s.isSystem() ) {
+                if( s.coll() == "system.profile" ) {
+                    if ( _profile != 0 )
+                        return Status( ErrorCodes::IllegalOperation,
+                                       "turn off profiling before dropping system.profile collection" );
+                }
+                else {
+                    return Status( ErrorCodes::IllegalOperation, "can't drop system ns" );
+                }
+            }
+        }
+
+        BackgroundOperation::assertNoBgOpInProgForNs( fullns );
+
+        audit::logDropCollection( currentClient.get(), fullns );
+
+        if ( collection->_details->getTotalIndexCount() > 0 ) {
+            try {
+                string errmsg;
+                BSONObjBuilder result;
+
+                if ( !dropIndexes( collection->_details, fullns, "*", errmsg, result, true) ) {
+                    warning() << "could not drop collection: " << fullns
+                              << " because of " << errmsg << endl;
+                    return Status( ErrorCodes::InternalError, errmsg );
+                }
+            }
+            catch( DBException& e ) {
+                stringstream ss;
+                ss << "drop: dropIndexes for collection failed - consider trying repair ";
+                ss << " cause: " << e.what();
+                warning() << ss.str() << endl;
+                return Status( ErrorCodes::InternalError, ss.str() );
+            }
+            verify( collection->_details->getTotalIndexCount() == 0 );
+        }
+        LOG(1) << "\t dropIndexes done" << endl;
+
+        ClientCursor::invalidate( fullns );
+        Top::global.collectionDropped( fullns );
+
+        Status s = _dropNS( fullns );
+
+        _clearCollectionCache( fullns ); // we want to do this always
+
+        if ( !s.isOK() )
+            return s;
+
+        DEV {
+            // check all index collection entries are gone
+            string nstocheck = fullns.toString() + ".$";
+            scoped_lock lk( _collectionLock );
+            for ( CollectionMap::iterator i = _collections.begin();
+                  i != _collections.end();
+                  ++i ) {
+                string temp = i->first;
+                if ( temp.find( nstocheck ) != 0 )
+                    continue;
+                log() << "after drop, bad cache entries for: "
+                      << fullns << " have " << temp;
+                verify(0);
+            }
+        }
+
+        return Status::OK();
+    }
+
+    void Database::_clearCollectionCache( const StringData& fullns ) {
+        scoped_lock lk( _collectionLock );
+        _clearCollectionCache_inlock( fullns );
+    }
+
+    void Database::_clearCollectionCache_inlock( const StringData& fullns ) {
+        verify( _name == nsToDatabaseSubstring( fullns ) );
+        CollectionMap::iterator it = _collections.find( fullns.toString() );
+        if ( it == _collections.end() )
+            return;
+
+        delete it->second;
+        _collections.erase( it );
+    }
+
+    Collection* Database::getCollection( const StringData& ns ) {
+        verify( _name == nsToDatabaseSubstring( ns ) );
+
+        scoped_lock lk( _collectionLock );
+
+        string myns = ns.toString();
+
+        CollectionMap::const_iterator it = _collections.find( myns );
+        if ( it != _collections.end() ) {
+            if ( it->second ) {
+                DEV {
+                    NamespaceDetails* details = _namespaceIndex.details( ns );
+                    if ( details != it->second->_details ) {
+                        log() << "about to crash for mismatch on ns: " << ns
+                              << " current: " << (void*)details
+                              << " cached: " << (void*)it->second->_details;
+                    }
+                    verify( details == it->second->_details );
+                }
+                return it->second;
+            }
+        }
+
+        NamespaceDetails* details = _namespaceIndex.details( ns );
+        if ( !details ) {
+            return NULL;
+        }
+
+        Collection* c = new Collection( ns, details, this );
+        _collections[myns] = c;
+        return c;
+    }
+
+
+
+    Status Database::renameCollection( const StringData& fromNS, const StringData& toNS,
+                                       bool stayTemp ) {
+
+        // move data namespace
+        Status s = _renameSingleNamespace( fromNS, toNS, stayTemp );
+        if ( !s.isOK() )
+            return s;
+
+        NamespaceDetails* details = _namespaceIndex.details( toNS );
+        verify( details );
+
+        audit::logRenameCollection( currentClient.get(), fromNS, toNS );
+
+        // move index namespaces
+        string indexName = _name + ".system.indexes";
+        BSONObj oldIndexSpec;
+        while( Helpers::findOne( indexName, BSON( "ns" << fromNS ), oldIndexSpec ) ) {
+            oldIndexSpec = oldIndexSpec.getOwned();
+
+            BSONObj newIndexSpec;
+            {
+                BSONObjBuilder b;
+                BSONObjIterator i( oldIndexSpec );
+                while( i.more() ) {
+                    BSONElement e = i.next();
+                    if ( strcmp( e.fieldName(), "ns" ) != 0 )
+                        b.append( e );
+                    else
+                        b << "ns" << toNS;
+                }
+                newIndexSpec = b.obj();
+            }
+
+            DiskLoc newIndexSpecLoc = theDataFileMgr.insert( indexName.c_str(),
+                                                             newIndexSpec.objdata(),
+                                                             newIndexSpec.objsize(),
+                                                             false,
+                                                             true,
+                                                             false );
+            int indexI = details->findIndexByName( oldIndexSpec.getStringField( "name" ) );
+            IndexDetails &indexDetails = details->idx(indexI);
+            string oldIndexNs = indexDetails.indexNamespace();
+            indexDetails.info = newIndexSpecLoc;
+            string newIndexNs = indexDetails.indexNamespace();
+
+            Status s = _renameSingleNamespace( oldIndexNs, newIndexNs, false );
+            if ( !s.isOK() )
+                return s;
+
+            deleteObjects( indexName, oldIndexSpec, true, false, true );
+        }
+
+        Top::global.collectionDropped( fromNS.toString() );
+
+        return Status::OK();
+    }
+
+    Status Database::_renameSingleNamespace( const StringData& fromNS, const StringData& toNS,
+                                             bool stayTemp ) {
+
+        // TODO: make it so we dont't need to do this
+        string fromNSString = fromNS.toString();
+        string toNSString = toNS.toString();
+
+        // some sanity checking
+        NamespaceDetails* fromDetails = _namespaceIndex.details( fromNS );
+        if ( !fromDetails )
+            return Status( ErrorCodes::BadValue, "from namespace doesn't exist" );
+
+        if ( _namespaceIndex.details( toNS ) )
+            return Status( ErrorCodes::BadValue, "to namespace already exists" );
+
+        // remove anything cached
+        {
+            scoped_lock lk( _collectionLock );
+            _clearCollectionCache_inlock( fromNSString );
+            _clearCollectionCache_inlock( toNSString );
+        }
+
+        ClientCursor::invalidate( fromNSString.c_str() );
+        ClientCursor::invalidate( toNSString.c_str() );
+
+        // at this point, we haven't done anything destructive yet
+
+        // ----
+        // actually start moving
+        // ----
+
+        // this could throw, but if it does we're ok
+        _namespaceIndex.add_ns( toNS, fromDetails );
+        NamespaceDetails* toDetails = _namespaceIndex.details( toNS );
+
+        try {
+            toDetails->copyingFrom(toNSString.c_str(), fromDetails); // fixes extraOffset
+        }
+        catch( DBException& ) {
+            // could end up here if .ns is full - if so try to clean up / roll back a little
+            _namespaceIndex.kill_ns( toNSString );
+            _clearCollectionCache(toNSString);
+            throw;
+        }
+
+        // at this point, code .ns stuff moved
+
+        _namespaceIndex.kill_ns( fromNSString );
+        _clearCollectionCache(fromNSString);
+        fromDetails = NULL;
+
+        // fix system.namespaces
+        BSONObj newSpec;
+        {
+
+            BSONObj oldSpec;
+            if ( !Helpers::findOne( _namespacesName, BSON( "name" << fromNS ), oldSpec ) )
+                return Status( ErrorCodes::InternalError, "can't find system.namespaces entry" );
+
+            BSONObjBuilder b;
+            BSONObjIterator i( oldSpec.getObjectField( "options" ) );
+            while( i.more() ) {
+                BSONElement e = i.next();
+                if ( strcmp( e.fieldName(), "create" ) != 0 ) {
+                    if (stayTemp || (strcmp(e.fieldName(), "temp") != 0))
+                        b.append( e );
+                }
+                else {
+                    b << "create" << toNS;
+                }
+            }
+            newSpec = b.obj();
+        }
+
+        _addNamespaceToCatalog( toNSString, newSpec.isEmpty() ? 0 : &newSpec );
+
+        deleteObjects( _namespacesName, BSON( "name" << fromNS ), false, false, true );
+
+        return Status::OK();
+    }
+
+    void Database::_initExtentFreeList() {
+        NamespaceDetails* details = _namespaceIndex.details( _extentFreelistName );
+        if ( !details ) {
+            _namespaceIndex.add_ns( _extentFreelistName, DiskLoc(), false );
+            details = _namespaceIndex.details( _extentFreelistName );
+            verify( details );
+
+            // TODO: this is an odd place, but because of lazy init,
+            // this is the only place its safe/easy
+            audit::logCreateDatabase( currentClient.get(), _name );
+        }
+        _extentManager.init( details );
+        verify( _extentManager.hasFreeList() );
+        log() << "have free list for " << _extentFreelistName << endl;
+    }
+
+    Collection* Database::createCollection( const StringData& ns, bool capped, const BSONObj* options ) {
+        verify( _namespaceIndex.details( ns ) == NULL );
+
+        if ( serverGlobalParams.configsvr &&
+             !( ns.startsWith( "config." ) ||
+                ns.startsWith( "local." ) ||
+                ns.startsWith( "admin." ) ) ) {
+            uasserted(14037, "can't create user databases on a --configsvr instance");
+        }
+
+        audit::logCreateCollection( currentClient.get(), ns );
+
+        _namespaceIndex.add_ns( ns, DiskLoc(), capped );
+        _addNamespaceToCatalog( ns, options );
+
+        // TODO: option for: allocation, indexes?
+
+        if ( nsToCollectionSubstring( ns ).startsWith( "system." ) ) {
+            authindex::createSystemIndexes( ns );
+        }
+
+        Collection* collection = getCollection( ns );
+        verify( collection );
+        return collection;
+    }
+
+
+    void Database::_addNamespaceToCatalog( const StringData& ns, const BSONObj* options ) {
+        LOG(1) << "Database::_addNamespaceToCatalog ns: " << ns << endl;
+        if ( nsToCollectionSubstring( ns ) == "system.namespaces" ) {
+            // system.namespaces holds all the others, so it is not explicitly listed in the catalog.
+            return;
+        }
+
+        if ( ns == _extentFreelistName ) {
+            // this doesn't go in catalog
+            return;
+        }
+
+        BSONObjBuilder b;
+        b.append("name", ns);
+        if ( options )
+            b.append("options", *options);
+        BSONObj obj = b.done();
+
+        theDataFileMgr.insert( _namespacesName.c_str(), obj.objdata(), obj.objsize(), false, true);
+    }
+
+    Status Database::_dropNS( const StringData& ns ) {
+        NamespaceDetails* d = _namespaceIndex.details( ns );
+        if ( !d )
+            return Status( ErrorCodes::InternalError, str::stream() << "ns not found: " << ns );
+
+        BackgroundOperation::assertNoBgOpInProgForNs( ns );
+
+        {
+            // remove from the system catalog
+            BSONObj cond = BSON( "name" << ns );   // { name: "colltodropname" }
+            deleteObjects( _namespacesName, cond, false, false, true);
+        }
+
+        // free extents
+        if( !d->firstExtent().isNull() ) {
+            _extentManager.freeExtents(d->firstExtent(), d->lastExtent());
+            d->setFirstExtentInvalid();
+            d->setLastExtentInvalid();
+        }
+
+        // remove from the catalog hashtable
+        _namespaceIndex.kill_ns( ns );
+
+        return Status::OK();
+    }
 
 } // namespace mongo

@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -19,8 +31,9 @@
 #include <string>
 
 #include "mongo/bson/bson_field.h"
-#include "mongo/bson/util/misc.h" // for Date_t
 #include "mongo/db/jsobj.h"
+#include "mongo/s/bson_serializable.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
@@ -109,6 +122,74 @@ namespace mongo {
                                   string* errMsg = NULL);
 
         /**
+         * Extracts a mandatory BSONSerializable structure 'field' from the object 'doc'. Write
+         * the extracted contents to '*out' if successful or fills '*errMsg', if exising,
+         * otherwise.  This variant relies on T having a parseBSON, which all
+         * BSONSerializable's have.
+         *
+         * TODO: Tighten for BSONSerializable's only
+         */
+        template<typename T>
+        static FieldState extract(BSONObj doc,
+                            const BSONField<T>& field,
+                            T* out,
+                            string* errMsg = NULL);
+
+        template<typename T>
+        static FieldState extract(BSONObj doc,
+                            const BSONField<T*>& field,
+                            T** out,
+                            string* errMsg = NULL);
+
+        /**
+         * Similar to the mandatory 'extract' but on a optional field. '*out' would only be
+         * allocated if the field is present. The ownership of '*out' would be transferred to
+         * the caller, in that case.
+         *
+         * TODO: Tighten for BSONSerializable's only
+         */
+        template<typename T>
+        static FieldState extract(BSONObj doc,
+                            const BSONField<T>& field,
+                            T** out,  // alloc variation
+                            string* errMsg = NULL);
+
+        /**
+         * Extracts a mandatory repetition of BSONSerializable structures, 'field', from the
+         * object 'doc'. Write the extracted contents to '*out' if successful or fills
+         * '*errMsg', if exising, otherwise.  This variant relies on T having a parseBSON,
+         * which all BSONSerializable's have.
+         *
+         * The vector owns the instances of T.
+         *
+         * TODO: Tighten for BSONSerializable's only
+         */
+        template<typename T>
+        static FieldState extract(BSONObj doc,
+                            const BSONField<vector<T*> >& field,
+                            vector<T*>* out,
+                            string* errMsg = NULL);
+
+        /**
+         * Similar to the mandatory repetition' extract but on an optional field. '*out' would
+         * only be allocated if the field is present. The ownership of '*out' would be
+         * transferred to the caller, in that case.
+         *
+         * The vector owns the instances of T.
+         *
+         * TODO: Tighten for BSONSerializable's only
+         */
+        template<typename T>
+        static FieldState extract(BSONObj doc,
+                            const BSONField<vector<T*> >& field,
+                            vector<T*>** out,
+                            string* errMsg = NULL);
+
+        //
+        // ==================== Below DEPRECATED; use types instead ====================
+        //
+
+        /**
          * The following extract methods are templatized to handle extraction of vectors and
          * maps of sub-objects.  Keys in the map should be StringData compatible.
          *
@@ -128,6 +209,10 @@ namespace mongo {
                             const BSONField<map<K, T> >& field,
                             map<K, T>* out,
                             string* errMsg = NULL);
+
+    private:
+        template<typename T>
+        static void clearOwnedVector(vector<T*>* vec);
     };
 
 } // namespace mongo

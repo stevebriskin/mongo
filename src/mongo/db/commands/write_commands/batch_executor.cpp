@@ -12,10 +12,25 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/commands/write_commands/batch_executor.h"
 
+#include <memory>
+
+#include "mongo/base/error_codes.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
@@ -24,277 +39,427 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/write_concern.h"
+#include "mongo/s/batched_error_detail.h"
+#include "mongo/s/collection_metadata.h"
+#include "mongo/s/d_logic.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    WriteBatchExecutor::WriteBatchExecutor(Client* client, OpCounters* opCounters, LastError* le)
-        : _client(client)
-        , _opCounters(opCounters)
-        , _le(le) {}
+    namespace {
 
-    bool WriteBatchExecutor::executeBatch(const WriteBatch& writeBatch,
-                                          string* errMsg,
-                                          BSONObjBuilder* result) {
-        Timer commandTimer;
+        // We're assuming here that writeConcern was parsed and is valid. This is just
+        // a quick check of whether is is {w:0} or not.
+        bool verboseResponse( BSONObj writeConcern ) {
+            if ( writeConcern.nFields() != 1 ) {
+                return true;
+            }
 
-        BSONArrayBuilder resultsArray;
-        bool batchSuccess = applyWriteBatch(writeBatch, &resultsArray);
-        result->append("resultsBatchSuccess", batchSuccess);
-        result->append("results", resultsArray.arr());
+            BSONElement wElem = writeConcern["w"];
+            if ( !wElem.isNumber() || wElem.Number() != 0 ) {
+                return true;
+            }
 
-        BSONObjBuilder writeConcernResults;
-        Timer writeConcernTimer;
+            return false;
+        }
 
-        // TODO Define final layout for write commands result object.
-
-        // bool writeConcernSuccess = waitForWriteConcern(writeBatch.getWriteConcern(),
-        //                                                writeConcernResults,
-        //                                                !batchSuccess,
-        //                                                *errMsg);
-        // if (!writeConcernSuccess) {
-        //     return false;
-        // }
-        //
-        // const char *writeConcernErrField = writeConcernResults.asTempObj().getStringField("err");
-        // // TODO Should consider changing following existing strange behavior with GLE?
-        // // - {w:2} specified with batch where any op fails skips replication wait, yields success
-        // bool writeConcernFulfilled = !writeConcernErrField || strlen(writeConcernErrField) == 0;
-        // writeConcernResults.append("micros", static_cast<long long>(writeConcernTimer.micros()));
-        // writeConcernResults.append("ok", writeConcernFulfilled);
-        // result->append("writeConcernResults", writeConcernResults.obj());
-
-        result->append("micros", static_cast<long long>(commandTimer.micros()));
-
-        return true;
     }
 
-    bool WriteBatchExecutor::applyWriteBatch(const WriteBatch& writeBatch,
-                                             BSONArrayBuilder* resultsArray) {
+    WriteBatchExecutor::WriteBatchExecutor( Client* client,
+                                            OpCounters* opCounters,
+                                            LastError* le )
+        : _client( client ), _opCounters( opCounters ), _le( le ) {
+    }
+
+    void WriteBatchExecutor::executeBatch( const BatchedCommandRequest& request,
+                                           BatchedCommandResponse* response ) {
+
+        Timer commandTimer;
+
+        WriteStats stats;
+        std::auto_ptr<BatchedErrorDetail> error( new BatchedErrorDetail );
         bool batchSuccess = true;
-        for (size_t i = 0; i < writeBatch.getNumWriteItems(); ++i) {
-            const WriteBatch::WriteItem& writeItem = writeBatch.getWriteItem(i);
+        bool staleBatch = false;
 
-            // All writes in the batch must be of the same type:
-            dassert(writeBatch.getWriteType() == writeItem.getWriteType());
+        // Apply each batch item, stopping on an error if we were asked to apply the batch
+        // sequentially.
+        size_t numBatchOps = request.sizeWriteOps();
+        bool verbose = verboseResponse( request.getWriteConcern() );
+        for ( size_t i = 0; i < numBatchOps; i++ ) {
 
-            BSONObjBuilder results;
-            bool opSuccess = applyWriteItem(writeBatch.getNS(), writeItem, &results);
-            resultsArray->append(results.obj());
+            if ( !applyWriteItem( BatchItemRef( &request, i ), &stats, error.get() ) ) {
 
-            batchSuccess &= opSuccess;
+                // If the error is sharding related, we'll have to investigate whether we
+                // have a stale view of sharding state.
+                if ( error->getErrCode() == ErrorCodes::StaleShardVersion ) staleBatch = true;
 
-            if (!opSuccess && !writeBatch.getContinueOnError()) {
-                break;
+                // Don't bother recording if the user doesn't want a verbose answer. We want to
+                // keep the error if this is a one-item batch, since we already compact the
+                // response for those.
+                if (verbose || numBatchOps == 1) {
+                    error->setIndex( static_cast<int>( i ) );
+                    response->addToErrDetails( error.release() );
+                }
+
+                batchSuccess = false;
+
+                if ( request.getOrdered() ) break;
+
+                error.reset( new BatchedErrorDetail );
             }
         }
 
-        return batchSuccess;
+        // So far, we may have failed some of the batch's items. So we record
+        // that. Rergardless, we still need to apply the write concern.  If that generates a
+        // more specific error, we'd replace for the intermediate error here. Note that we
+        // "compatct" the error messge if this is an one-item batch. (See rationale later in
+        // this file.)
+        if ( !batchSuccess ) {
+
+            if (numBatchOps > 1) {
+                // TODO
+                // Define the final error code here.
+                // Might be used as a final error, depending on write concern success.
+                response->setErrCode( 99999 );
+                response->setErrMessage( "batch op errors occurred" );
+            }
+            else {
+                // Promote the single error.
+                const BatchedErrorDetail* error = response->getErrDetailsAt( 0 );
+                response->setErrCode( error->getErrCode() );
+                if ( error->isErrInfoSet() ) response->setErrInfo( error->getErrInfo() );
+                response->setErrMessage( error->getErrMessage() );
+                response->unsetErrDetails();
+                error = NULL;
+            }
+        }
+
+        // Apply write concern. Note, again, that we're only assembling a full response if the
+        // user is interested in it.
+        string errMsg;
+        BSONObjBuilder wcResultsB;
+        if ( !waitForWriteConcern( request.getWriteConcern(),
+                                   !batchSuccess,
+                                   &wcResultsB,
+                                   &errMsg ) ) {
+
+            // TODO
+            // Not using error codes yet; we may use the "family" facility of Status for that
+            // response->setErrCode( ErrorCodes::WriteConcernFailed );
+            response->setErrCode( 99999 );
+            response->setErrMessage( errMsg );
+
+            if ( verbose ) {
+                response->setErrInfo( wcResultsB.obj() );
+            }
+        }
+
+        // TODO: Audit where we want to queue here
+        if ( staleBatch ) {
+            ChunkVersion latestShardVersion;
+            shardingState.refreshMetadataIfNeeded( request.getNS(),
+                                                   request.getShardVersion(),
+                                                   &latestShardVersion );
+        }
+
+        // Set the main body of the response. We assume that, if there was an error, the error
+        // code would already be set.
+        response->setOk( !response->isErrCodeSet() );
+        response->setN( stats.numUpdated + stats.numInserted + stats.numDeleted );
+
+        // 'upserted' is only relevant for updated batches.
+        if (request.getBatchType() == BatchedCommandRequest::BatchType_Update) {
+            response->setUpserted( stats.numUpserted );
+        }
     }
 
     namespace {
 
         // Translates write item type to wire protocol op code.
         // Helper for WriteBatchExecutor::applyWriteItem().
-        int getOpCode(WriteBatch::WriteType writeType) {
-            switch (writeType) {
-            case WriteBatch::WRITE_INSERT:
+        int getOpCode( BatchedCommandRequest::BatchType writeType ) {
+            switch ( writeType ) {
+            case BatchedCommandRequest::BatchType_Insert:
                 return dbInsert;
-            case WriteBatch::WRITE_UPDATE:
+            case BatchedCommandRequest::BatchType_Update:
                 return dbUpdate;
-            case WriteBatch::WRITE_DELETE:
+            default:
+                dassert( writeType == BatchedCommandRequest::BatchType_Delete );
                 return dbDelete;
             }
-            dassert(false);
             return 0;
         }
 
     } // namespace
 
-    bool WriteBatchExecutor::applyWriteItem(const string& ns,
-                                            const WriteBatch::WriteItem& writeItem,
-                                            BSONObjBuilder* results) {
-        // Clear operation's LastError before starting.
-        _le->reset(true);
+    bool WriteBatchExecutor::applyWriteItem( const BatchItemRef& itemRef,
+                                             WriteStats* stats,
+                                             BatchedErrorDetail* error ) {
+        const BatchedCommandRequest& request = *itemRef.getRequest();
+        const string& ns = request.getNS();
 
-        uint64_t itemTimeMicros = 0;
+        // Clear operation's LastError before starting.
+        _le->reset( true );
+
+        //uint64_t itemTimeMicros = 0;
         bool opSuccess = true;
 
         // Each write operation executes in its own PageFaultRetryableSection.  This means that
         // a single batch can throw multiple PageFaultException's, which is not the case for
         // other operations.
         PageFaultRetryableSection s;
-        while (true) {
+        while ( true ) {
             try {
                 // Execute the write item as a child operation of the current operation.
-                CurOp childOp(_client, _client->curop());
+                CurOp childOp( _client, _client->curop() );
+
+                HostAndPort remote =
+                    _client->hasRemote() ? _client->getRemote() : HostAndPort( "0.0.0.0", 0 );
 
                 // TODO Modify CurOp "wrapped" constructor to take an opcode, so calling .reset()
                 // is unneeded
-                childOp.reset(_client->getRemote(), getOpCode(writeItem.getWriteType()));
+                childOp.reset( remote, getOpCode( request.getBatchType() ) );
 
                 childOp.ensureStarted();
                 OpDebug& opDebug = childOp.debug();
                 opDebug.ns = ns;
                 {
-                    Client::WriteContext ctx(ns);
+                    Lock::DBWrite dbLock( ns );
+                    Client::Context ctx( ns,
+                                         storageGlobalParams.dbpath, // TODO: better constructor?
+                                         false /* don't check version here */);
 
-                    switch(writeItem.getWriteType()) {
-                    case WriteBatch::WRITE_INSERT:
-                        opSuccess = applyInsert(ns, writeItem, &childOp);
-                        break;
-                    case WriteBatch::WRITE_UPDATE:
-                        opSuccess = applyUpdate(ns, writeItem, &childOp);
-                        break;
-                    case WriteBatch::WRITE_DELETE:
-                        opSuccess = applyDelete(ns, writeItem, &childOp);
-                        break;
-                    }
+                    opSuccess = doWrite( ns, itemRef, &childOp, stats, error );
                 }
                 childOp.done();
-                itemTimeMicros = childOp.totalTimeMicros();
+                //itemTimeMicros = childOp.totalTimeMicros();
 
                 opDebug.executionTime = childOp.totalTimeMillis();
                 opDebug.recordStats();
 
                 // Log operation if running with at least "-v", or if exceeds slow threshold.
                 if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1))
-                    || opDebug.executionTime > cmdLine.slowMS + childOp.getExpectedLatencyMs()) {
+                     || opDebug.executionTime >
+                        serverGlobalParams.slowMS + childOp.getExpectedLatencyMs()) {
 
-                    MONGO_TLOG(1) << opDebug.report(childOp) << endl;
+                    MONGO_TLOG(1) << opDebug.report( childOp ) << endl;
                 }
 
                 // TODO Log operation if logLevel >= 3 and assertion thrown (as assembleResponse()
                 // does).
 
                 // Save operation to system.profile if shouldDBProfile().
-                if (childOp.shouldDBProfile(opDebug.executionTime)) {
-                    profile(*_client, getOpCode(writeItem.getWriteType()), childOp);
+                if ( childOp.shouldDBProfile( opDebug.executionTime ) ) {
+                    profile( *_client, getOpCode( request.getBatchType() ), childOp );
                 }
                 break;
             }
-            catch (PageFaultException& e) {
+            catch ( PageFaultException& e ) {
                 e.touch();
             }
         }
 
-        // Fill caller's builder with results of operation, using LastError.
-        results->append("ok", opSuccess);
-        _le->appendSelf(*results, false);
-        results->append("micros", static_cast<long long>(itemTimeMicros));
-
         return opSuccess;
     }
 
-    bool WriteBatchExecutor::applyInsert(const string& ns,
-                                         const WriteBatch::WriteItem& writeItem,
-                                         CurOp* currentOp) {
+    static void toBatchedError( const UserException& ex, BatchedErrorDetail* error ) {
+        // TODO: Complex transform here?
+        error->setErrCode( ex.getCode() );
+        error->setErrMessage( ex.what() );
+    }
+
+    bool WriteBatchExecutor::doWrite( const string& ns,
+                                      const BatchItemRef& itemRef,
+                                      CurOp* currentOp,
+                                      WriteStats* stats,
+                                      BatchedErrorDetail* error ) {
+
+        const BatchedCommandRequest& request = *itemRef.getRequest();
+        int index = itemRef.getItemIndex();
+
+        //
+        // Check our shard version if we need to (must be in the write lock)
+        //
+
+        if ( shardingState.enabled() && request.isShardVersionSet()
+             && !ChunkVersion::isIgnoredVersion( request.getShardVersion() ) ) {
+
+            Lock::assertWriteLocked( ns );
+            CollectionMetadataPtr metadata = shardingState.getCollectionMetadata( ns );
+            ChunkVersion shardVersion =
+                metadata ? metadata->getShardVersion() : ChunkVersion::UNSHARDED();
+
+            if ( !request.getShardVersion() //
+                .isWriteCompatibleWith( shardVersion ) ) {
+
+                // Write stale error to results
+                error->setErrCode( ErrorCodes::StaleShardVersion );
+
+                BSONObjBuilder infoB;
+                shardVersion.addToBSON( infoB, "vWanted" );
+                error->setErrInfo( infoB.obj() );
+
+                string errMsg = mongoutils::str::stream()
+                    << "stale shard version detected before write, received "
+                    << request.getShardVersion().toString() << " but local version is "
+                    << shardVersion.toString();
+                error->setErrMessage( errMsg );
+
+                return false;
+            }
+        }
+
+        //
+        // Not stale, do the actual write
+        //
+
+        if ( request.getBatchType() == BatchedCommandRequest::BatchType_Insert ) {
+
+            // Insert
+            return doInsert( ns,
+                             request.getInsertRequest()->getDocumentsAt( index ),
+                             currentOp,
+                             stats,
+                             error );
+        }
+        else if ( request.getBatchType() == BatchedCommandRequest::BatchType_Update ) {
+
+            // Update
+            return doUpdate( ns,
+                             *request.getUpdateRequest()->getUpdatesAt( index ),
+                             currentOp,
+                             stats,
+                             error );
+        }
+        else {
+            dassert( request.getBatchType() ==
+                BatchedCommandRequest::BatchType_Delete );
+
+            // Delete
+            return doDelete( ns,
+                             *request.getDeleteRequest()->getDeletesAt( index ),
+                             currentOp,
+                             stats,
+                             error );
+        }
+    }
+
+    bool WriteBatchExecutor::doInsert( const string& ns,
+                                       const BSONObj& insertOp,
+                                       CurOp* currentOp,
+                                       WriteStats* stats,
+                                       BatchedErrorDetail* error ) {
         OpDebug& opDebug = currentOp->debug();
 
         _opCounters->gotInsert();
 
         opDebug.op = dbInsert;
 
-        BSONObj doc;
-
-        string errMsg;
-        bool ret = writeItem.parseInsertItem(&errMsg, &doc);
-        verify(ret); // writeItem should have been already validated by WriteBatch::parse().
-
         try {
             // TODO Should call insertWithObjMod directly instead of checkAndInsert?  Note that
             // checkAndInsert will use mayInterrupt=false, so index builds initiated here won't
             // be interruptible.
-            checkAndInsert(ns.c_str(), doc);
+            BSONObj doc = insertOp; // b/c we're const going in
+            checkAndInsert( ns.c_str(), doc );
             getDur().commitIfNeeded();
             _le->nObjects = 1; // TODO Replace after implementing LastError::recordInsert().
             opDebug.ninserted = 1;
+            stats->numInserted++;
         }
-        catch (UserException& e) {
-            opDebug.exceptionInfo = e.getInfo();
+        catch ( const UserException& ex ) {
+            opDebug.exceptionInfo = ex.getInfo();
+            toBatchedError( ex, error );
             return false;
         }
 
         return true;
     }
 
-    bool WriteBatchExecutor::applyUpdate(const string& ns,
-                                         const WriteBatch::WriteItem& writeItem,
-                                         CurOp* currentOp) {
+    bool WriteBatchExecutor::doUpdate( const string& ns,
+                                       const BatchedUpdateDocument& updateOp,
+                                       CurOp* currentOp,
+                                       WriteStats* stats,
+                                       BatchedErrorDetail* error ) {
         OpDebug& opDebug = currentOp->debug();
 
         _opCounters->gotUpdate();
 
-        BSONObj queryObj;
-        BSONObj updateObj;
-        bool multi;
-        bool upsert;
+        BSONObj queryObj = updateOp.getQuery();
+        BSONObj updateObj = updateOp.getUpdateExpr();
+        bool multi = updateOp.isMultiSet() ? updateOp.getMulti() : false;
+        bool upsert = updateOp.isUpsertSet() ? updateOp.getUpsert() : false;
 
-        string errMsg;
-        bool ret = writeItem.parseUpdateItem(&errMsg, &queryObj, &updateObj, &multi, &upsert);
-        verify(ret); // writeItem should have been already validated by WriteBatch::parse().
-
-        currentOp->setQuery(queryObj);
+        currentOp->setQuery( queryObj );
         opDebug.op = dbUpdate;
         opDebug.query = queryObj;
 
         bool resExisting = false;
         long long resNum = 0;
-        OID resUpserted = OID();
+        BSONObj resUpserted;
         try {
-            UpdateResult res = updateObjects(ns.c_str(),
-                                             updateObj,
-                                             queryObj,
-                                             upsert,
-                                             multi,
-                                             /*logOp*/true,
-                                             opDebug);
+
+            const NamespaceString requestNs( ns );
+            UpdateRequest request( requestNs );
+
+            request.setQuery( queryObj );
+            request.setUpdates( updateObj );
+            request.setUpsert( upsert );
+            request.setMulti( multi );
+            request.setUpdateOpLog();
+
+            UpdateResult res = update( request, &opDebug );
+
             resExisting = res.existing;
-            resNum = res.num;
+            resNum = res.numMatched;
             resUpserted = res.upserted;
+
+            stats->numUpdated += resUpserted.isEmpty() ? resNum : 0;
+            stats->numUpserted += !resUpserted.isEmpty() ? 1 : 0;
         }
-        catch (UserException& e) {
-            opDebug.exceptionInfo = e.getInfo();
+        catch ( const UserException& ex ) {
+            opDebug.exceptionInfo = ex.getInfo();
+            toBatchedError( ex, error );
             return false;
         }
 
-        _le->recordUpdate(resExisting, resNum, resUpserted);
+        _le->recordUpdate( resExisting, resNum, resUpserted );
 
         return true;
     }
 
-    bool WriteBatchExecutor::applyDelete(const string& ns,
-                                         const WriteBatch::WriteItem& writeItem,
-                                         CurOp* currentOp) {
+    bool WriteBatchExecutor::doDelete( const string& ns,
+                                       const BatchedDeleteDocument& deleteOp,
+                                       CurOp* currentOp,
+                                       WriteStats* stats,
+                                       BatchedErrorDetail* error ) {
         OpDebug& opDebug = currentOp->debug();
 
         _opCounters->gotDelete();
 
-        BSONObj queryObj;
+        BSONObj queryObj = deleteOp.getQuery();
 
-        string errMsg;
-        bool ret = writeItem.parseDeleteItem(&errMsg, &queryObj);
-        verify(ret); // writeItem should have been already validated by WriteBatch::parse().
-
-        currentOp->setQuery(queryObj);
+        currentOp->setQuery( queryObj );
         opDebug.op = dbDelete;
         opDebug.query = queryObj;
 
         long long n;
 
         try {
-            n = deleteObjects(ns.c_str(),
-                              queryObj,
-                              /*justOne*/false,
-                              /*logOp*/true,
-                              /*god*/false,
-                              /*rs*/NULL);
+            n = deleteObjects( ns, queryObj, // ns, query
+                               false, // justOne
+                               true, // logOp
+                               false // god
+                               );
+            stats->numDeleted += n;
         }
-        catch (UserException& e) {
-            opDebug.exceptionInfo = e.getInfo();
+        catch ( const UserException& ex ) {
+            opDebug.exceptionInfo = ex.getInfo();
+            toBatchedError( ex, error );
             return false;
         }
 
-        _le->recordDelete(n);
+        _le->recordDelete( n );
         opDebug.ndeleted = n;
 
         return true;

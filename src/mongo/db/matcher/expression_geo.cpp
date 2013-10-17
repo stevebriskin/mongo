@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/pch.h"
@@ -21,8 +33,14 @@
 
 namespace mongo {
 
-    Status GeoMatchExpression::init( const StringData& path, const GeoQuery& query ) {
+    //
+    // Geo queries we don't need an index to answer: geoWithin and geoIntersects
+    //
+
+    Status GeoMatchExpression::init( const StringData& path, const GeoQuery& query,
+                                     const BSONObj& rawObj ) {
         _query = query;
+        _rawObj = rawObj;
         return initPath( path );
     }
 
@@ -39,7 +57,13 @@ namespace mongo {
 
     void GeoMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << "GEO\n";
+        debug << "GEO";
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
     }
 
     bool GeoMatchExpression::equivalent( const MatchExpression* other ) const {
@@ -58,7 +82,61 @@ namespace mongo {
 
     LeafMatchExpression* GeoMatchExpression::shallowClone() const {
         GeoMatchExpression* next = new GeoMatchExpression();
-        next->init( path(), _query );
+        next->init( path(), _query, _rawObj);
+        if (getTag()) {
+            next->setTag(getTag()->clone());
+        }
+        return next;
+    }
+
+    //
+    // Parse-only geo expressions: geoNear (formerly known as near).
+    //
+
+    Status GeoNearMatchExpression::init( const StringData& path, const NearQuery& query,
+                                         const BSONObj& rawObj ) {
+        _query = query;
+        _rawObj = rawObj;
+        return initPath( path );
+    }
+
+    bool GeoNearMatchExpression::matchesSingleElement( const BSONElement& e ) const {
+        // This shouldn't be called.
+        verify(0);
+        return false;
+    }
+
+    void GeoNearMatchExpression::debugString( StringBuilder& debug, int level ) const {
+        _debugAddSpace( debug, level );
+        debug << "GEONEAR raw = " << _rawObj.toString();
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
+    }
+
+    bool GeoNearMatchExpression::equivalent( const MatchExpression* other ) const {
+        if ( matchType() != other->matchType() )
+            return false;
+
+        const GeoNearMatchExpression* realOther = static_cast<const GeoNearMatchExpression*>(other);
+
+        if ( path() != realOther->path() )
+            return false;
+
+        // TODO:
+        // return _query == realOther->_query;
+        return false;
+    }
+
+    LeafMatchExpression* GeoNearMatchExpression::shallowClone() const {
+        GeoNearMatchExpression* next = new GeoNearMatchExpression();
+        next->init( path(), _query, _rawObj );
+        if (getTag()) {
+            next->setTag(getTag()->clone());
+        }
         return next;
     }
 

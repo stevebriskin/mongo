@@ -1102,6 +1102,11 @@ namespace {
         ASSERT_EQUALS(mongo::fromjson(outJson), outObj);
     }
 
+    TEST(Document, CantRenameRootElement) {
+        mmb::Document doc;
+        ASSERT_NOT_OK(doc.root().rename("foo"));
+    }
+
     TEST(Document, RemoveElementWithOpaqueRightSibling) {
         // Regression test for a bug where removing an element with an opaque right sibling
         // would access an invalidated rep. Note that this test may or may not fail depending
@@ -2552,6 +2557,38 @@ namespace {
         ASSERT_FALSE(doc.isInPlaceModeEnabled());
     }
 
+    TEST(DocumentInPlace, ReserveDamageEventsIsAlwaysSafeToCall) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
+        doc.reserveDamageEvents(10);
+        doc.disableInPlaceUpdates();
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+        doc.reserveDamageEvents(10);
+    }
+
+    TEST(DocumentInPlace, GettingInPlaceUpdatesWhenDisabledClearsArguments) {
+        mongo::BSONObj obj = mongo::fromjson("{ foo : 'foo' }");
+        mmb::Document doc(obj, mmb::Document::kInPlaceDisabled);
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+
+        mmb::DamageVector damages;
+        const mmb::DamageEvent event = { 0 };
+        damages.push_back(event);
+        const char* source = "foo";
+        ASSERT_FALSE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_TRUE(damages.empty());
+        ASSERT_EQUALS(static_cast<const char*>(NULL), source);
+
+        damages.push_back(event);
+        source = "bar";
+        size_t size = 1;
+        ASSERT_FALSE(doc.getInPlaceUpdates(&damages, &source, &size));
+        ASSERT_TRUE(damages.empty());
+        ASSERT_EQUALS(static_cast<const char*>(NULL), source);
+        ASSERT_EQUALS(0U, size);
+    }
+
     // This isn't a great test since we aren't testing all possible combinations of compatible
     // and incompatible sets, but since all setValueX calls decay to the internal setValue, we
     // can be pretty sure that this will at least check the logic somewhat.
@@ -2588,6 +2625,82 @@ namespace {
         ASSERT_EQUALS(mongo::fromjson(outJson), doc.getObject());
     }
 
+    TEST(DocumentInPlace, StringLifecycle) {
+        mongo::BSONObj obj(mongo::fromjson("{ x : 'foo' }"));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueString("bar");
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::String));
+        ASSERT_EQUALS("bar", x.getValueString());
+
+        // TODO: When in-place updates for leaf elements is implemented, add tests here.
+    }
+
+    TEST(DocumentInPlace, BinDataLifecycle) {
+        const char kData1[] = "\x01\x02\x03\x04\x05\x06";
+        const char kData2[] = "\x10\x20\x30\x40\x50\x60";
+
+        const mongo::BSONBinData binData1(kData1, sizeof(kData1) - 1, mongo::BinDataGeneral);
+        const mongo::BSONBinData binData2(kData2, sizeof(kData2) - 1, mongo::bdtCustom);
+
+        mongo::BSONObj obj(BSON("x" << binData1));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueBinary(binData2.length, binData2.type, binData2.data);
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::BinData));
+
+        mongo::BSONElement value = x.getValue();
+        ASSERT_EQUALS(binData2.type, value.binDataType());
+        int len = 0;
+        const char* const data = value.binDataClean(len);
+        ASSERT_EQUALS(binData2.length, len);
+        ASSERT_EQUALS(0, std::memcmp(data, kData2, len));
+
+        // TODO: When in-place updates for leaf elements is implemented, add tests here.
+    }
+
+    TEST(DocumentInPlace, OIDLifecycle) {
+        const mongo::OID oid1 = mongo::OID::gen();
+        const mongo::OID oid2 = mongo::OID::gen();
+        ASSERT_NOT_EQUALS(oid1, oid2);
+
+        mongo::BSONObj obj(BSON("x" << oid1));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueOID(oid2);
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::jstOID));
+        ASSERT_EQUALS(oid2, x.getValueOID());
+
+        // TODO: When in-place updates for leaf elements is implemented, add tests here.
+    }
+
     TEST(DocumentInPlace, BooleanLifecycle) {
         mongo::BSONObj obj(mongo::fromjson("{ x : false }"));
         mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
@@ -2599,6 +2712,7 @@ namespace {
 
         x.setValueBool(false);
         ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
         apply(&obj, damages, source);
         ASSERT_TRUE(x.hasValue());
         ASSERT_TRUE(x.isType(mongo::Bool));
@@ -2611,6 +2725,26 @@ namespace {
         // ASSERT_TRUE(x.hasValue());
         // ASSERT_TRUE(x.isType(mongo::Bool));
         // ASSERT_EQUALS(true, x.getValueBool());
+    }
+
+    TEST(DocumentInPlace, DateLifecycle) {
+        mongo::BSONObj obj(BSON("x" << mongo::Date_t(1000)));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueDate(mongo::Date_t(20000));
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::Date));
+        ASSERT_EQUALS(mongo::Date_t(20000), x.getValueDate());
+
+        // TODO: When in-place updates for leaf elements is implemented, add tests here.
     }
 
     TEST(DocumentInPlace, NumberIntLifecycle) {
@@ -2626,6 +2760,7 @@ namespace {
 
         x.setValueInt(value2);
         ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
         apply(&obj, damages, source);
         ASSERT_TRUE(x.hasValue());
         ASSERT_TRUE(x.isType(mongo::NumberInt));
@@ -2638,6 +2773,26 @@ namespace {
         // ASSERT_TRUE(x.hasValue());
         // ASSERT_TRUE(x.isType(mongo::NumberInt));
         // ASSERT_EQUALS(value1, x.getValueInt());
+    }
+
+    TEST(DocumentInPlace, TimestampLifecycle) {
+        mongo::BSONObj obj(BSON("x" << mongo::OpTime(mongo::Date_t(1000))));
+        mmb::Document doc(obj, mmb::Document::kInPlaceEnabled);
+
+        mmb::Element x = doc.root().leftChild();
+
+        mmb::DamageVector damages;
+        const char* source = NULL;
+
+        x.setValueTimestamp(mongo::OpTime(mongo::Date_t(20000)));
+        ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
+        apply(&obj, damages, source);
+        ASSERT_TRUE(x.hasValue());
+        ASSERT_TRUE(x.isType(mongo::Timestamp));
+        ASSERT_TRUE(mongo::OpTime(mongo::Date_t(20000)) == x.getValueTimestamp());
+
+        // TODO: When in-place updates for leaf elements is implemented, add tests here.
     }
 
     TEST(DocumentInPlace, NumberLongLifecycle) {
@@ -2654,6 +2809,7 @@ namespace {
 
         x.setValueLong(value2);
         ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
         apply(&obj, damages, source);
         ASSERT_TRUE(x.hasValue());
         ASSERT_TRUE(x.isType(mongo::NumberLong));
@@ -2682,6 +2838,7 @@ namespace {
 
         x.setValueDouble(value2);
         ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        ASSERT_EQUALS(1U, damages.size());
         apply(&obj, damages, source);
         ASSERT_TRUE(x.hasValue());
         ASSERT_TRUE(x.isType(mongo::NumberDouble));
@@ -2712,6 +2869,8 @@ namespace {
 
         x.setValueLong(value2);
         ASSERT_TRUE(doc.getInPlaceUpdates(&damages, &source));
+        // We changed the type, so we get an extra damage event.
+        ASSERT_EQUALS(2U, damages.size());
         apply(&obj, damages, source);
         ASSERT_TRUE(x.hasValue());
         ASSERT_TRUE(x.isType(mongo::NumberLong));
@@ -2776,6 +2935,79 @@ namespace {
         // Ensure that the two deserialized documents compare with each other correctly.
         ASSERT_EQUALS(0, doc1.compareWith(doc2));
         ASSERT_EQUALS(0, doc2.compareWith(doc1));
+    }
+
+    TEST(UnorderedEqualityChecker, Identical) {
+        const mongo::BSONObj b1 = mongo::fromjson(
+            "{ a : [1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 3 } }");
+
+        const mongo::BSONObj b2 = b1.getOwned();
+
+        ASSERT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
+    }
+
+    TEST(UnorderedEqualityChecker, DifferentValuesAreNotEqual) {
+        const mongo::BSONObj b1 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 3 } }");
+        const mongo::BSONObj b2 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 4 } }");
+
+        ASSERT_NOT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
+    }
+
+    TEST(UnorderedEqualityChecker, DifferentTypesAreNotEqual) {
+        const mongo::BSONObj b1 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 3 } }");
+        const mongo::BSONObj b2 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : '2', z : 3 } }");
+
+        ASSERT_NOT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
+    }
+
+    TEST(UnorderedEqualityChecker, DifferentFieldNamesAreNotEqual) {
+        const mongo::BSONObj b1 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 3 } }");
+        const mongo::BSONObj b2 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, Y : 2, z : 3 } }");
+
+        ASSERT_NOT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
+    }
+
+    TEST(UnorderedEqualityChecker, MissingFieldsInObjectAreNotEqual) {
+        const mongo::BSONObj b1 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 3 } }");
+        const mongo::BSONObj b2 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, z : 3 } }");
+
+        ASSERT_NOT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
+    }
+
+    TEST(UnorderedEqualityChecker, ObjectOrderingIsNotConsidered) {
+        const mongo::BSONObj b1 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 3 } }");
+        const mongo::BSONObj b2 = mongo::fromjson(
+            "{ b : { y : 2, z : 3 , x : 1  }, a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ] }");
+
+        ASSERT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
+    }
+
+    TEST(UnorderedEqualityChecker, ArrayOrderingIsConsidered) {
+        const mongo::BSONObj b1 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 3 } }");
+
+        const mongo::BSONObj b2 = mongo::fromjson(
+            "{ a : [ 1, { 'a' : 'b', 'x' : 'y' }, 2 ], b : { x : 1, y : 2, z : 3 } }");
+
+        ASSERT_NOT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
+    }
+
+    TEST(UnorderedEqualityChecker, MissingItemsInArrayAreNotEqual) {
+        const mongo::BSONObj b1 = mongo::fromjson(
+            "{ a : [ 1, 2, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, y : 2, z : 3 } }");
+        const mongo::BSONObj b2 = mongo::fromjson(
+            "{ a : [ 1, { 'a' : 'b', 'x' : 'y' } ], b : { x : 1, z : 3 } }");
+
+        ASSERT_NOT_EQUALS(mmb::unordered(b1), mmb::unordered(b2));
     }
 
 } // namespace

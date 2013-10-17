@@ -12,11 +12,22 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
 
-#include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/repl/multicmd.h"
 #include "mongo/db/repl/rs.h"
@@ -34,7 +45,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::replSetFresh);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
     private:
 
@@ -63,7 +74,9 @@ namespace mongo {
                 return true;
             }
 
-            if (primary && primary->hbinfo().opTime >= hopeful->hbinfo().opTime) {
+            if (primary &&
+                    (hopeful->hbinfo().id() != primary->hbinfo().id()) &&
+                    (primary->hbinfo().opTime >= hopeful->hbinfo().opTime)) {
                 // other members might be aware of more up-to-date nodes
                 errmsg = str::stream() << hopeful->fullName() <<
                     " is trying to elect itself but " << primary->fullName() <<
@@ -131,7 +144,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::replSetElect);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
     private:
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
@@ -371,7 +384,7 @@ namespace mongo {
 
         rs.sethbmsg("",9);
 
-        if( !allUp && time(0) - cmdLine.started < 60 * 5 ) {
+        if (!allUp && time(0) - serverGlobalParams.started < 60 * 5) {
             /* the idea here is that if a bunch of nodes bounce all at once, we don't want to drop data
                if we don't have to -- we'd rather be offline and wait a little longer instead
                todo: make this configurable.

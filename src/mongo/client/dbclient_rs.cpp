@@ -15,7 +15,7 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/client/dbclient_rs.h"
 
@@ -31,10 +31,136 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/util/background.h"
+#include "mongo/util/concurrency/mutex.h" // for StaticObserver
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    /*  Replica Set statics:
+     *      If a program (such as one built with the C++ driver) exits (by either calling exit()
+     *      or by returning from main()), static objects will be destroyed in the reverse order
+     *      of their creation (within each translation unit (source code file)).  This makes it
+     *      vital that the order be explicitly controlled within the source file so that destroyed
+     *      objects never reference objects that have been destroyed earlier.
+     *
+     *      The order chosen below is intended to allow safe destruction in reverse order from
+     *      construction order:
+     *          _setsLock                -- mutex protecting _seedServers and _sets, destroyed last
+     *          _seedServers             -- list (map) of servers
+     *          _sets                    -- list (map) of ReplicaSetMonitors
+     *          replicaSetMonitorWatcher -- background job to check Replica Set members
+     *          staticObserver           -- sentinel to detect process termination
+     *
+     *      Related to:
+     *          SERVER-8891 -- Simple client fail with segmentation fault in mongoclient library
+     */
+    mongo::mutex ReplicaSetMonitor::_setsLock( "ReplicaSetMonitor" );
+    map<string, vector<HostAndPort> > ReplicaSetMonitor::_seedServers;
+    map<string, ReplicaSetMonitorPtr> ReplicaSetMonitor::_sets;
+
+    // global background job responsible for checking every X amount of time
+    class ReplicaSetMonitorWatcher : public BackgroundJob {
+    public:
+        ReplicaSetMonitorWatcher():
+            _monitorMutex("ReplicaSetMonitorWatcher::_safego"),
+            _started(false),
+            _stopRequested(false) {
+        }
+
+        ~ReplicaSetMonitorWatcher() {
+            stop();
+
+            // We relying on the fact that if the monitor was rerun again, wait will not hang
+            // because _destroyingStatics will make the run method exit immediately.
+            dassert(StaticObserver::_destroyingStatics);
+            if (running()) {
+                wait();
+            }
+        }
+
+        virtual string name() const { return "ReplicaSetMonitorWatcher"; }
+
+        void safeGo() {
+            // check outside of lock for speed
+            if ( _started )
+                return;
+
+            scoped_lock lk( _monitorMutex );
+            if ( _started )
+                return;
+
+            _started = true;
+            _stopRequested = false;
+
+            go();
+        }
+
+        /**
+         * Stops monitoring the sets and wait for the monitoring thread to terminate.
+         */
+        void stop() {
+            scoped_lock sl( _monitorMutex );
+            _stopRequested = true;
+            _stopRequestedCV.notify_one();
+        }
+
+    protected:
+        void run() {
+            log() << "starting" << endl;
+
+            // Added only for patching timing problems in test. Remove after tests
+            // are fixed - see 392b933598668768bf12b1e41ad444aa3548d970.
+            // Should not be needed after SERVER-7533 gets implemented and tests start
+            // using it.
+            if (!inShutdown() && !StaticObserver::_destroyingStatics) {
+                scoped_lock sl( _monitorMutex );
+                _stopRequestedCV.timed_wait(sl.boost(), boost::posix_time::seconds(10));
+            }
+
+            while ( !inShutdown() &&
+                    !StaticObserver::_destroyingStatics ) {
+                {
+                    scoped_lock sl( _monitorMutex );
+                    if (_stopRequested) {
+                        break;
+                    }
+                }
+
+                try {
+                    ReplicaSetMonitor::checkAll();
+                }
+                catch ( std::exception& e ) {
+                    error() << "check failed: " << e.what() << endl;
+                }
+                catch ( ... ) {
+                    error() << "unknown error" << endl;
+                }
+
+                scoped_lock sl( _monitorMutex );
+                if (_stopRequested) {
+                    break;
+                }
+
+                _stopRequestedCV.timed_wait(sl.boost(), boost::posix_time::seconds(10));
+            }
+
+            scoped_lock sl( _monitorMutex );
+            _started = false;
+        }
+
+        // protects _started, _stopRequested
+        mongo::mutex _monitorMutex;
+        bool _started;
+
+        boost::condition _stopRequestedCV;
+        bool _stopRequested;
+
+    } replicaSetMonitorWatcher;
+
+    static StaticObserver staticObserver;
+
+
     /*
      * Set of commands that can be used with $readPreference
      */
@@ -306,47 +432,6 @@ namespace mongo {
     // ----- ReplicaSetMonitor ---------
     // --------------------------------
 
-    // global background job responsible for checking every X amount of time
-    class ReplicaSetMonitorWatcher : public BackgroundJob {
-    public:
-        ReplicaSetMonitorWatcher() : _safego("ReplicaSetMonitorWatcher::_safego") , _started(false) {}
-
-        virtual string name() const { return "ReplicaSetMonitorWatcher"; }
-        
-        void safeGo() {
-            // check outside of lock for speed
-            if ( _started )
-                return;
-            
-            scoped_lock lk( _safego );
-            if ( _started )
-                return;
-            _started = true;
-
-            go();
-        }
-    protected:
-        void run() {
-            log() << "starting" << endl;
-            while ( ! inShutdown() ) {
-                sleepsecs( 10 );
-                try {
-                    ReplicaSetMonitor::checkAll();
-                }
-                catch ( std::exception& e ) {
-                    error() << "check failed: " << e.what() << endl;
-                }
-                catch ( ... ) {
-                    error() << "unkown error" << endl;
-                }
-            }
-        }
-
-        mongo::mutex _safego;
-        bool _started;
-
-    } replicaSetMonitorWatcher;
-
     string seedString( const vector<HostAndPort>& servers ){
         string seedStr;
         for ( unsigned i = 0; i < servers.size(); i++ ){
@@ -366,7 +451,8 @@ namespace mongo {
         : _lock( "ReplicaSetMonitor instance" ),
           _checkConnectionLock( "ReplicaSetMonitor check connection lock" ),
           _name( name ), _master(-1),
-          _nextSlave(0), _failedChecks(0), _localThresholdMillis(cmdLine.defaultLocalThresholdMillis) {
+          _nextSlave(0), _failedChecks(0),
+          _localThresholdMillis(serverGlobalParams.defaultLocalThresholdMillis) {
 
         uassert( 13642 , "need at least 1 node for a replica set" , servers.size() > 0 );
 
@@ -387,7 +473,6 @@ namespace mongo {
     // delete ReplicaSetMonitors from ReplicaSetMonitor::remove.
     ReplicaSetMonitor::~ReplicaSetMonitor() {
         scoped_lock lk ( _lock );
-        log() << "deleting replica set monitor for: " << _getServerAddress_inlock() << endl;
         _cacheServerAddresses_inlock();
         pool.removeHost( _getServerAddress_inlock() );
         _nodes.clear();
@@ -1226,6 +1311,19 @@ namespace mongo {
         return false;
     }
 
+    void ReplicaSetMonitor::cleanup() {
+        {
+            scoped_lock lock(_setsLock);
+            _sets.clear();
+            _seedServers.clear();
+
+            replicaSetMonitorWatcher.stop();
+        }
+
+        // Join thread outside of _setsLock to avoid deadlock.
+        replicaSetMonitorWatcher.wait();
+    }
+
     bool ReplicaSetMonitor::Node::matchesTag(const BSONObj& tag) const {
         if (tag.isEmpty()) {
             return true;
@@ -1307,9 +1405,6 @@ namespace mongo {
         return builder.obj();
     }
 
-    mongo::mutex ReplicaSetMonitor::_setsLock( "ReplicaSetMonitor" );
-    map<string,ReplicaSetMonitorPtr> ReplicaSetMonitor::_sets;
-    map<string,vector<HostAndPort> > ReplicaSetMonitor::_seedServers;
     ReplicaSetMonitor::ConfigChangeHook ReplicaSetMonitor::_hook;
     int ReplicaSetMonitor::_maxFailedChecks = 30; // At 1 check every 10 seconds, 30 checks takes 5 minutes
 
@@ -1660,7 +1755,8 @@ namespace mongo {
 
         // If the error code here ever changes, we need to change this code also
         BSONElement code = error["code"];
-        if( code.isNumber() && code.Int() == 13436 /* not master or secondary */ ){
+        if( code.isNumber() &&
+            code.Int() == NotMasterOrSecondaryCode /* not master or secondary */ ) {
             isntSecondary();
             throw DBException( str::stream() << "slave " << _lastSlaveOkHost.toString()
                     << " is no longer secondary", 14812 );
@@ -1856,7 +1952,8 @@ namespace mongo {
 
             // Check the error code for a slave not secondary error
             if( nReturned == -1 ||
-                ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo() && dataObj["code"].Int() == 13436 ) ){
+                ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo()
+                  && dataObj["code"].Int() == NotMasterOrSecondaryCode ) ){
 
                 bool wasMaster = false;
                 if( _lazyState._lastClient == _lastSlaveOkConn.get() ){
@@ -1885,7 +1982,8 @@ namespace mongo {
             // slaveOk is not set, just mark the master as bad
 
             if( nReturned == -1 ||
-               ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo() && dataObj["code"].Int() == 13435 ) )
+               ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo()
+                 && dataObj["code"].Int() == NotMasterNoSlaveOkCode ) )
             {
                 if( _lazyState._lastClient == _master.get() ){
                     isntMaster();

@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -25,17 +37,20 @@
 #include <fstream>
 
 #include "mongo/client/dbclientinterface.h"
-#include "mongo/db/btreecursor.h"
 #include "mongo/db/db.h"
 #include "mongo/db/json.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
+#include "mongo/db/ops/update_request.h"
+#include "mongo/db/ops/update_result.h"
 #include "mongo/db/pagefault.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query_optimizer.h"
 #include "mongo/db/query_runner.h"
+#include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/write_concern.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/db/structure/collection.h"
 #include "mongo/s/d_logic.h"
 
 namespace mongo {
@@ -160,9 +175,9 @@ namespace mongo {
     }
 
     bool Helpers::isEmpty(const char *ns) {
-        Client::Context context(ns, dbpath);
-        shared_ptr<Cursor> c = DataFileMgr::findAll(ns);
-        return !c->ok();
+        Client::Context context(ns, storageGlobalParams.dbpath);
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns));
+        return Runner::RUNNER_EOF == runner->getNext(NULL, NULL);
     }
 
     /* Get the first object from a collection.  Generally only useful if the collection
@@ -172,25 +187,17 @@ namespace mongo {
     */
     bool Helpers::getSingleton(const char *ns, BSONObj& result) {
         Client::Context context(ns);
-
-        shared_ptr<Cursor> c = DataFileMgr::findAll(ns);
-        if ( !c->ok() ) {
-            context.getClient()->curop()->done();
-            return false;
-        }
-
-        result = c->current();
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns));
+        Runner::RunnerState state = runner->getNext(&result, NULL);
         context.getClient()->curop()->done();
-        return true;
+        return Runner::RUNNER_ADVANCED == state;
     }
 
     bool Helpers::getLast(const char *ns, BSONObj& result) {
         Client::Context ctx(ns);
-        shared_ptr<Cursor> c = findTableScan(ns, reverseNaturalObj);
-        if( !c->ok() )
-            return false;
-        result = c->current();
-        return true;
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns, InternalPlanner::BACKWARD));
+        Runner::RunnerState state = runner->getNext(&result, NULL);
+        return Runner::RUNNER_ADVANCED == state;
     }
 
     void Helpers::upsert( const string& ns , const BSONObj& o, bool fromMigrate ) {
@@ -200,13 +207,32 @@ namespace mongo {
 
         OpDebug debug;
         Client::Context context(ns);
-        updateObjects(ns.c_str(), o, /*pattern=*/id, /*upsert=*/true, /*multi=*/false , /*logtheop=*/true , debug, fromMigrate );
+
+        const NamespaceString requestNs(ns);
+        UpdateRequest request(requestNs);
+
+        request.setQuery(id);
+        request.setUpdates(o);
+        request.setUpsert();
+        request.setUpdateOpLog();
+        request.setFromMigration(fromMigrate);
+
+        update(request, &debug);
     }
 
     void Helpers::putSingleton(const char *ns, BSONObj obj) {
         OpDebug debug;
         Client::Context context(ns);
-        updateObjects(ns, obj, /*pattern=*/BSONObj(), /*upsert=*/true, /*multi=*/false , /*logtheop=*/true , debug );
+
+        const NamespaceString requestNs(ns);
+        UpdateRequest request(requestNs);
+
+        request.setUpdates(obj);
+        request.setUpsert();
+        request.setUpdateOpLog();
+
+        update(request, &debug);
+
         context.getClient()->curop()->done();
     }
 
@@ -214,30 +240,15 @@ namespace mongo {
         OpDebug debug;
         Client::Context context(ns);
 
-        if (isNewUpdateFrameworkEnabled()) {
+        const NamespaceString requestNs(ns);
+        UpdateRequest request(requestNs);
 
-            _updateObjectsNEW(/*god=*/true,
-                              ns,
-                              obj,
-                              /*pattern=*/BSONObj(),
-                              /*upsert=*/true,
-                              /*multi=*/false,
-                              logTheOp,
-                              debug );
+        request.setGod();
+        request.setUpdates(obj);
+        request.setUpsert();
+        request.setUpdateOpLog(logTheOp);
 
-        }
-        else {
-
-            _updateObjects(/*god=*/true,
-                           ns,
-                           obj,
-                           /*pattern=*/BSONObj(),
-                           /*upsert=*/true,
-                           /*multi=*/false,
-                           logTheOp,
-                           debug );
-
-        }
+        update(request, &debug);
 
         context.getClient()->curop()->done();
     }
@@ -284,7 +295,7 @@ namespace mongo {
     long long Helpers::removeRange( const KeyRange& range,
                                     bool maxInclusive,
                                     bool secondaryThrottle,
-                                    RemoveCallback * callback,
+                                    RemoveSaver* callback,
                                     bool fromMigrate,
                                     bool onlyRemoveOrphanedDocs )
     {
@@ -322,43 +333,34 @@ namespace mongo {
         Client& c = cc();
 
         long long numDeleted = 0;
-        PageFaultRetryableSection pgrs;
         
         long long millisWaitingForReplication = 0;
 
         while ( 1 ) {
-            try {
-
+            // Scoping for write lock.
+            {
                 Client::WriteContext ctx(ns);
 
-                scoped_ptr<Cursor> c;
-                
-                {
-                    NamespaceDetails* nsd = nsdetails( ns );
-                    if ( ! nsd )
-                        break;
+                NamespaceDetails* nsd = nsdetails( ns );
+                if (NULL == nsd) { break; }
+                int ii = nsd->findIndexByKeyPattern( indexKeyPattern.toBSON() );
 
-                    int ii = nsd->findIndexByKeyPattern( indexKeyPattern.toBSON() );
-                    verify( ii >= 0 );
-                    
-                    IndexDetails& i = nsd->idx( ii );
-                    
-                    c.reset( BtreeCursor::make( nsd, i, min, max, maxInclusive, 1 ) );
-                }
-                
-                if ( ! c->ok() ) {
-                    // we're done
-                    break;
-                }
-                
-                DiskLoc rloc = c->currLoc();
-                BSONObj obj = c->current();
+                auto_ptr<Runner> runner(InternalPlanner::indexScan(ns, nsd, ii, min, max,
+                                                                   maxInclusive,
+                                                                   InternalPlanner::FORWARD,
+                                                                   InternalPlanner::IXSCAN_FETCH));
 
-                // this is so that we don't have to handle this cursor in the delete code
-                c.reset(0);
+                runner->setYieldPolicy(Runner::YIELD_AUTO);
+
+                DiskLoc rloc;
+                BSONObj obj;
+                Runner::RunnerState state;
+                // This may yield so we cannot touch nsd after this.
+                state = runner->getNext(&obj, &rloc);
+                runner.reset();
+                if (Runner::RUNNER_EOF == state) { break; }
 
                 if ( onlyRemoveOrphanedDocs ) {
-
                     // Do a final check in the write lock to make absolutely sure that our
                     // collection hasn't been modified in a way that invalidates our migration
                     // cleanup.
@@ -388,17 +390,13 @@ namespace mongo {
                         break;
                     }
                 }
-                
+
                 if ( callback )
                     callback->goingToDelete( obj );
-                
-                logOp( "d" , ns.c_str() , rloc.obj()["_id"].wrap() , 0 , 0 , fromMigrate );
-                theDataFileMgr.deleteRecord(ns.c_str() , rloc.rec(), rloc);
+
+                logOp("d", ns.c_str(), obj["_id"].wrap(), 0, 0, fromMigrate);
+                c.database()->getCollection( ns )->deleteDocument( rloc );
                 numDeleted++;
-            }
-            catch( PageFaultException& e ) {
-                e.touch();
-                continue;
             }
 
             Timer secondaryThrottleTime;
@@ -417,7 +415,6 @@ namespace mongo {
                     sleepmicros( micros );
                 }
             }
-                
         }
         
         if ( secondaryThrottle )
@@ -456,17 +453,6 @@ namespace mongo {
             return Status( ErrorCodes::IndexNotFound, range.keyPattern.toString() );
         }
 
-        // Assume both min and max non-empty, append MinKey's to make them fit chosen index
-        KeyPattern idxKeyPattern( idx->keyPattern() );
-        BSONObj min = Helpers::toKeyFormat( idxKeyPattern.extendRangeBound( range.minKey, false ) );
-        BSONObj max = Helpers::toKeyFormat( idxKeyPattern.extendRangeBound( range.maxKey, false ) );
-
-        // TODO: May not always be btreecursor?
-        BtreeCursor* btreeCursor = BtreeCursor::make( details, *idx, min, max, false, 1 );
-        auto_ptr<ClientCursor> cc( new ClientCursor( QueryOption_NoCursorTimeout,
-                                                     shared_ptr<Cursor>( btreeCursor ),
-                                                     ns ) );
-
         // use the average object size to estimate how many objects a full chunk would carry
         // do that while traversing the chunk's range using the sharding index, below
         // there's a fair amount of slack before we determine a chunk is too large because object
@@ -486,23 +472,27 @@ namespace mongo {
             avgDocsWhenFull = kMaxDocsPerChunk + 1;
         }
 
+        // Assume both min and max non-empty, append MinKey's to make them fit chosen index
+        KeyPattern idxKeyPattern( idx->keyPattern() );
+        BSONObj min = Helpers::toKeyFormat( idxKeyPattern.extendRangeBound( range.minKey, false ) );
+        BSONObj max = Helpers::toKeyFormat( idxKeyPattern.extendRangeBound( range.maxKey, false ) );
+
+
         // do a full traversal of the chunk and don't stop even if we think it is a large chunk
         // we want the number of records to better report, in that case
         bool isLargeChunk = false;
         long long docCount = 0;
 
-        while ( cc->ok() ) {
-            DiskLoc loc = cc->currLoc();
+        auto_ptr<Runner> runner(InternalPlanner::indexScan(ns, details, details->idxNo(*idx), min, max, false));
+        // we can afford to yield here because any change to the base data that we might miss  is
+        // already being queued and will be migrated in the 'transferMods' stage
+        runner->setYieldPolicy(Runner::YIELD_AUTO);
+
+        DiskLoc loc;
+        Runner::RunnerState state;
+        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, &loc))) {
             if ( !isLargeChunk ) {
                 locs->insert( loc );
-            }
-            cc->advance();
-
-            // we can afford to yield here because any change to the base data that we might miss
-            // is already being queued and will be migrated in the 'transferMods' stage
-            if ( !cc->yieldSometimes( ClientCursor::DontNeed ) ) {
-                cc.release();
-                break;
             }
 
             if ( ++docCount > avgDocsWhenFull ) {
@@ -528,10 +518,11 @@ namespace mongo {
         deleteObjects(ns, BSONObj(), false);
     }
 
-    RemoveSaver::RemoveSaver( const string& a , const string& b , const string& why) : _out(0) {
+    Helpers::RemoveSaver::RemoveSaver( const string& a , const string& b , const string& why) 
+        : _out(0) {
         static int NUM = 0;
 
-        _root = dbpath;
+        _root = storageGlobalParams.dbpath;
         if ( a.size() )
             _root /= a;
         if ( b.size() )
@@ -545,7 +536,7 @@ namespace mongo {
         _file /= ss.str();
     }
 
-    RemoveSaver::~RemoveSaver() {
+    Helpers::RemoveSaver::~RemoveSaver() {
         if ( _out ) {
             _out->close();
             delete _out;
@@ -553,7 +544,7 @@ namespace mongo {
         }
     }
 
-    void RemoveSaver::goingToDelete( const BSONObj& o ) {
+    void Helpers::RemoveSaver::goingToDelete( const BSONObj& o ) {
         if ( ! _out ) {
             boost::filesystem::create_directories( _root );
             _out = new ofstream();

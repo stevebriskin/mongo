@@ -12,10 +12,23 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/geo/s2common.h"
 
+#include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/geoparser.h"
 #include "mongo/db/geo/geoquery.h"
 #include "third_party/s2/s2.h"
@@ -93,11 +106,10 @@ namespace mongo {
         return minDist;
     }
 
-    bool S2SearchUtil::distanceBetween(const S2Point& us, const BSONObj& them,
-                                       const S2IndexingParams &params, double *out) {
+    bool S2SearchUtil::distanceBetween(const S2Point& us, const BSONObj& them, double *out) {
         if (GeoParser::isGeometryCollection(them)) {
             GeometryCollection c;
-            GeoParser::parseGeometryCollection(them, &c);
+            if (!GeoParser::parseGeometryCollection(them, &c)) { return false; }
             double minDist = numeric_limits<double>::max();
 
             for (size_t i = 0; i < c.points.size(); ++i) {
@@ -138,37 +150,37 @@ namespace mongo {
                 }
             }
 
-            *out = params.radius * minDist;
+            *out = kRadiusOfEarthInMeters * minDist;
             return true;
-        } if (GeoParser::isMultiPoint(them)) {
+        } else if (GeoParser::isMultiPoint(them)) {
             MultiPointWithCRS multiPoint;
-            GeoParser::parseMultiPoint(them, &multiPoint);
-            *out = dist(us, multiPoint) * params.radius;
+            if (!GeoParser::parseMultiPoint(them, &multiPoint)) { return false; }
+            *out = dist(us, multiPoint) * kRadiusOfEarthInMeters;
             return true;
         } else if (GeoParser::isMultiLine(them)) {
             MultiLineWithCRS multiLine;
-            GeoParser::parseMultiLine(them, &multiLine);
-            *out = dist(us, multiLine) * params.radius;
+            if (!GeoParser::parseMultiLine(them, &multiLine)) { return false; }
+            *out = dist(us, multiLine) * kRadiusOfEarthInMeters;
             return true;
         } else if (GeoParser::isMultiPolygon(them)) {
             MultiPolygonWithCRS multiPolygon;
-            GeoParser::parseMultiPolygon(them, &multiPolygon);
-            *out = dist(us, multiPolygon) * params.radius;
+            if (!GeoParser::parseMultiPolygon(them, &multiPolygon)) { return false; }
+            *out = dist(us, multiPolygon) * kRadiusOfEarthInMeters;
             return true;
         } else if (GeoParser::isPolygon(them)) {
             PolygonWithCRS poly;
-            GeoParser::parsePolygon(them, &poly);
-            *out = dist(us, poly.polygon) * params.radius;
+            if (!GeoParser::parsePolygon(them, &poly)) { return false; }
+            *out = dist(us, poly.polygon) * kRadiusOfEarthInMeters;
             return true;
         } else if (GeoParser::isLine(them)) {
             LineWithCRS line;
-            GeoParser::parseLine(them, &line);
-            *out = dist(us, line.line) * params.radius;
+            if (!GeoParser::parseLine(them, &line)) { return false; }
+            *out = dist(us, line.line) * kRadiusOfEarthInMeters;
             return true;
         } else if (GeoParser::isPoint(them)) {
             PointWithCRS point;
-            GeoParser::parsePoint(them, &point);
-            *out = dist(us, point.point) * params.radius;
+            if (!GeoParser::parsePoint(them, &point)) { return false; }
+            *out = dist(us, point.point) * kRadiusOfEarthInMeters;
             return true;
         } else {
             return false;

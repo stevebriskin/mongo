@@ -19,7 +19,7 @@ tempfile=`mktemp /tmp/consolidate-repos.XXXXXX`
 
 mkdir -p "$repodir"
 
-find "$source_dir" -name \*.rpm -o -name \*.deb -o -name Release | grep -v "$repodir" > "$tempfile"
+find "$source_dir/" -name \*.rpm -o -name \*.deb -o -name Release | grep -v "$repodir" | grep -v enterprise > "$tempfile"
 
 echo "Scanning and copying package files from $source_dir"
 echo ". = skipping existing file, @ = copying file"
@@ -52,7 +52,7 @@ echo
 for debian_dir in "$repodir"/ubuntu-* "$repodir"/debian-* 
 do
   cd "$debian_dir" 
-  for arch_dir in dists/dist/10gen/*   
+  for arch_dir in dists/dist/mongodb/*   
   do
     echo "Generating Packages file under $debian_dir/$arch_dir"
     dpkg-scanpackages --multiversion "$arch_dir"   > "$arch_dir"/Packages

@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -23,6 +35,8 @@
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
+
+    class LogBuilder;
 
     /**
      * Abstract base class for update "modifiers" (a.k.a "$ operators"). To create a new
@@ -52,6 +66,7 @@ namespace mongo {
     public:
         virtual ~ModifierInterface() { }
 
+        struct Options;
         /**
          * Returns OK and extracts the parameters for this given mod from 'modExpr'. For
          * instance, for a $inc, extracts the increment value. The init() method would be
@@ -68,7 +83,7 @@ namespace mongo {
          *     time of this mod. Therefore, taking references to elements inside modExpr is
          *     valid.
          */
-        virtual Status init(const BSONElement& modExpr) = 0;
+        virtual Status init(const BSONElement& modExpr, const Options& opts) = 0;
 
         /**
          * Returns OK if it would be correct to apply this mod over the document 'root' (e.g, if
@@ -104,10 +119,9 @@ namespace mongo {
         virtual Status apply() const = 0 ;
 
         /**
-         * Returns OK and registers the result of this mod in 'logRoot', the document that
-         * would eventually become a log entry. The mod must have kept enough state to
-         * be able to produce the log record (see idempotency note below). This call may be
-         * issued even if apply() was not.
+         * Returns OK and records the result of this mod in the provided LogBuilder. The mod
+         * must have kept enough state to be able to produce the log record (see idempotency
+         * note below). This call may be issued even if apply() was not.
          *
          * If the mod could not be logged, returns an error status with a reason description.
          *
@@ -119,8 +133,22 @@ namespace mongo {
          *     for logging purposes.  An array based operator may check the contents of the
          *     array before operating on it.
          */
-        virtual Status log(mutablebson::Element logRoot) const = 0;
+        virtual Status log(LogBuilder* logBuilder) const = 0;
+    };
 
+    /**
+     * Options used to control Modifier behavior
+     */
+    struct ModifierInterface::Options {
+        Options() : fromReplication(false), enforceOkForStorage(true) {}
+        Options(bool repl, bool ofs) : fromReplication(repl), enforceOkForStorage(ofs) {}
+
+        static Options normal() { return Options(false, true); }
+        static Options fromRepl() { return Options(true, false); }
+        static Options unchecked() { return Options(false, false); }
+
+        bool fromReplication;
+        bool enforceOkForStorage;
     };
 
     struct ModifierInterface::ExecInfo {
@@ -141,7 +169,7 @@ namespace mongo {
             ANY_CONTEXT
         };
 
-        ExecInfo() : inPlace(false), noOp(false), context(ANY_CONTEXT) {
+        ExecInfo() : noOp(false), context(ANY_CONTEXT) {
             for (int i = 0; i < MAX_NUM_FIELDS; i++) {
                 fieldRef[i] = NULL;
             }
@@ -149,7 +177,6 @@ namespace mongo {
 
         // The fields of concern to the driver: no other op may modify the fields listed here.
         FieldRef* fieldRef[MAX_NUM_FIELDS]; // not owned here
-        bool inPlace;
         bool noOp;
         UpdateContext context;
     };

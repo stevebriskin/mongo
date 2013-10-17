@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -34,7 +46,7 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/background.h"
-#include "mongo/db/cmdline.h"
+#include "mongo/db/clientcursor.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/db.h"
@@ -47,20 +59,24 @@
 #include "mongo/db/json.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/mongod_options.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/query.h"
 #include "mongo/db/ops/update.h"
+#include "mongo/db/ops/update_driver.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/platform/process_id.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/file_allocator.h"
+#include "mongo/util/gcov.h"
 #include "mongo/util/goodies.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/time_support.h"
@@ -81,8 +97,6 @@ namespace mongo {
 #define LOGWITHRATELIMIT if( ++nloggedsome < 1000 || nloggedsome % 100 == 0 )
 
     string dbExecCommand;
-
-    bool useHints = true;
 
     KillCurrentOp killCurrentOp;
 
@@ -133,8 +147,8 @@ namespace mongo {
         QueryMessage q(d);
         BSONObjBuilder b;
 
-        const bool isAuthorized = cc().getAuthorizationSession()->checkAuthorization(
-                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::inprog);
+        const bool isAuthorized = cc().getAuthorizationSession()->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(), ActionType::inprog);
 
         audit::logInProgAuthzCheck(
                 &cc(), q.query, isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
@@ -192,8 +206,8 @@ namespace mongo {
         DbMessage d(m);
         QueryMessage q(d);
         BSONObj obj;
-        const bool isAuthorized = cc().getAuthorizationSession()->checkAuthorization(
-                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::killop);
+        const bool isAuthorized = cc().getAuthorizationSession()->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(), ActionType::killop);
         audit::logKillOpAuthzCheck(&cc(),
                                    q.query,
                                    isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
@@ -220,8 +234,8 @@ namespace mongo {
     bool _unlockFsync();
     void unlockFsync(const char *ns, Message& m, DbResponse &dbresponse) {
         BSONObj obj;
-        const bool isAuthorized = cc().getAuthorizationSession()->checkAuthorization(
-                AuthorizationManager::SERVER_RESOURCE_NAME, ActionType::unlock);
+        const bool isAuthorized = cc().getAuthorizationSession()->isAuthorizedForActionsOnResource(
+                ResourcePattern::forClusterResource(), ActionType::unlock);
         audit::logFsyncUnlockAuthzCheck(
                 &cc(), isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
         if (!isAuthorized) {
@@ -255,13 +269,12 @@ namespace mongo {
         shared_ptr<AssertionException> ex;
 
         try {
-            if (!NamespaceString(d.getns()).isCommand()) {
+            NamespaceString ns(d.getns());
+            if (!ns.isCommand()) {
                 // Auth checking for Commands happens later.
                 Client* client = &cc();
-                Status status = client->getAuthorizationSession()->checkAuthForQuery(d.getns(),
-                                                                                     q.query);
-                audit::logQueryAuthzCheck(
-                        client, NamespaceString(d.getns()), q.query, status.code());
+                Status status = client->getAuthorizationSession()->checkAuthForQuery(ns, q.query);
+                audit::logQueryAuthzCheck(client, ns, q.query, status.code());
                 uassertStatusOK(status);
             }
             dbresponse.exhaustNS = runQuery(m, q, op, *resp);
@@ -421,7 +434,7 @@ namespace mongo {
         OpDebug& debug = currentOp.debug();
         debug.op = op;
 
-        long long logThreshold = cmdLine.slowMS;
+        long long logThreshold = serverGlobalParams.slowMS;
         bool shouldLog = logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1));
 
         if ( op == dbQuery ) {
@@ -565,8 +578,6 @@ namespace mongo {
         prefix += '.';
         ClientCursor::invalidate(prefix.c_str());
 
-        NamespaceDetailsTransient::eraseDB( prefix );
-
         dbHolderW().erase( db, path );
         ctx->_clear();
         delete database; // closes files
@@ -574,8 +585,8 @@ namespace mongo {
 
     void receivedUpdate(Message& m, CurOp& op) {
         DbMessage d(m);
-        const char *ns = d.getns();
-        op.debug().ns = ns;
+        NamespaceString ns(d.getns());
+        op.debug().ns = ns.ns();
         int flags = d.pullInt();
         BSONObj query = d.nextJsObj();
 
@@ -593,30 +604,81 @@ namespace mongo {
                                                                            query,
                                                                            toupdate,
                                                                            upsert);
-        audit::logUpdateAuthzCheck(
-                &cc(), NamespaceString(ns), query, toupdate, upsert, multi, status.code());
+        audit::logUpdateAuthzCheck(&cc(), ns, query, toupdate, upsert, multi, status.code());
         uassertStatusOK(status);
 
         op.debug().query = query;
         op.setQuery(query);
 
+        // This code should look quite familiar, since it is basically the prelude code in the
+        // other overload of _updateObjectsNEW. We could factor it into a common function, but
+        // that would require that we heap allocate the driver, which doesn't seem worth it
+        // right now, especially considering that we will probably rewrite much of this code in
+        // the near term.
+
+        UpdateDriver::Options options;
+        options.multi = multi;
+        options.upsert = upsert;
+
+        // TODO: This is wasteful. We really shouldn't need to generate the oplog entry
+        // just to throw it away if we are not generating an oplog.
+        options.logOp = true;
+
+        // Select the right modifier options. We aren't in a replication context here, so
+        // the only question is whether this update is against the 'config' database, in
+        // which case we want to disable checks, since config db docs can have field names
+        // containing a dot (".").
+        options.modOptions = ( NamespaceString( ns ).isConfigDB() ) ?
+            ModifierInterface::Options::unchecked() :
+            ModifierInterface::Options::normal();
+
+        UpdateDriver driver( options );
+
+        status = driver.parse( toupdate );
+        if ( !status.isOK() ) {
+            uasserted( 17009, status.reason() );
+        }
+
         PageFaultRetryableSection s;
         while ( 1 ) {
             try {
-                Lock::DBWrite lk(ns);
-                
-                // void ReplSetImpl::relinquish() uses big write lock so 
-                // this is thus synchronized given our lock above.
-                uassert( 10054 ,  "not master", isMasterNs( ns ) );
-                
-                // if this ever moves to outside of lock, need to adjust check Client::Context::_finishInit
+                Lock::DBWrite lk(ns.ns());
+
+                // void ReplSetImpl::relinquish() uses big write lock so this is thus
+                // synchronized given our lock above.
+                uassert( 17010 ,  "not master", isMasterNs( ns.ns().c_str() ) );
+
+                // if this ever moves to outside of lock, need to adjust check
+                // Client::Context::_finishInit
                 if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
                     return;
-                
+
+                // See if we have any sharding keys, and if we find that we do, inject them
+                // into the driver. If we don't, the empty BSONObj will reset any shard key
+                // state in the driver.
+                BSONObj shardKeyPattern;
+                if (shardingState.needCollectionMetadata( ns ) ) {
+                    const CollectionMetadataPtr metadata = shardingState.getCollectionMetadata( ns );
+                    if ( metadata )
+                        shardKeyPattern = metadata->getKeyPattern();
+                }
+                driver.refreshShardKeyPattern( shardKeyPattern );
+
                 Client::Context ctx( ns );
-                
-                UpdateResult res = updateObjects(ns, toupdate, query, upsert, multi, true, op.debug() );
-                lastError.getSafe()->recordUpdate( res.existing , res.num , res.upserted ); // for getlasterror
+
+                const NamespaceString requestNs(ns);
+                UpdateRequest request(requestNs);
+
+                request.setUpsert(upsert);
+                request.setMulti(multi);
+                request.setQuery(query);
+                request.setUpdates(toupdate);
+                request.setUpdateOpLog(); // TODO: This is wasteful if repl is not active.
+
+                UpdateResult res = update(request, &op.debug(), &driver);
+
+                // for getlasterror
+                lastError.getSafe()->recordUpdate( res.existing , res.numMatched , res.upserted );
                 break;
             }
             catch ( PageFaultException& e ) {
@@ -627,9 +689,9 @@ namespace mongo {
 
     void receivedDelete(Message& m, CurOp& op) {
         DbMessage d(m);
-        const char *ns = d.getns();
+        NamespaceString ns(d.getns());
 
-        op.debug().ns = ns;
+        op.debug().ns = ns.ns();
         int flags = d.pullInt();
         bool justOne = flags & RemoveOption_JustOne;
         bool broadcast = flags & RemoveOption_Broadcast;
@@ -637,7 +699,7 @@ namespace mongo {
         BSONObj pattern = d.nextJsObj();
 
         Status status = cc().getAuthorizationSession()->checkAuthForDelete(ns, pattern);
-        audit::logDeleteAuthzCheck(&cc(), NamespaceString(ns), pattern, status.code());
+        audit::logDeleteAuthzCheck(&cc(), ns, pattern, status.code());
         uassertStatusOK(status);
 
         op.debug().query = pattern;
@@ -646,10 +708,10 @@ namespace mongo {
         PageFaultRetryableSection s;
         while ( 1 ) {
             try {
-                Lock::DBWrite lk(ns);
+                Lock::DBWrite lk(ns.ns());
                 
                 // writelock is used to synchronize stepdowns w/ writes
-                uassert( 10056 ,  "not master", isMasterNs( ns ) );
+                uassert( 10056 ,  "not master", isMasterNs( ns.ns().c_str() ) );
                 
                 // if this ever moves to outside of lock, need to adjust check Client::Context::_finishInit
                 if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
@@ -657,7 +719,7 @@ namespace mongo {
                 
                 Client::Context ctx(ns);
                 
-                long long n = deleteObjects(ns, pattern, justOne, true);
+                long long n = deleteObjects(ns.ns(), pattern, justOne, true);
                 lastError.getSafe()->recordDelete( n );
                 op.debug().ndeleted = n;
                 break;
@@ -696,8 +758,9 @@ namespace mongo {
                 const NamespaceString nsString( ns );
                 uassert( 16258, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
 
-                Status status = cc().getAuthorizationSession()->checkAuthForGetMore(ns, cursorid);
-                audit::logGetMoreAuthzCheck(&cc(), NamespaceString(ns), cursorid, status.code());
+                Status status = cc().getAuthorizationSession()->checkAuthForGetMore(
+                        nsString, cursorid);
+                audit::logGetMoreAuthzCheck(&cc(), nsString, cursorid, status.code());
                 uassertStatusOK(status);
 
                 if (str::startsWith(ns, "local.oplog.")){
@@ -794,20 +857,26 @@ namespace mongo {
         return ok;
     }
 
-    void checkAndInsert(const char *ns, /*modifies*/BSONObj& js) { 
+    void checkAndInsert(const char *ns, /*modifies*/BSONObj& js) {
         uassert( 10059 , "object to insert too large", js.objsize() <= BSONObjMaxUserSize);
         {
             BSONObjIterator i( js );
             while ( i.more() ) {
                 BSONElement e = i.next();
 
-                // check no $ modifiers.  note we only check top level.  
-                // (scanning deep would be quite expensive)
-                uassert( 13511, "document to insert can't have $ fields", e.fieldName()[0] != '$' );
-                
+                // No '$' prefixed field names allowed.
+                // NOTE: We only check top level (scanning deep would be too expensive).
+                uassert( 13511,
+                         str::stream() << "Document can't have $ prefixed field names: "
+                                       << e.fieldName(),
+                         e.fieldName()[0] != '$' );
+
                 // check no regexp for _id (SERVER-9502)
+                // also, disallow undefined and arrays
                 if (str::equals(e.fieldName(), "_id")) {
                     uassert(16824, "can't use a regex for _id", e.type() != RegEx);
+                    uassert(17150, "can't use undefined for _id", e.type() != Undefined);
+                    uassert(17151, "can't use an array for _id", e.type() != Array);
                 }
             }
         }
@@ -860,8 +929,9 @@ namespace mongo {
 
             // Check auth for insert (also handles checking if this is an index build and checks
             // for the proper privileges in that case).
-            Status status = cc().getAuthorizationSession()->checkAuthForInsert(ns, obj);
-            audit::logInsertAuthzCheck(&cc(), NamespaceString(ns), obj, status.code());
+            const NamespaceString nsString(ns);
+            Status status = cc().getAuthorizationSession()->checkAuthForInsert(nsString, obj);
+            audit::logInsertAuthzCheck(&cc(), nsString, obj, status.code());
             uassertStatusOK(status);
         }
 
@@ -899,7 +969,7 @@ namespace mongo {
         boost::filesystem::path path( usePath );
         for ( boost::filesystem::directory_iterator i( path );
                 i != boost::filesystem::directory_iterator(); ++i ) {
-            if ( directoryperdb ) {
+            if (storageGlobalParams.directoryperdb) {
                 boost::filesystem::path p = *i;
                 string dbName = p.leaf().string();
                 p /= ( dbName + ".ns" );
@@ -1040,7 +1110,7 @@ namespace mongo {
         log() << "shutdown: waiting for fs preallocator..." << endl;
         FileAllocator::get()->waitUntilFinished();
 
-        if( cmdLine.dur ) {
+        if (storageGlobalParams.dur) {
             log() << "shutdown: lock for final commit..." << endl;
             {
                 int n = 10;
@@ -1068,7 +1138,7 @@ namespace mongo {
         MemoryMappedFile::closeAllFiles( ss3 );
         log() << ss3.str() << endl;
 
-        if( cmdLine.dur ) {
+        if (storageGlobalParams.dur) {
             dur::journalCleanup(true);
         }
 
@@ -1107,7 +1177,10 @@ namespace mongo {
     /* not using log() herein in case we are already locked */
     NOINLINE_DECL void dbexit( ExitCode rc, const char *why ) {
 
+        flushForGcov();
+
         Client * c = currentClient.get();
+        audit::logShutdown(c);
         {
             scoped_lock lk( exitMutex );
             if ( numExitCalls++ > 0 ) {
@@ -1175,7 +1248,7 @@ namespace mongo {
     }
 
     void acquirePathLock(bool doingRepair) {
-        string name = ( boost::filesystem::path( dbpath ) / "mongod.lock" ).string();
+        string name = (boost::filesystem::path(storageGlobalParams.dbpath) / "mongod.lock").string();
 
         bool oldFile = false;
 
@@ -1224,7 +1297,7 @@ namespace mongo {
                          "run with --repair again.\n"
                          "**************";
             }
-            else if (cmdLine.dur) {
+            else if (storageGlobalParams.dur) {
                 if (!dur::haveJournalFiles(/*anyFiles=*/true)) {
                     // Passing anyFiles=true as we are trying to protect against starting in an
                     // unclean state with the journal directory unmounted. If there are any files,
@@ -1278,7 +1351,7 @@ namespace mongo {
         }
 
         // Not related to lock file, but this is where we handle unclean shutdown
-        if( !cmdLine.dur && dur::haveJournalFiles() ) {
+        if (!storageGlobalParams.dur && dur::haveJournalFiles()) {
             cout << "**************" << endl;
             cout << "Error: journal files are present in journal directory, yet starting without journaling enabled." << endl;
             cout << "It is recommended that you start with journaling enabled so that recovery may occur." << endl;
@@ -1302,7 +1375,7 @@ namespace mongo {
         // TODO - this is very bad that the code above not running here.
 
         // Not related to lock file, but this is where we handle unclean shutdown
-        if( !cmdLine.dur && dur::haveJournalFiles() ) {
+        if (!storageGlobalParams.dur && dur::haveJournalFiles()) {
             cout << "**************" << endl;
             cout << "Error: journal files are present in journal directory, yet starting without --journal enabled." << endl;
             cout << "It is recommended that you start with journaling enabled so that recovery may occur." << endl;
@@ -1320,7 +1393,7 @@ namespace mongo {
     void DiagLog::openFile() {
         verify( f == 0 );
         stringstream ss;
-        ss << dbpath << "/diaglog." << hex << time(0);
+        ss << storageGlobalParams.dbpath << "/diaglog." << hex << time(0);
         string name = ss.str();
         f = new ofstream(name.c_str(), ios::out | ios::binary);
         if ( ! f->good() ) {

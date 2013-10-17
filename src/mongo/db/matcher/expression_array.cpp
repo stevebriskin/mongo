@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/matcher/expression_array.h"
@@ -32,8 +44,7 @@ namespace mongo {
     }
 
     bool ArrayMatchingMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-
-        boost::scoped_ptr<ElementIterator> cursor( doc->getIterator( _elementPath ) );
+        MatchableDocument::IteratorHolder cursor( doc, &_elementPath );
 
         while ( cursor->more() ) {
             ElementIterator::Context e = cursor->next();
@@ -82,7 +93,7 @@ namespace mongo {
 
     // -------
 
-    Status ElemMatchObjectMatchExpression::init( const StringData& path, const MatchExpression* sub ) {
+    Status ElemMatchObjectMatchExpression::init( const StringData& path, MatchExpression* sub ) {
         _sub.reset( sub );
         return initPath( path );
     }
@@ -105,7 +116,14 @@ namespace mongo {
 
     void ElemMatchObjectMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << path() << " $elemMatch\n";
+        debug << path() << " $elemMatch (obj)";
+
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
         _sub->debugString( debug, level + 1 );
     }
 
@@ -118,7 +136,7 @@ namespace mongo {
         _subs.clear();
     }
 
-    Status ElemMatchValueMatchExpression::init( const StringData& path, const MatchExpression* sub ) {
+    Status ElemMatchValueMatchExpression::init( const StringData& path, MatchExpression* sub ) {
         init( path );
         add( sub );
         return Status::OK();
@@ -129,7 +147,7 @@ namespace mongo {
     }
 
 
-    void ElemMatchValueMatchExpression::add( const MatchExpression* sub ) {
+    void ElemMatchValueMatchExpression::add( MatchExpression* sub ) {
         verify( sub );
         _subs.push_back( sub );
     }
@@ -159,7 +177,14 @@ namespace mongo {
 
     void ElemMatchValueMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << path() << " $elemMatch\n";
+        debug << path() << " $elemMatch (value)";
+
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
         for ( unsigned i = 0; i < _subs.size(); i++ ) {
             _subs[i]->debugString( debug, level + 1 );
         }
@@ -181,13 +206,13 @@ namespace mongo {
         return s;
     }
 
-    void AllElemMatchOp::add( const ArrayMatchingMatchExpression* expr ) {
+    void AllElemMatchOp::add( ArrayMatchingMatchExpression* expr ) {
         verify( expr );
         _list.push_back( expr );
     }
 
     bool AllElemMatchOp::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        boost::scoped_ptr<ElementIterator> cursor( doc->getIterator( _elementPath ) );
+        MatchableDocument::IteratorHolder cursor( doc, &_elementPath );
         while ( cursor->more() ) {
             ElementIterator::Context e = cursor->next();
             if ( e.element().type() != Array )
@@ -209,7 +234,8 @@ namespace mongo {
         if ( _list.size() == 0 )
             return false;
         for ( unsigned i = 0; i < _list.size(); i++ ) {
-            if ( !_list[i]->matchesArray( anArray, NULL ) )
+            if ( !static_cast<ArrayMatchingMatchExpression*>(_list[i])->matchesArray(
+                     anArray, NULL ) )
                 return false;
         }
         return true;
@@ -218,10 +244,17 @@ namespace mongo {
 
     void AllElemMatchOp::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " AllElemMatchOp: " << _path << "\n";
+        debug << _path << " AllElemMatchOp:";
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
         for ( size_t i = 0; i < _list.size(); i++ ) {
             _list[i]->debugString( debug, level + 1);
         }
+
     }
 
     bool AllElemMatchOp::equivalent( const MatchExpression* other ) const {
@@ -259,6 +292,12 @@ namespace mongo {
     void SizeMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
         debug << path() << " $size : " << _size << "\n";
+
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
     }
 
     bool SizeMatchExpression::equivalent( const MatchExpression* other ) const {

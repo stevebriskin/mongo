@@ -12,50 +12,47 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
-#include "db/pipeline/document_source.h"
 
-#include "db/jsobj.h"
-#include "db/pipeline/accumulator.h"
-#include "db/pipeline/document.h"
-#include "db/pipeline/expression.h"
-#include "db/pipeline/expression_context.h"
-#include "db/pipeline/value.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/value.h"
 
 namespace mongo {
     const char DocumentSourceGroup::groupName[] = "$group";
-
-    DocumentSourceGroup::~DocumentSourceGroup() {
-    }
 
     const char *DocumentSourceGroup::getSourceName() const {
         return groupName;
     }
 
-    bool DocumentSourceGroup::eof() {
-        if (!populated)
-            populate();
-
-        return _spilled
-                ? _done
-                : (groupsIterator == groups.end());
-    }
-
-    bool DocumentSourceGroup::advance() {
-        DocumentSource::advance(); // check for interrupts
+    boost::optional<Document> DocumentSourceGroup::getNext() {
+        pExpCtx->checkForInterrupt();
 
         if (!populated)
             populate();
 
         if (_spilled) {
-            if (_doneAfterNextAdvance) {
-                verify(!_done);
-                _done = true;
-                return !_done;
-            }
+            if (!_sorterIterator)
+                return boost::none;
 
             const size_t numAccumulators = vpAccumulatorFactory.size();
             for (size_t i=0; i < numAccumulators; i++) {
@@ -88,38 +85,27 @@ namespace mongo {
                 }
 
                 if (!_sorterIterator->more()) {
-                    _doneAfterNextAdvance = true;
+                    dispose();
                     break;
                 }
 
                 _firstPartOfNextGroup = _sorterIterator->next();
             }
 
-        } else {
-            verify(groupsIterator != groups.end());
+            return makeDocument(_currentId, _currentAccumulators, pExpCtx->inShard);
 
-            ++groupsIterator;
-            if (groupsIterator == groups.end()) {
+        } else {
+            if (groups.empty())
+                return boost::none;
+
+            Document out = makeDocument(groupsIterator->first,
+                                        groupsIterator->second,
+                                        pExpCtx->inShard);
+
+            if (++groupsIterator == groups.end())
                 dispose();
-                return false;
-            }
-        }
 
-        return true;
-    }
-
-    Document DocumentSourceGroup::getCurrent() {
-        if (!populated)
-            populate();
-
-        dassert(!eof());
-
-        if (_spilled) {
-            return makeDocument(_currentId, _currentAccumulators, pExpCtx->getInShard());
-        } else {
-            return makeDocument(groupsIterator->first,
-                                groupsIterator->second,
-                                pExpCtx->getInShard());
+            return out;
         }
     }
 
@@ -129,29 +115,33 @@ namespace mongo {
         _sorterIterator.reset();
 
         // make us look done
-        _doneAfterNextAdvance = true;
-        _done = true;
         groupsIterator = groups.end();
 
         // free our source's resources
         pSource->dispose();
     }
 
-    void DocumentSourceGroup::sourceToBson(BSONObjBuilder* pBuilder, bool explain) const {
+    Value DocumentSourceGroup::serialize(bool explain) const {
         MutableDocument insides;
 
-        /* add the _id */
+        // add the _id
         insides["_id"] = pIdExpression->serialize();
 
-        /* add the remaining fields */
+        // add the remaining fields
         const size_t n = vFieldName.size();
         for(size_t i = 0; i < n; ++i) {
             intrusive_ptr<Accumulator> accum = vpAccumulatorFactory[i]();
-            insides[vFieldName[i]] = Value(
-                    DOC(accum->getOpName() << vpExpression[i]->serialize()));
+            insides[vFieldName[i]] = Value(DOC(accum->getOpName() << vpExpression[i]->serialize()));
         }
 
-        *pBuilder << groupName << insides.freeze();
+        if (_doingMerge) {
+            // This makes the output unparsable (with error) on pre 2.6 shards, but it will never
+            // be sent to old shards when this flag is true since they can't do a merge anyway.
+
+            insides["$doingMerge"] = Value(true);
+        }
+
+        return Value(DOC(getSourceName() << insides.freeze()));
     }
 
     DocumentSource::GetDepsReturn DocumentSourceGroup::getDependencies(set<string>& deps) const {
@@ -177,11 +167,10 @@ namespace mongo {
     DocumentSourceGroup::DocumentSourceGroup(const intrusive_ptr<ExpressionContext>& pExpCtx)
         : SplittableDocumentSource(pExpCtx)
         , populated(false)
+        , _doingMerge(false)
         , _spilled(false)
-        , _extSortAllowed(pExpCtx->getExtSortAllowed() && !pExpCtx->getInRouter())
+        , _extSortAllowed(pExpCtx->extSortAllowed && !pExpCtx->inRouter)
         , _maxMemoryUsageBytes(100*1024*1024)
-        , _doneAfterNextAdvance(false)
-        , _done(false)
     {}
 
     void DocumentSourceGroup::addAccumulator(
@@ -222,16 +211,16 @@ namespace mongo {
     static const size_t NGroupOp = sizeof(GroupOpTable)/sizeof(GroupOpTable[0]);
 
     intrusive_ptr<DocumentSource> DocumentSourceGroup::createFromBson(
-        BSONElement *pBsonElement,
-        const intrusive_ptr<ExpressionContext> &pExpCtx) {
+            BSONElement elem,
+            const intrusive_ptr<ExpressionContext> &pExpCtx) {
         uassert(15947, "a group's fields must be specified in an object",
-                pBsonElement->type() == Object);
+                elem.type() == Object);
 
         intrusive_ptr<DocumentSourceGroup> pGroup(
             DocumentSourceGroup::create(pExpCtx));
         bool idSet = false;
 
-        BSONObj groupObj(pBsonElement->Obj());
+        BSONObj groupObj(elem.Obj());
         BSONObjIterator groupIterator(groupObj);
         while(groupIterator.more()) {
             BSONElement groupField(groupIterator.next());
@@ -249,10 +238,7 @@ namespace mongo {
                       group-by key.
                     */
                     Expression::ObjectCtx oCtx(Expression::ObjectCtx::DOCUMENT_OK);
-                    intrusive_ptr<Expression> pId(
-                        Expression::parseObject(&groupField, &oCtx));
-
-                    pGroup->setIdExpression(pId);
+                    pGroup->setIdExpression(Expression::parseObject(groupField.Obj(), &oCtx));
                     idSet = true;
                 }
                 else if (groupType == String) {
@@ -268,6 +254,12 @@ namespace mongo {
                     pGroup->setIdExpression(ExpressionConstant::create(Value(groupField)));
                     idSet = true;
                 }
+            }
+            else if (str::equals(pFieldName, "$doingMerge")) {
+                massert(17030, "$doingMerge should be true if present",
+                        groupField.Bool());
+
+                pGroup->setDoingMerge(true);
             }
             else {
                 /*
@@ -310,17 +302,15 @@ namespace mongo {
 
                     BSONType elementType = subElement.type();
                     if (elementType == Object) {
-                        Expression::ObjectCtx oCtx(
-                            Expression::ObjectCtx::DOCUMENT_OK);
-                        pGroupExpr = Expression::parseObject(
-                            &subElement, &oCtx);
+                        Expression::ObjectCtx oCtx(Expression::ObjectCtx::DOCUMENT_OK);
+                        pGroupExpr = Expression::parseObject(subElement.Obj(), &oCtx);
                     }
                     else if (elementType == Array) {
                         uasserted(15953, str::stream()
                                 << "aggregating group operators are unary (" << key.name << ")");
                     }
                     else { /* assume its an atomic single operand */
-                        pGroupExpr = Expression::parseOperand(&subElement);
+                        pGroupExpr = Expression::parseOperand(subElement);
                     }
 
                     pGroup->addAccumulator(pFieldName, pOp->factory, pGroupExpr);
@@ -352,14 +342,12 @@ namespace mongo {
         const size_t numAccumulators = vpAccumulatorFactory.size();
         dassert(numAccumulators == vpExpression.size());
 
-        const bool mergeInputs = pExpCtx->getDoingMerge();
-
         // pushed to on spill()
         vector<shared_ptr<Sorter<Value, Value>::Iterator> > sortedFiles;
         int memoryUsageBytes = 0;
 
         // This loop consumes all input from pSource and buckets it based on pIdExpression.
-        for (bool hasNext = !pSource->eof(); hasNext; hasNext = pSource->advance()) {
+        while (boost::optional<Document> input = pSource->getNext()) {
             if (memoryUsageBytes > _maxMemoryUsageBytes) {
                 uassert(16945, "Exceeded memory limit for $group, but didn't allow external sort",
                         _extSortAllowed);
@@ -367,8 +355,7 @@ namespace mongo {
                 memoryUsageBytes = 0;
             }
 
-            const Document input = pSource->getCurrent();
-            const Variables vars (input);
+            const Variables vars(*input);
 
             /* get the _id value */
             Value id = pIdExpression->evaluate(vars);
@@ -403,14 +390,14 @@ namespace mongo {
             /* tickle all the accumulators for the group we found */
             dassert(numAccumulators == group.size());
             for (size_t i = 0; i < numAccumulators; i++) {
-                group[i]->process(vpExpression[i]->evaluate(vars), mergeInputs);
+                group[i]->process(vpExpression[i]->evaluate(vars), _doingMerge);
                 memoryUsageBytes += group[i]->memUsageForSorter();
             }
 
             DEV {
                 // In debug mode, spill every time we have a duplicate id to stress merge logic.
                 if (!inserted // is a dup
-                        && !pExpCtx->getInRouter() // can't spill to disk in router
+                        && !pExpCtx->inRouter // can't spill to disk in router
                         && !_extSortAllowed // don't change behavior when testing external sort
                         && sortedFiles.size() < 20 // don't open too many FDs
                         ) {
@@ -439,17 +426,14 @@ namespace mongo {
                 _currentAccumulators.push_back(vpAccumulatorFactory[i]());
             }
 
-            // must be before call to advance so we don't recurse
-            populated = true;
-
             verify(_sorterIterator->more()); // we put data in, we should get something out.
             _firstPartOfNextGroup = _sorterIterator->next();
-            verify(advance()); // moves first result into _currentId and _currentAccumulators
         } else {
             // start the group iterator
             groupsIterator = groups.begin();
-            populated = true;
         }
+
+        populated = true;
     }
 
     class DocumentSourceGroup::SpillSTLComparator {
@@ -468,7 +452,7 @@ namespace mongo {
 
         stable_sort(ptrs.begin(), ptrs.end(), SpillSTLComparator());
 
-        SortedFileWriter<Value, Value> writer;
+        SortedFileWriter<Value, Value> writer(SortOptions().TempDir(pExpCtx->tempDir));
         switch (vpAccumulatorFactory.size()) { // same as ptrs[i]->second.size() for all i.
         case 0: // no values, essentially a distinct
             for (size_t i=0; i < ptrs.size(); i++) {
@@ -528,9 +512,8 @@ namespace mongo {
     }
 
     intrusive_ptr<DocumentSource> DocumentSourceGroup::getRouterSource() {
-        intrusive_ptr<ExpressionContext> pMergerExpCtx = pExpCtx->clone();
-        pMergerExpCtx->setDoingMerge(true);
-        intrusive_ptr<DocumentSourceGroup> pMerger(DocumentSourceGroup::create(pMergerExpCtx));
+        intrusive_ptr<DocumentSourceGroup> pMerger(DocumentSourceGroup::create(pExpCtx));
+        pMerger->setDoingMerge(true);
 
         /* the merger will use the same grouping key */
         pMerger->setIdExpression(ExpressionFieldPath::parse("$$ROOT._id"));

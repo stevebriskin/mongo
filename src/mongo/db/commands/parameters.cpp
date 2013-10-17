@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -21,8 +33,8 @@
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/server_parameters.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
@@ -48,7 +60,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::getParameter);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual void help( stringstream &help ) const {
             help << "get administrative option(s)\nexample:\n";
@@ -60,6 +72,22 @@ namespace mongo {
             bool all = *cmdObj.firstElement().valuestrsafe() == '*';
 
             int before = result.len();
+
+            // TODO: convert to ServerParameters -- SERVER-10515
+
+            if (isJournalingEnabled() && (all || cmdObj.hasElement("journalCommitInterval")) &&
+                !isMongos()) {
+                result.append("journalCommitInterval",
+                              getJournalCommitInterval());
+            }
+            if( all || cmdObj.hasElement( "traceExceptions" ) ) {
+                result.append("traceExceptions",
+                              DBException::traceExceptions);
+            }
+            if( all || cmdObj.hasElement( "replMonitorMaxFailedChecks" ) ) {
+                result.append("replMonitorMaxFailedChecks",
+                              ReplicaSetMonitor::getMaxFailedChecks());
+            }
 
             const ServerParameter::Map& m = ServerParameterSet::getGlobal()->getMap();
             for ( ServerParameter::Map::const_iterator i = m.begin(); i != m.end(); ++i ) {
@@ -87,7 +115,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::setParameter);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual void help( stringstream &help ) const {
             help << "set administrative option(s)\n";
@@ -98,16 +126,20 @@ namespace mongo {
             int s = 0;
             bool found = false;
 
-            // TODO: remove these manual things
+            // TODO: convert to ServerParameters -- SERVER-10515
 
             if( cmdObj.hasElement("journalCommitInterval") ) {
-                if( !cmdLine.dur ) {
+                if (isMongos()) {
+                    errmsg = "cannot set journalCommitInterval on a mongos";
+                    return false;
+                }
+                if(!isJournalingEnabled()) {
                     errmsg = "journaling is off";
                     return false;
                 }
                 int x = (int) cmdObj["journalCommitInterval"].Number();
                 verify( x > 1 && x < 500 );
-                cmdLine.journalCommitInterval = x;
+                setJournalCommitInterval(x);
                 log() << "setParameter journalCommitInterval=" << x << endl;
                 s++;
             }
@@ -199,23 +231,11 @@ namespace mongo {
             }
         } logLevelSetting;
 
-        ExportedServerParameter<bool> NoTableScanSetting( ServerParameterSet::getGlobal(),
-                                                          "notablescan",
-                                                          &cmdLine.noTableScan,
-                                                          true,
-                                                          true );
-
         ExportedServerParameter<bool> QuietSetting( ServerParameterSet::getGlobal(),
                                                     "quiet",
-                                                    &cmdLine.quiet,
+                                                    &serverGlobalParams.quiet,
                                                     true,
                                                     true );
-
-        ExportedServerParameter<double> SyncdelaySetting( ServerParameterSet::getGlobal(),
-                                                          "syncdelay",
-                                                          &cmdLine.syncdelay,
-                                                          true,
-                                                          true );
     }
 
 }

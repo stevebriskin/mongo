@@ -487,7 +487,8 @@ ReplSetTest.prototype.initiate = function( cfg , initCmd , timeout ) {
     this.awaitSecondaryNodes();
 
     // Setup authentication if running test with authentication
-    if (jsTestOptions().keyFile && !this.keyFile && cmdKey == 'replSetInitiate') {
+    if ((jsTestOptions().keyFile || jsTestOptions().useX509) && 
+          cmdKey == 'replSetInitiate') {
         master = this.getMaster();
         jsTest.addAuth(master);
         jsTest.authenticateNodes(this.nodes);
@@ -527,6 +528,8 @@ ReplSetTest.prototype.awaitReplication = function(timeout) {
     var name = this.liveNodes.master.toString().substr(14); // strip "connection to "
     print("ReplSetTest awaitReplication: starting: timestamp for primary, " +
           name + ", is " + tojson(this.latest));
+
+    var configVersion = this.liveNodes.master.getDB("local")['system.replset'].findOne().version;
 
     var self = this;
     assert.soon( function() {
@@ -581,6 +584,15 @@ ReplSetTest.prototype.awaitReplication = function(timeout) {
                              else {
                                  print("ReplSetTest awaitReplication: waiting for secondary #" +
                                        secondaryCount + ", " + name + ", to have an oplog built");
+                                 return false;
+                             }
+
+                             var slaveConfigVersion = slave.getDB("local")['system.replset'].findOne().version;
+
+                             if (configVersion != slaveConfigVersion) {
+                                 print("ReplSetTest awaitReplication: secondary #" + secondaryCount +
+                                       ", " + name + ", has config version #" + slaveConfigVersion +
+                                       ", but expected config version #" + configVersion);
                                  return false;
                              }
                          }
@@ -729,7 +741,7 @@ ReplSetTest.prototype.restart = function( n , options, signal, wait ){
     this.stop( n, signal, wait && wait.toFixed ? wait : true, options )
     started = this.start( n , options , true, wait );
 
-    if (jsTestOptions().keyFile && !this.keyFile) {
+    if (jsTestOptions().keyFile || jsTestOptions().useX509) {
         if (started.length) {
              // if n was an array of conns, start will return an array of connections
             for (var i = 0; i < started.length; i++) {
@@ -908,7 +920,13 @@ ReplSetTest.prototype.waitForIndicator = function( node, states, ind, timeout ){
     var self = this;
     assert.soon(function() {
         
-        status = self.status()
+        try {
+            status = self.status();
+        }
+        catch ( ex ) {
+            print( "ReplSetTest waitForIndicator could not get status: " + tojson( ex ) );
+            return false;
+        }
         
         var printStatus = false
         if( lastTime == null || ( currTime = new Date().getTime() ) - (1000 * 5) > lastTime ){

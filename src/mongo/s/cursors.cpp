@@ -13,6 +13,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 
@@ -23,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
@@ -284,8 +297,8 @@ namespace mongo {
         uassert( 13287 , "too many cursors to kill" , n < 30000 );
 
         long long * cursors = (long long *)x;
-        AuthorizationSession* authSession =
-                ClientBasic::getCurrent()->getAuthorizationSession();
+        ClientBasic* client = ClientBasic::getCurrent();
+        AuthorizationSession* authSession = client->getAuthorizationSession();
         for ( int i=0; i<n; i++ ) {
             long long id = cursors[i];
             LOG(_myLogLevel) << "CursorCache::gotKillCursors id: " << id << endl;
@@ -301,8 +314,14 @@ namespace mongo {
 
                 MapSharded::iterator i = _cursors.find( id );
                 if ( i != _cursors.end() ) {
-                    if (authSession->checkAuthorization(i->second->getNS(),
-                                                        ActionType::killCursors)) {
+                    const bool isAuthorized = authSession->isAuthorizedForActionsOnNamespace(
+                            NamespaceString(i->second->getNS()), ActionType::killCursors);
+                    audit::logKillCursorsAuthzCheck(
+                            client,
+                            NamespaceString(i->second->getNS()),
+                            id,
+                            isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+                    if (isAuthorized) {
                         _cursors.erase( i );
                     }
                     continue;
@@ -315,7 +334,14 @@ namespace mongo {
                     continue;
                 }
                 verify(refsNSIt != _refsNS.end());
-                if (!authSession->checkAuthorization(refsNSIt->second, ActionType::killCursors)) {
+                const bool isAuthorized = authSession->isAuthorizedForActionsOnNamespace(
+                        NamespaceString(refsNSIt->second), ActionType::killCursors);
+                audit::logKillCursorsAuthzCheck(
+                        client,
+                        NamespaceString(refsNSIt->second),
+                        id,
+                        isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+                if (!isAuthorized) {
                     continue;
                 }
                 server = refsIt->second;
@@ -385,7 +411,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::cursorInfo);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual LockType locktype() const { return NONE; }
         bool run(const string&, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {

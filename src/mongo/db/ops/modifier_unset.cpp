@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/modifier_unset.h"
@@ -19,9 +31,13 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/ops/field_checker.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/db/ops/path_support.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    namespace str = mongoutils::str;
 
     struct ModifierUnset::PreparedState {
 
@@ -30,7 +46,6 @@ namespace mongo {
             , idxFound(0)
             , elemFound(doc.end())
             , boundDollar("")
-            , inPlace(false)
             , noOp(false) {
         }
 
@@ -38,16 +53,13 @@ namespace mongo {
         mutablebson::Document& doc;
 
         // Index in _fieldRef for which an Element exist in the document.
-        int32_t idxFound;
+        size_t idxFound;
 
         // Element corresponding to _fieldRef[0.._idxFound].
         mutablebson::Element elemFound;
 
         // Value to bind to a $-positional field, if one is provided.
         std::string boundDollar;
-
-        // Could this mod be applied in place?
-        bool inPlace;
 
         // This $set is a no-op?
         bool noOp;
@@ -63,16 +75,15 @@ namespace mongo {
     ModifierUnset::~ModifierUnset() {
     }
 
-    Status ModifierUnset::init(const BSONElement& modExpr) {
+    Status ModifierUnset::init(const BSONElement& modExpr, const Options& opts) {
 
         //
         // field name analysis
         //
 
-        // Break down the field name into its 'dotted' components (aka parts) and check that
-        // there are no empty parts.
+        // Perform standard field name and updateable checks.
         _fieldRef.parse(modExpr.fieldName());
-        Status status = fieldchecker::isUpdatable(_fieldRef);
+        Status status = fieldchecker::isUpdatableLegacy(_fieldRef);
         if (! status.isOK()) {
             return status;
         }
@@ -82,8 +93,11 @@ namespace mongo {
         size_t foundCount;
         bool foundDollar = fieldchecker::isPositional(_fieldRef, &_posDollar, &foundCount);
         if (foundDollar && foundCount > 1) {
-            return Status(ErrorCodes::BadValue, "too many positional($) elements found.");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "Too many positional (i.e. '$') elements found in path '"
+                                        << _fieldRef.dottedField() << "'");
         }
+
 
         //
         // value analysis
@@ -104,11 +118,15 @@ namespace mongo {
         // If we have a $-positional field, it is time to bind it to an actual field part.
         if (_posDollar) {
             if (matchedField.empty()) {
-                return Status(ErrorCodes::BadValue, "matched field not provided");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The positional operator did not find the match "
+                                               "needed from the query. Unexpanded update: "
+                                            << _fieldRef.dottedField());
             }
             _preparedState->boundDollar = matchedField.toString();
             _fieldRef.setPart(_posDollar, _preparedState->boundDollar);
         }
+
 
         // Locate the field name in 'root'. Note that if we don't have the full path in the
         // doc, there isn't anything to unset, really.
@@ -117,9 +135,8 @@ namespace mongo {
                                                        &_preparedState->idxFound,
                                                        &_preparedState->elemFound);
         if (!status.isOK() ||
-            _preparedState->idxFound != static_cast<int32_t>(_fieldRef.numParts() -1)) {
+            _preparedState->idxFound != (_fieldRef.numParts() -1)) {
             execInfo->noOp = _preparedState->noOp = true;
-            execInfo->inPlace = _preparedState->noOp = true;
             execInfo->fieldRef[0] = &_fieldRef;
 
             return Status::OK();
@@ -136,11 +153,9 @@ namespace mongo {
         // field boundaries must change.
         //
         // TODO:
-        // execInfo->inPlace = true;
         // mutablebson::Element curr = _preparedState->elemFound;
         // while (curr.ok()) {
         //     if (curr.rightSibling().ok()) {
-        //         execInfo->inPlace = false;
         //     }
         //     curr = curr.parent();
         // }
@@ -163,17 +178,13 @@ namespace mongo {
         }
     }
 
-    Status ModifierUnset::log(mutablebson::Element logRoot) const {
+    Status ModifierUnset::log(LogBuilder* logBuilder) const {
 
         // We'd like to create an entry such as {$unset: {<fieldname>: 1}} under 'logRoot'.
         // We start by creating the {$unset: ...} Element.
-        mutablebson::Document& doc = logRoot.getDocument();
-        mutablebson::Element unsetElement = doc.makeElementObject("$unset");
-        if (!unsetElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot create log entry for $unset mod");
-        }
+        mutablebson::Document& doc = logBuilder->getDocument();
 
-        // Then we create the {<fieldname>: <value>} Element. Note that <fieldname> must be a
+        // Create the {<fieldname>: <value>} Element. Note that <fieldname> must be a
         // dotted field, and not only the last part of that field. The rationale here is that
         // somoene picking up this log entry -- e.g., a secondary -- must be capable of doing
         // the same path find/creation that was done in the previous calls here.
@@ -182,14 +193,7 @@ namespace mongo {
             return Status(ErrorCodes::InternalError, "cannot create log details for $unset mod");
         }
 
-        // Now, we attach the {<fieldname>: `} Element under the {$unset: ...} one.
-        Status status = unsetElement.pushBack(logElement);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        // And attach the result under the 'logRoot' Element provided.
-        return logRoot.pushBack(unsetElement);
+        return logBuilder->addToUnsets(logElement);
     }
 
 } // namespace mongo

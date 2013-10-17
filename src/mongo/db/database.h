@@ -14,20 +14,34 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
 
 #include "mongo/db/cc_by_loc.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/namespace_details.h"
-#include "mongo/db/record.h"
 #include "mongo/db/storage/extent_manager.h"
+#include "mongo/db/storage/record.h"
+#include "mongo/db/storage_options.h"
 
 namespace mongo {
 
+    class Collection;
     class Extent;
     class DataFile;
+    class IndexDetails;
 
     /**
      * Database represents a database database
@@ -37,7 +51,8 @@ namespace mongo {
     class Database {
     public:
         // you probably need to be in dbHolderMutex when constructing this
-        Database(const char *nm, /*out*/ bool& newDb, const string& path = dbpath);
+        Database(const char *nm, /*out*/ bool& newDb,
+                 const string& path = storageGlobalParams.dbpath);
 
         /* you must use this to close - there is essential code in this method that is not in the ~Database destructor.
            thus the destructor is private.  this could be cleaned up one day...
@@ -67,11 +82,12 @@ namespace mongo {
          * return file n.  if it doesn't exist, create it
          */
         DataFile* getFile( int n, int sizeNeeded = 0, bool preallocateOnly = false ) {
-            _namespaceIndex.init();
+            _initForWrites();
             return _extentManager.getFile( n, sizeNeeded, preallocateOnly );
         }
 
         DataFile* addAFile( int sizeNeeded, bool preallocateNextFile ) {
+            _initForWrites();
             return _extentManager.addAFile( sizeNeeded, preallocateNextFile );
         }
 
@@ -80,10 +96,6 @@ namespace mongo {
          * safe to call this multiple times - the implementation will only preallocate one file
          */
         void preallocateAFile() { _extentManager.preallocateAFile(); }
-
-        DataFile* suitableFile( const char *ns, int sizeNeeded, bool preallocate, bool enforceQuota );
-
-        Extent* allocExtent( const char *ns, int size, bool capped, bool enforceQuota );
 
         /**
          * @return true if success.  false if bad level or error creating profile ns
@@ -115,6 +127,18 @@ namespace mongo {
 
         // TODO: do not think this method should exist, so should try and encapsulate better
         ExtentManager& getExtentManager() { return _extentManager; }
+        const ExtentManager& getExtentManager() const { return _extentManager; }
+
+        Status dropCollection( const StringData& fullns );
+
+        Collection* createCollection( const StringData& ns, bool capped, const BSONObj* options );
+
+        /**
+         * @param ns - this is fully qualified, which is maybe not ideal ???
+         */
+        Collection* getCollection( const StringData& ns );
+
+        Status renameCollection( const StringData& fromNS, const StringData& toNS, bool stayTemp );
 
         /**
          * @return name of an existing database with same text name but different
@@ -127,7 +151,35 @@ namespace mongo {
 
     private:
 
+        void _clearCollectionCache( const StringData& fullns );
+
+        void _clearCollectionCache_inlock( const StringData& fullns );
+
         ~Database(); // closes files and other cleanup see below.
+
+        void _addNamespaceToCatalog( const StringData& ns, const BSONObj* options );
+
+
+        /**
+         * removes from *.system.namespaces
+         * frees extents
+         * removes from NamespaceIndex
+         * NOT RIGHT NOW, removes cache entry in Database TODO?
+         */
+        Status _dropNS( const StringData& ns );
+
+        /**
+         * make sure namespace is initialized and $freelist is allocated before
+         * doing anything that will write
+         */
+        void _initForWrites() {
+            _namespaceIndex.init();
+            if ( !_extentManager.hasFreeList() ) {
+                _initExtentFreeList();
+            }
+        }
+
+        void _initExtentFreeList();
 
         /**
          * @throws DatabaseDifferCaseCode if the name is a duplicate based on
@@ -137,12 +189,8 @@ namespace mongo {
 
         void openAllFiles();
 
-        /**
-         * throws exception if error encounted
-         * @return true if the file was opened
-         *         false if no errors, but file doesn't exist
-         */
-        bool openExistingFile( int n );
+        Status _renameSingleNamespace( const StringData& fromNS, const StringData& toNS,
+                                       bool stayTemp );
 
         const string _name; // "alleyinsider"
         const string _path; // "/data/db"
@@ -151,6 +199,8 @@ namespace mongo {
         ExtentManager _extentManager;
 
         const string _profileName; // "alleyinsider.system.profile"
+        const string _namespacesName; // "alleyinsider.system.namespaces"
+        const string _extentFreelistName;
 
         CCByLoc _ccByLoc; // use by ClientCursor
 
@@ -159,6 +209,16 @@ namespace mongo {
 
         int _magic; // used for making sure the object is still loaded in memory
 
+        // TODO: probably shouldn't be a std::map
+        // TODO: make sure deletes go through
+        // this in some ways is a dupe of _namespaceIndex
+        // but it points to a much more useful data structure
+        typedef std::map< std::string, Collection* > CollectionMap;
+        CollectionMap _collections;
+        mutex _collectionLock;
+
+        friend class NamespaceDetails;
+        friend class IndexDetails;
     };
 
 } // namespace mongo

@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/field_checker.h"
@@ -26,44 +38,83 @@ namespace mongo {
 
 namespace fieldchecker {
 
-    Status basicIsUpdatable(const FieldRef& field) {
-        size_t numParts = field.numParts();
-        if (numParts == 0) {
-            return Status(ErrorCodes::BadValue, "cannot update anempty field name");
-        }
+    namespace {
 
-        for (size_t i = 0; i < numParts; i++) {
-            if (field.getPart(i).empty()) {
-                return Status(ErrorCodes::BadValue,
-                              mongoutils::str::stream() << field.dottedField()
-                                                        << " contains empty fields");
+        Status isUpdatable(const FieldRef& field, bool legacy) {
+            const size_t numParts = field.numParts();
+
+            if (numParts == 0) {
+                return Status(ErrorCodes::EmptyFieldName,
+                              "An empty update path is not valid.");
             }
+
+            for (size_t i = 0; i != numParts; ++i) {
+                const StringData part = field.getPart(i);
+
+                if ((i == 0) && part.compare("_id") == 0) {
+                    return Status(ErrorCodes::ImmutableIdField,
+                                  mongoutils::str::stream() << "The update path '"
+                                  << field.dottedField()
+                                  << "' contains the '_id' field, which cannot be updated.");
+                }
+
+                if (part.empty()) {
+                    return Status(ErrorCodes::EmptyFieldName,
+                                  mongoutils::str::stream() << "The update path '"
+                                  << field.dottedField()
+                                  << "' contains an empty field, which is not allowed.");
+                }
+
+                if (!legacy && (part[0] == '$')) {
+
+                    // A 'bare' dollar sign not in the first position is a positional
+                    // update token, so it is not an error.
+                    //
+                    // TODO: In 'isPositional' below, we redo a very similar walk and check.
+                    // Perhaps we should fuse these operations, and have isUpdatable take a
+                    // 'PositionalContext' object to be populated with information about any
+                    // discovered positional ops.
+                    const bool positional = ((i != 0) && (part.size() == 1));
+
+                    if (!positional) {
+
+                        // We ignore the '$'-prefixed names that are part of a DBRef, because
+                        // we don't have enough context here to validate that we have a proper
+                        // DB ref. Errors with the DBRef will be caught upstream when
+                        // okForStorage is invoked.
+                        //
+                        // TODO: We need to find a way to consolidate this checking with that
+                        // done in okForStorage. There is too much duplication between this
+                        // code and that code.
+                        const bool mightBePartOfDbRef =
+                            part.startsWith("$db") ||
+                            part.startsWith("$id") ||
+                            part.startsWith("$ref");
+
+                        if (!mightBePartOfDbRef)
+                            return Status(ErrorCodes::DollarPrefixedFieldName,
+                                          mongoutils::str::stream() << "The update path '"
+                                              << field.dottedField()
+                                              << "' contains an illegal field name "
+                                                      "(field name starts with '$').");
+
+                    }
+
+                }
+
+            }
+
+            return Status::OK();
         }
 
-        StringData firstPart = field.getPart(0);
-        if (firstPart.compare("_id") == 0) {
-            return Status(ErrorCodes::BadValue, "updated cannot affect the _id");
-        }
-
-        return Status::OK();
-    }
+    } // namespace
 
     Status isUpdatable(const FieldRef& field) {
-        Status status = basicIsUpdatable(field);
-        if (! status.isOK()) {
-            return status;
-        }
-
-        StringData firstPart = field.getPart(0);
-        if (firstPart[0] == '$') {
-            return Status(ErrorCodes::BadValue, "field name cannot start with $");
-        }
-
-        return Status::OK();
+        return isUpdatable(field, false);
     }
 
     Status isUpdatableLegacy(const FieldRef& field) {
-        return basicIsUpdatable(field);
+        return isUpdatable(field, true);
     }
 
     bool isPositional(const FieldRef& fieldRef, size_t* pos, size_t* count) {

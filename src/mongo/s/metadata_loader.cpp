@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include "mongo/s/metadata_loader.h"
@@ -22,6 +34,7 @@
 #include "mongo/s/chunk_diff.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/collection_metadata.h"
+#include "mongo/s/range_arithmetic.h"
 #include "mongo/s/type_chunk.h"
 #include "mongo/s/type_collection.h"
 
@@ -190,17 +203,20 @@ namespace mongo {
                                        CollectionMetadata* metadata ) const
     {
         map<string, ChunkVersion> versionMap;
+
+        // Preserve the epoch
+        versionMap[shard] = metadata->_shardVersion;
         OID epoch = metadata->getCollVersion().epoch();
+        bool fullReload = true;
 
         // Check to see if we should use the old version or not.
         if ( oldMetadata ) {
 
-            ChunkVersion oldVersion = oldMetadata->getShardVersion();
+            // If our epochs are compatible, it's useful to use the old metadata for diffs
+            if ( oldMetadata->getCollVersion().hasCompatibleEpoch( epoch ) ) {
 
-            if ( oldVersion.isSet() && oldVersion.hasCompatibleEpoch( epoch ) ) {
-
-                // Our epoch for coll version and shard version should be the same.
-                verify( oldMetadata->getCollVersion().hasCompatibleEpoch( epoch ) );
+                fullReload = false;
+                dassert( oldMetadata->isValid() );
 
                 versionMap[shard] = oldMetadata->_shardVersion;
                 metadata->_collVersion = oldMetadata->_collVersion;
@@ -209,15 +225,17 @@ namespace mongo {
                 // not as frequently reloaded as in mongos.
                 metadata->_chunksMap = oldMetadata->_chunksMap;
 
-                LOG(2) << "loading new chunks for collection " << ns
-                              << " using old metadata w/ version " << oldMetadata->getShardVersion()
-                              << " and " << metadata->_chunksMap.size() << " chunks" << endl;
+                LOG( 2 ) << "loading new chunks for collection " << ns
+                         << " using old metadata w/ version " << oldMetadata->getShardVersion()
+                         << " and " << metadata->_chunksMap.size() << " chunks" << endl;
+            }
+            else {
+                warning() << "reloading collection metadata for " << ns << " with new epoch "
+                          << epoch.toString() << ", the current epoch is "
+                          << oldMetadata->getCollVersion().epoch().toString() << endl;
             }
         }
-        else {
-            // Preserve the epoch
-            versionMap[shard] = metadata->_shardVersion;
-        }
+
 
         // Exposes the new metadata's range map and version to the "differ," who
         // would ultimately be responsible of filling them up.
@@ -260,16 +278,21 @@ namespace mongo {
                 metadata->fillRanges();
                 conn.done();
 
+                dassert( metadata->isValid() );
                 return Status::OK();
             }
             else if ( diffsApplied == 0 ) {
 
-                // No chunks found, something changed or we're confused
+                // No chunks found, the collection is dropping or we're confused
+                // If this is a full reload, assume it is a drop for backwards compatibility
+                // TODO: drop the config.collections entry *before* the chunks and eliminate this
+                // ambiguity
 
-                string errMsg = // br
-                        str::stream() << "no chunks found when reloading " << ns
-                                      << ", previous version was "
-                                      << metadata->_collVersion.toString();
+                string errMsg =
+                    str::stream() << "no chunks found when reloading " << ns
+                                  << ", previous version was "
+                                  << metadata->_collVersion.toString()
+                                  << ( fullReload ? ", this is a drop" : "" );
 
                 warning() << errMsg << endl;
 
@@ -277,7 +300,8 @@ namespace mongo {
                 metadata->_chunksMap.clear();
                 conn.done();
 
-                return Status( ErrorCodes::RemoteChangeDetected, errMsg );
+                return fullReload ? Status( ErrorCodes::NamespaceNotFound, errMsg ) :
+                                    Status( ErrorCodes::RemoteChangeDetected, errMsg );
             }
             else {
 
@@ -308,5 +332,64 @@ namespace mongo {
             return Status( ErrorCodes::HostUnreachable, errMsg );
         }
     }
+
+    Status MetadataLoader::promotePendingChunks( const CollectionMetadata* afterMetadata,
+                                                 CollectionMetadata* remoteMetadata ) const {
+
+        // Ensure pending chunks are applicable
+        bool notApplicable =
+            ( NULL == afterMetadata || NULL == remoteMetadata ) ||
+            ( afterMetadata->getShardVersion() > remoteMetadata->getShardVersion() ) ||
+            ( afterMetadata->getShardVersion().epoch() != 
+                  remoteMetadata->getShardVersion().epoch() );
+        if ( notApplicable ) return Status::OK();
+
+        // The chunks from remoteMetadata are the latest version, and the pending chunks
+        // from afterMetadata are the latest version.  If no trickery is afoot, pending chunks
+        // should match exactly zero or one loaded chunk.
+
+        remoteMetadata->_pendingMap = afterMetadata->_pendingMap;
+
+        // Resolve our pending chunks against the chunks we've loaded
+        for ( RangeMap::iterator it = remoteMetadata->_pendingMap.begin();
+                it != remoteMetadata->_pendingMap.end(); ) {
+
+            if ( !rangeMapOverlaps( remoteMetadata->_chunksMap, it->first, it->second ) ) {
+                ++it;
+                continue;
+            }
+
+            // Our pending range overlaps at least one chunk
+
+            if ( rangeMapContains( remoteMetadata->_chunksMap, it->first, it->second ) ) {
+
+                // Chunk was promoted from pending, successful migration
+                LOG( 2 ) << "verified chunk " << rangeToString( it->first, it->second )
+                         << " was migrated earlier to this shard" << endl;
+
+                remoteMetadata->_pendingMap.erase( it++ );
+            }
+            else {
+
+                // Something strange happened, maybe manual editing of config?
+                RangeVector overlap;
+                getRangeMapOverlap( remoteMetadata->_chunksMap,
+                                    it->first,
+                                    it->second,
+                                    &overlap );
+
+                string errMsg = str::stream()
+                    << "the remote metadata changed unexpectedly, pending range "
+                    << rangeToString( it->first, it->second )
+                    << " does not exactly overlap loaded chunks "
+                    << overlapToString( overlap );
+
+                return Status( ErrorCodes::RemoteChangeDetected, errMsg );
+            }
+        }
+
+        return Status::OK();
+    }
+
 
 } // namespace mongo

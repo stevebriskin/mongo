@@ -22,26 +22,27 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
-#include <boost/thread/thread.hpp>
-
-#include <fstream>
-#include "../db/db.h"
-#include "../db/instance.h"
-#include "../db/json.h"
-#include "../db/lasterror.h"
-#include "../db/taskqueue.h"
-#include "../util/timer.h"
-#include "dbtests.h"
-#include "../db/dur_stats.h"
-#include "../util/checksum.h"
-#include "../util/version.h"
-#include "../db/key.h"
-#include "../util/compress.h"
-#include "../util/concurrency/qlock.h"
-#include "../util/fail_point.h"
 #include <boost/filesystem/operations.hpp>
+#include <boost/thread/thread.hpp>
+#include <fstream>
+
+#include "mongo/db/db.h"
+#include "mongo/db/dur_stats.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/json.h"
+#include "mongo/db/key.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/db/taskqueue.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/dbtests/framework_options.h"
+#include "mongo/util/checksum.h"
+#include "mongo/util/compress.h"
+#include "mongo/util/concurrency/qlock.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/timer.h"
+#include "mongo/util/version.h"
 
 #if (__cplusplus >= 201103L)
 #include <mutex>
@@ -49,15 +50,7 @@
 
 using namespace bson;
 
-namespace mongo {
-    namespace dbtests {
-        extern unsigned perfHist;
-    }
-}
-
 namespace PerfTests {
-
-    using mongo::dbtests::perfHist;
 
     const bool profiling = false;
 
@@ -228,14 +221,16 @@ namespace PerfTests {
 
             if( conn && !conn->isFailed() ) {
                 const char *ns = "perf.pstats";
-                if( perfHist ) {
+                if(frameworkGlobalParams.perfHist) {
                     static bool needver = true;
                     try {
                         // try to report rps from last time */
                         Query q;
                         {
                             BSONObjBuilder b;
-                            b.append("host",_perfhostname).append("test",s).append("dur",cmdLine.dur);
+                            b.append("host", _perfhostname);
+                            b.append("test", s);
+                            b.append("dur", storageGlobalParams.dur);
                             DEV { b.append("info.DEBUG",true); }
                             else b.appendNull("info.DEBUG");
                             if( sizeof(int*) == 4 )
@@ -246,7 +241,7 @@ namespace PerfTests {
                         }
                         BSONObj fields = BSON( "rps" << 1 << "info" << 1 );
                         vector<BSONObj> v;
-                        conn->findN(v, ns, q, perfHist, 0, &fields);
+                        conn->findN(v, ns, q, frameworkGlobalParams.perfHist, 0, &fields);
                         for( vector<BSONObj>::iterator i = v.begin(); i != v.end(); i++ ) {
                             BSONObj o = *i;
                             double lastrps = o["rps"].Number();
@@ -270,8 +265,8 @@ namespace PerfTests {
                     b.append("test", s);
                     b.append("rps", (int) rps);
                     b.append("millis", ms);
-                    b.appendBool("dur", cmdLine.dur);
-                    if( showDurStats() && cmdLine.dur )
+                    b.appendBool("dur", storageGlobalParams.dur);
+                    if (showDurStats() && storageGlobalParams.dur)
                         b.append("durStats", dur::stats.curr->_asObj());
                     {
                         bob inf;
@@ -282,6 +277,9 @@ namespace PerfTests {
                         inf.append("os", "win");
 #endif
                         inf.append("git", gitVersion());
+#ifdef MONGO_SSL
+                        inf.append("OpenSSL", openSSLVersion());
+#endif
                         inf.append("boost", BOOST_VERSION);
                         b.append("info", inf.obj());
                     }
@@ -1222,7 +1220,7 @@ namespace PerfTests {
                 // write something to the private view as a test
                 strcpy(p, "hello");
             }
-            if( cmdLine.dur ) {
+            if (storageGlobalParams.dur) {
                 char *w = (char *) f.view_write();
                 strcpy(w + 6, "world");
             }

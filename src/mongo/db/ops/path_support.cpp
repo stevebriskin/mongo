@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/path_support.h"
@@ -69,7 +81,7 @@ namespace pathsupport {
 
     Status findLongestPrefix(const FieldRef& prefix,
                              mutablebson::Element root,
-                             int32_t* idxFound,
+                             size_t* idxFound,
                              mutablebson::Element* elemFound) {
 
         // If root is empty or the prefix is so, there's no point in looking for a prefix.
@@ -130,7 +142,10 @@ namespace pathsupport {
             *idxFound = i - 1;
             *elemFound = prev;
             return Status(ErrorCodes::PathNotViable,
-                          "cannot use the part to traverse the document");
+                          mongoutils::str::stream() << "cannot use the part (" <<
+                          prefix.getPart(i-1) << " of " << prefix.dottedField() <<
+                          ") to traverse the element ({" <<
+                          curr.toString() << "})");
         }
         else if (curr.ok()) {
             *idxFound = i - 1;
@@ -145,18 +160,13 @@ namespace pathsupport {
     }
 
     Status createPathAt(const FieldRef& prefix,
-                        int32_t idxFound,
+                        size_t idxFound,
                         mutablebson::Element elemFound,
                         mutablebson::Element newElem) {
         Status status = Status::OK();
 
-        // idxFound can't be negative
-        if (idxFound < 0) {
-            return Status(ErrorCodes::BadValue, "index must be greater or equal to zero");
-        }
-
         // Sanity check that 'idxField' is an actual part.
-        const int32_t size = prefix.numParts();
+        const size_t size = prefix.numParts();
         if (idxFound >= size) {
             return Status(ErrorCodes::BadValue, "index larger than path size");
         }
@@ -165,7 +175,7 @@ namespace pathsupport {
 
         // If we are creating children under an array and a numeric index is next, then perhaps
         // we need padding.
-        int32_t i = idxFound;
+        size_t i = idxFound;
         bool inArray = false;
         if (elemFound.getType() == mongo::Array) {
             size_t newIdx = 0;

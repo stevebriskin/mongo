@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -21,8 +33,22 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/database.h"
 #include "mongo/db/kill_current_op.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
+
+    // Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a valid
+    // non-zero max time to fail immediately.  Any getmore operation on a cursor already created
+    // with a valid non-zero max time will also fail immediately.
+    //
+    // This fail point cannot be used with the maxTimeNeverTimeOut fail point.
+    MONGO_FP_DECLARE(maxTimeAlwaysTimeOut);
+
+    // Enabling the maxTimeNeverTimeOut fail point will cause the server to never time out any
+    // query, command, or getmore operation, regardless of whether a max time is set.
+    //
+    // This fail point cannot be used with the maxTimeAlwaysTimeOut fail point.
+    MONGO_FP_DECLARE(maxTimeNeverTimeOut);
 
     // todo : move more here
 
@@ -48,6 +74,7 @@ namespace mongo {
         _command = false;
         _dbprofile = 0;
         _end = 0;
+        _maxTimeTracker.reset();
         _message = "";
         _progressMeter.finished();
         _killPending.store(0);
@@ -256,6 +283,30 @@ namespace mongo {
         }
     }
 
+    void CurOp::setMaxTimeMicros(uint64_t maxTimeMicros) {
+        if (maxTimeMicros == 0) {
+            // 0 is "allow to run indefinitely".
+            return;
+        }
+
+        // Note that calling startTime() will set CurOp::_start if it hasn't been set yet.
+        _maxTimeTracker.setTimeLimit(startTime(), maxTimeMicros);
+    }
+
+    bool CurOp::maxTimeHasExpired() {
+        if (MONGO_FAIL_POINT(maxTimeNeverTimeOut)) {
+            return false;
+        }
+        if (_maxTimeTracker.isEnabled() && MONGO_FAIL_POINT(maxTimeAlwaysTimeOut)) {
+            return true;
+        }
+        return _maxTimeTracker.checkTimeLimit();
+    }
+
+    uint64_t CurOp::getRemainingMaxTimeMicros() const {
+        return _maxTimeTracker.getRemainingMicros();
+    }
+
     AtomicUInt CurOp::_nextOpNum;
 
     static Counter64 returnedCounter;
@@ -297,4 +348,76 @@ namespace mongo {
         if ( fastmod )
             fastmodCounter.increment();
     }
+
+    CurOp::MaxTimeTracker::MaxTimeTracker() {
+        reset();
+    }
+
+    void CurOp::MaxTimeTracker::reset() {
+        _enabled = false;
+        _targetEpochMicros = 0;
+        _approxTargetServerMillis = 0;
+    }
+
+    void CurOp::MaxTimeTracker::setTimeLimit(uint64_t startEpochMicros, uint64_t durationMicros) {
+        dassert(durationMicros != 0);
+
+        _enabled = true;
+
+        _targetEpochMicros = startEpochMicros + durationMicros;
+
+        uint64_t now = curTimeMicros64();
+        // If our accurate time source thinks time is not up yet, calculate the next target for
+        // our approximate time source.
+        if (_targetEpochMicros > now) {
+            _approxTargetServerMillis = Listener::getElapsedTimeMillis() +
+                                        static_cast<int64_t>((_targetEpochMicros - now) / 1000);
+        }
+        // Otherwise, set our approximate time source target such that it thinks time is already
+        // up.
+        else {
+            _approxTargetServerMillis = Listener::getElapsedTimeMillis();
+        }
+    }
+
+    bool CurOp::MaxTimeTracker::checkTimeLimit() {
+        if (!_enabled) {
+            return false;
+        }
+
+        // Does our approximate time source think time is not up yet?  If so, return early.
+        if (_approxTargetServerMillis > Listener::getElapsedTimeMillis()) {
+            return false;
+        }
+
+        uint64_t now = curTimeMicros64();
+        // Does our accurate time source think time is not up yet?  If so, readjust the target for
+        // our approximate time source and return early.
+        if (_targetEpochMicros > now) {
+            _approxTargetServerMillis = Listener::getElapsedTimeMillis() +
+                                        static_cast<int64_t>((_targetEpochMicros - now) / 1000);
+            return false;
+        }
+
+        // Otherwise, time is up.
+        return true;
+    }
+
+    uint64_t CurOp::MaxTimeTracker::getRemainingMicros() const {
+        if (!_enabled) {
+            // 0 is "allow to run indefinitely".
+            return 0;
+        }
+
+        // Does our accurate time source think time is up?  If so, claim there is 1 microsecond
+        // left for this operation.
+        uint64_t now = curTimeMicros64();
+        if (_targetEpochMicros <= now) {
+            return 1;
+        }
+
+        // Otherwise, calculate remaining time.
+        return _targetEpochMicros - now;
+    }
+
 }

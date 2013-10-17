@@ -15,15 +15,16 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/auth/role_name.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/unordered_map.h"
-#include "mongo/platform/unordered_set.h"
 
 namespace mongo {
 
@@ -49,6 +50,18 @@ namespace mongo {
             bool isExternal;
         };
 
+        struct RoleData {
+            RoleName name;
+            bool hasRole;
+            bool canDelegate;
+            RoleData() : hasRole(false), canDelegate(false) {}
+            RoleData(const RoleName& _name, bool _hasRole, bool _canDelegate) :
+                name(_name), hasRole(_hasRole), canDelegate(_canDelegate) {}
+        };
+
+        typedef unordered_map<ResourcePattern, Privilege> ResourcePrivilegeMap;
+        typedef unordered_map<RoleName, RoleData> RoleDataMap;
+
         explicit User(const UserName& name);
         ~User();
 
@@ -58,14 +71,29 @@ namespace mongo {
         const UserName& getName() const;
 
         /**
-         * Returns an iterator that can be used to get the list of roles this user belongs to.
+         * Returns a reference to the information about the users' role membership.
          */
-        const RoleNameIterator getRoles() const;
+        const RoleDataMap& getRoles() const;
+
+        /**
+         * Returns true if this user is a member of the given role.
+         */
+        bool hasRole(const RoleName& roleName) const;
+
+        /**
+         * Returns a reference to the information about the user's privileges.
+         */
+        const ResourcePrivilegeMap& getPrivileges() const { return _privileges; }
+
+        /**
+         * Returns the CredentialData for this user.
+         */
+        const CredentialData& getCredentials() const;
 
         /**
          * Gets the set of actions this user is allowed to perform on the given resource.
          */
-        const ActionSet getActionsForResource(const std::string& resource) const;
+        const ActionSet getActionsForResource(const ResourcePattern& resource) const;
 
         /**
          * Returns true if this copy of information about this user is still valid. If this returns
@@ -94,6 +122,16 @@ namespace mongo {
         void setCredentials(const CredentialData& credentials);
 
         /**
+         * Replaces any existing user role membership information with "roles".
+         */
+        void setRoleData(const std::vector<RoleData>& roles);
+
+        /**
+         * Replaces any existing user privilege information with "privileges".
+         */
+        void setPrivileges(const PrivilegeVector& privileges);
+
+        /**
          * Adds the given role name to the list of roles of which this user is a member.
          */
         void addRole(const RoleName& role);
@@ -102,6 +140,16 @@ namespace mongo {
          * Adds the given role names to the list of roles that this user belongs to.
          */
         void addRoles(const std::vector<RoleName>& roles);
+
+        /**
+         * Adds the given role name to the list of roles that this user is allowed to delegate.
+         */
+        void addDelegatableRole(const RoleName& role);
+
+        /**
+         * Adds the given role names to the list of roles that this user is allowed to delegate.
+         */
+        void addDelegatableRoles(const std::vector<RoleName>& roles);
 
         /**
          * Adds the given privilege to the list of privileges this user is authorized for.
@@ -143,12 +191,11 @@ namespace mongo {
 
         UserName _name;
 
-        typedef unordered_map<std::string, Privilege> ResourcePrivilegeMap;
-
         // Maps resource name to privilege on that resource
         ResourcePrivilegeMap _privileges;
 
-        unordered_set<RoleName> _roles;
+        // Roles the user has privileges from and/or can delegate
+        RoleDataMap _roles;
 
         CredentialData _credentials;
 

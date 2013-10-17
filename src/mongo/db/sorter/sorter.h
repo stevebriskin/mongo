@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
@@ -23,7 +35,8 @@
 #include <utility>
 #include <vector>
 
-#include <mongo/base/disallow_copying.h>
+#include "mongo/base/disallow_copying.h"
+#include "mongo/bson/util/builder.h"
 
 /**
  * This is the public API for the Sorter (both in-memory and external)
@@ -83,6 +96,8 @@ namespace mongo {
         unsigned long long limit; /// number of KV pairs to be returned. 0 for no limit.
         size_t maxMemoryUsageBytes; /// Approximate.
         bool extSortAllowed; /// If false, uassert if more mem needed than allowed.
+        std::string tempDir; /// Directory to directly place files in.
+                             /// Must be explicitly set if extSortAllowed is true.
 
         SortOptions()
             : limit(0)
@@ -104,6 +119,11 @@ namespace mongo {
 
         SortOptions& ExtSortAllowed(bool newExtSortAllowed=true) {
             extSortAllowed = newExtSortAllowed;
+            return *this;
+        }
+
+        SortOptions& TempDir(const std::string& newTempDir) {
+            tempDir = newTempDir;
             return *this;
         }
     };
@@ -171,7 +191,8 @@ namespace mongo {
                          ,typename Value::SorterDeserializeSettings
                          > Settings;
 
-        explicit SortedFileWriter(const Settings& settings = Settings());
+        explicit SortedFileWriter(const SortOptions& opts,
+                                  const Settings& settings = Settings());
 
         void addAlreadySorted(const Key&, const Value&);
         Iterator* done(); /// Can't add more data after calling done()

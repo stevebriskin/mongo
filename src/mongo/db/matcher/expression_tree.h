@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -45,7 +57,10 @@ namespace mongo {
         void clearAndRelease() { _expressions.clear(); }
 
         virtual size_t numChildren() const { return _expressions.size(); }
-        virtual const MatchExpression* getChild( size_t i ) const { return _expressions[i]; }
+
+        virtual MatchExpression* getChild( size_t i ) const { return _expressions[i]; }
+
+        virtual std::vector<MatchExpression*>* getChildVector() { return &_expressions; }
 
         bool equivalent( const MatchExpression* other ) const;
 
@@ -64,6 +79,17 @@ namespace mongo {
         virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
         virtual bool matchesSingleElement( const BSONElement& e ) const;
 
+        virtual MatchExpression* shallowClone() const {
+            AndMatchExpression* self = new AndMatchExpression();
+            for (size_t i = 0; i < numChildren(); ++i) {
+                self->add(getChild(i)->shallowClone());
+            }
+            if ( getTag() ) {
+                self->setTag(getTag()->clone());
+            }
+            return self;
+        }
+
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
     };
 
@@ -75,6 +101,17 @@ namespace mongo {
         virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
         virtual bool matchesSingleElement( const BSONElement& e ) const;
 
+        virtual MatchExpression* shallowClone() const {
+            OrMatchExpression* self = new OrMatchExpression();
+            for (size_t i = 0; i < numChildren(); ++i) {
+                self->add(getChild(i)->shallowClone());
+            }
+            if ( getTag() ) {
+                self->setTag(getTag()->clone());
+            }
+            return self;
+        }
+
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
     };
 
@@ -85,6 +122,17 @@ namespace mongo {
 
         virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const;
         virtual bool matchesSingleElement( const BSONElement& e ) const;
+
+        virtual MatchExpression* shallowClone() const {
+            NorMatchExpression* self = new NorMatchExpression();
+            for (size_t i = 0; i < numChildren(); ++i) {
+                self->add(getChild(i)->shallowClone());
+            }
+            if ( getTag() ) {
+                self->setTag(getTag()->clone());
+            }
+            return self;
+        }
 
         virtual void debugString( StringBuilder& debug, int level = 0 ) const;
     };
@@ -101,6 +149,16 @@ namespace mongo {
             return Status::OK();
         }
 
+        virtual MatchExpression* shallowClone() const {
+            NotMatchExpression* self = new NotMatchExpression();
+            MatchExpression* child = _exp->shallowClone();
+            self->init(child);
+            if ( getTag() ) {
+                self->setTag(getTag()->clone());
+            }
+            return self;
+        }
+
         virtual bool matches( const MatchableDocument* doc, MatchDetails* details = 0 ) const {
             return !_exp->matches( doc, NULL );
         }
@@ -114,8 +172,8 @@ namespace mongo {
         bool equivalent( const MatchExpression* other ) const;
 
         virtual size_t numChildren() const { return 1; }
-        virtual MatchExpression* getChild( size_t i ) const { return _exp.get(); }
 
+        virtual MatchExpression* getChild( size_t i ) const { return _exp.get(); }
 
     private:
         boost::scoped_ptr<MatchExpression> _exp;

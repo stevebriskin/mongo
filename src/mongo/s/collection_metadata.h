@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
@@ -53,29 +65,6 @@ namespace mongo {
         //
 
         /**
-         * Returns a new metadata's instance based on 'this's state by removing 'chunk'.
-         * When cloning away the last chunk, 'newShardVersion' must be zero. In any case,
-         * the caller owns the new metadata when the cloning is successful.
-         *
-         * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
-         * provided.
-         */
-        CollectionMetadata* cloneMinusChunk( const ChunkType& chunk,
-                                             const ChunkVersion& newShardVersion,
-                                             string* errMsg ) const;
-
-        /**
-         * Returns a new metadata's instance based on 'this's state by adding 'chunk'. The new
-         * metadata can never be zero, though (see cloneMinus). The caller owns the new metadata.
-         *
-         * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
-         * provided.
-         */
-        CollectionMetadata* clonePlusChunk( const ChunkType& chunk,
-                                            const ChunkVersion& newShardVersion,
-                                            string* errMsg ) const;
-
-        /**
          * Returns a new metadata's instance based on 'this's state by removing a 'pending' chunk.
          *
          * The shard and collection version of the new metadata are unaffected.  The caller owns the
@@ -98,6 +87,18 @@ namespace mongo {
         CollectionMetadata* clonePlusPending( const ChunkType& pending, string* errMsg ) const;
 
         /**
+         * Returns a new metadata's instance based on 'this's state by removing 'chunk'.
+         * When cloning away the last chunk, 'newShardVersion' must be zero. In any case,
+         * the caller owns the new metadata when the cloning is successful.
+         *
+         * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
+         * provided.
+         */
+        CollectionMetadata* cloneMigrate( const ChunkType& chunk,
+                                          const ChunkVersion& newShardVersion,
+                                          string* errMsg ) const;
+
+        /**
          * Returns a new metadata's instance by splitting an existing 'chunk' at the points
          * describe by 'splitKeys'. The first resulting chunk will have 'newShardVersion' and
          * subsequent one would have that with the minor version incremented at each chunk. The
@@ -111,9 +112,28 @@ namespace mongo {
                                         const ChunkVersion& newShardVersion,
                                         string* errMsg ) const;
 
+        /**
+         * Returns a new metadata instance by merging a key range which starts and ends at existing
+         * chunks into a single chunk.  The range may not have holes.  The resulting metadata will
+         * have the 'newShardVersion'.  The caller owns the new metadata.
+         *
+         * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
+         * provided.
+         */
+        CollectionMetadata* cloneMerge( const BSONObj& minKey,
+                                        const BSONObj& maxKey,
+                                        const ChunkVersion& newShardVersion,
+                                        string* errMsg ) const;
+
         //
         // verification logic
         //
+
+        /**
+         * Returns true if the document key 'key' is a valid instance of a shard key for this
+         * metadata.  The 'key' must contain exactly the same fields as the shard key pattern.
+         */
+        bool isValidKey( const BSONObj& key ) const;
 
         /**
          * Returns true if the document key 'key' belongs to this chunkset. Recall that documents of
@@ -129,16 +149,29 @@ namespace mongo {
         bool keyIsPending( const BSONObj& key ) const;
 
         /**
-         * Given the chunk's min key (or empty doc) in 'lookupKey', gets the boundaries of the
-         * chunk following that one (the first), and fills in 'foundChunk' with those
-         * boundaries.  If the next chunk happens to be the last one, returns true otherwise
-         * false.
+         * Given a key 'lookupKey' in the shard key range, get the next chunk which overlaps or is
+         * greater than this key.  Returns true if a chunk exists, false otherwise.
          *
-         * @param lookupKey passing a doc that does not belong to this metadata is undefined.
-         *     An empty doc is special and the chunk with the lowest range will be set on
-         *     foundChunk.
+         * Passing a key that is not a valid shard key for this range results in undefined behavior.
          */
-        bool getNextChunk( const BSONObj& lookupKey, ChunkType* foundChunk ) const;
+        bool getNextChunk( const BSONObj& lookupKey, ChunkType* chunk ) const;
+
+        /**
+         * Given a key in the shard key range, get the next range which overlaps or is greater than
+         * this key.
+         *
+         * This allows us to do the following to iterate over all orphan ranges:
+         *
+         * KeyRange range;
+         * BSONObj lookupKey = metadata->getMinKey();
+         * while( metadata->getNextOrphanRange( lookupKey, &orphanRange ) ) {
+         *   // Do stuff with range
+         *   lookupKey = orphanRange.maxKey;
+         * }
+         *
+         * @param lookupKey passing a key that does not belong to this metadata is undefined.
+         */
+        bool getNextOrphanRange( const BSONObj& lookupKey, KeyRange* orphanRange ) const;
 
         //
         // accessors
@@ -156,6 +189,10 @@ namespace mongo {
             return _keyPattern;
         }
 
+        BSONObj getMinKey() const;
+
+        BSONObj getMaxKey() const;
+
         std::size_t getNumChunks() const {
             return _chunksMap.size();
         }
@@ -164,6 +201,33 @@ namespace mongo {
             return _pendingMap.size();
         }
 
+        //
+        // reporting
+        //
+
+        /**
+         * BSON output of the metadata information.
+         */
+        BSONObj toBSON() const;
+
+        /**
+         * BSON output of the metadata information, into a builder.
+         */
+        void toBSON( BSONObjBuilder& bb ) const;
+
+        /**
+         * BSON output of the chunks metadata into a BSONArray
+         */
+        void toBSONChunks( BSONArrayBuilder& bb ) const;
+
+        /**
+         * BSON output of the pending metadata into a BSONArray
+         */
+        void toBSONPending( BSONArrayBuilder& bb ) const;
+
+        /**
+         * String output of the metadata information.
+         */
         string toString() const;
 
         /**
@@ -174,6 +238,19 @@ namespace mongo {
          * directly.
          */
         CollectionMetadata();
+
+        /**
+         * TESTING ONLY
+         *
+         * Returns a new metadata's instance based on 'this's state by adding 'chunk'. The new
+         * metadata can never be zero, though (see cloneMinus). The caller owns the new metadata.
+         *
+         * If a new metadata can't be created, returns NULL and fills in 'errMsg', if it was
+         * provided.
+         */
+        CollectionMetadata* clonePlusChunk( const ChunkType& chunk,
+                                            const ChunkVersion& newShardVersion,
+                                            string* errMsg ) const;
 
     private:
         // Effectively, the MetadataLoader is this class's builder. So we open an exception
@@ -219,17 +296,6 @@ namespace mongo {
          * Try to find chunks that are adjacent and record these intervals in the _rangesMap
          */
         void fillRanges();
-
-        /**
-         * String representation of [inclusiveLower, exclusiveUpper)
-         */
-        std::string rangeToString( const BSONObj& inclusiveLower,
-                                   const BSONObj& exclusiveUpper ) const;
-
-        /**
-         * String representation of overlapping ranges as a list "[range1),[range2),..."
-         */
-        std::string overlapToString( RangeVector overlap ) const;
 
     };
 

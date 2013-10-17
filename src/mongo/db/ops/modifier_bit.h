@@ -12,12 +12,25 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
 #include <boost/scoped_ptr.hpp>
 #include <string>
+#include <vector>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/bson/mutable/element.h"
@@ -26,6 +39,8 @@
 #include "mongo/util/safe_num.h"
 
 namespace mongo {
+
+    class LogBuilder;
 
     class ModifierBit : public ModifierInterface {
         MONGO_DISALLOW_COPYING(ModifierBit);
@@ -41,7 +56,7 @@ namespace mongo {
          * operation subtype, and the value to be assigned to it from 'modExpr'. It returns OK
          * if successful or a status describing the error.
          */
-        virtual Status init(const BSONElement& modExpr);
+        virtual Status init(const BSONElement& modExpr, const Options& opts);
 
         /** Validates the potential application of the init'ed mod to the given Element and
          *  configures the internal state of the mod as necessary.
@@ -54,20 +69,28 @@ namespace mongo {
         virtual Status apply() const;
 
         /** Converts the effects of this $bit into an equivalent $set */
-        virtual Status log(mutablebson::Element logRoot) const;
+        virtual Status log(LogBuilder* logBuilder) const;
 
     private:
+        SafeNum apply(SafeNum value) const;
+
         // Access to each component of fieldName that's the target of this mod.
         FieldRef _fieldRef;
 
         // 0 or index for $-positional in _fieldRef.
         size_t _posDollar;
 
-        // Value to be $bit'ed onto target
-        SafeNum _val;
-
         // The operator on SafeNum that we will invoke.
-        SafeNum (SafeNum::* _op)(const SafeNum&) const;
+        typedef SafeNum (SafeNum::* SafeNumOp)(const SafeNum&) const;
+
+        struct OpEntry {
+            SafeNum val;
+            SafeNumOp op;
+        };
+
+        typedef std::vector<OpEntry> OpEntries;
+
+        OpEntries _ops;
 
         struct PreparedState;
         scoped_ptr<PreparedState> _preparedState;

@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/pch.h"
@@ -22,6 +34,7 @@
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
@@ -30,6 +43,7 @@
 #include "mongo/db/matcher.h"
 #include "mongo/db/query_optimizer.h"
 #include "mongo/db/repl/is_master.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/s/collection_metadata.h"
 #include "mongo/s/d_logic.h"
@@ -301,8 +315,13 @@ namespace mongo {
          */
         void State::dropTempCollections() {
             _db.dropCollection(_config.tempNamespace);
-            if (_useIncremental)
+            // Always forget about temporary namespaces, so we don't cache lots of them
+            ShardConnection::forgetNS( _config.tempNamespace );
+            if (_useIncremental) {
                 _db.dropCollection(_config.incLong);
+                ShardConnection::forgetNS( _config.incLong );
+            }
+
         }
 
         /**
@@ -623,7 +642,10 @@ namespace mongo {
          */
         void State::init() {
             // setup js
-            _scope.reset(globalScriptEngine->getPooledScope( _config.dbname, "mapreduce" ).release() );
+            const string userToken = ClientBasic::getCurrent()->getAuthorizationSession()
+                                                              ->getAuthenticatedUserNamesToken();
+            _scope.reset(globalScriptEngine->getPooledScope(
+                            _config.dbname, "mapreduce" + userToken).release());
 
             if ( ! _config.scopeSetup.isEmpty() )
                 _scope->init( &_config.scopeSetup );
@@ -863,7 +885,7 @@ namespace mongo {
             shared_ptr<Cursor> temp = getBestGuessCursor(_config.incLong.c_str(),
                                                          BSONObj(),
                                                          sortKey);
-            ClientCursor::Holder cursor(new ClientCursor(QueryOption_NoCursorTimeout,
+            ClientCursorHolder cursor(new ClientCursor(QueryOption_NoCursorTimeout,
                                                          temp,
                                                          _config.incLong.c_str()));
             // iterate over all sorted objects
@@ -885,7 +907,7 @@ namespace mongo {
                     continue;
                 }
 
-                ClientCursor::YieldLock yield (cursor.get());
+                ClientCursorYieldLock yield (cursor.get());
 
                 try {
                     // reduce a finalize array
@@ -1104,7 +1126,7 @@ namespace mongo {
             virtual void addRequiredPrivileges(const std::string& dbname,
                                                const BSONObj& cmdObj,
                                                std::vector<Privilege>* out) {
-                addPrivilegesRequiredForMapReduce(dbname, cmdObj, out);
+                addPrivilegesRequiredForMapReduce(this, dbname, cmdObj, out);
             }
 
             bool run(const string& dbname , BSONObj& cmd, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
@@ -1118,7 +1140,7 @@ namespace mongo {
 
                 uassert( 16149 , "cannot run map reduce without the js engine", globalScriptEngine );
 
-                ClientCursor::Holder holdCursor;
+                ClientCursorHolder holdCursor;
                 CollectionMetadataPtr collMetadata;
 
                 {
@@ -1167,9 +1189,23 @@ namespace mongo {
                     state.init();
                     state.prepTempCollection();
                     ON_BLOCK_EXIT_OBJ(state, &State::dropTempCollections);
-                    ProgressMeterHolder pm(op->setMessage("m/r: (1/3) emit phase",
-                                                          "M/R: (1/3) Emit Progress",
-                                                          state.incomingDocuments()));
+
+                    int progressTotal = 0;
+                    bool showTotal = true;
+                    if ( state.config().filter.isEmpty() ) {
+                        progressTotal = state.incomingDocuments();
+                    }
+                    else {
+                        showTotal = false;
+                        // Set an arbitrary total > 0 so the meter will be activated.
+                        progressTotal = 1;
+                    }
+
+                    ProgressMeter& progress( op->setMessage("m/r: (1/3) emit phase",
+                                             "M/R: (1/3) Emit Progress",
+                                             progressTotal ));
+                    progress.showTotal(showTotal);
+                    ProgressMeterHolder pm(progress);
 
                     wassert( config.limit < 0x4000000 ); // see case on next line to 32 bit unsigned
                     long long mapTime = 0;
@@ -1180,14 +1216,14 @@ namespace mongo {
                         Lock::DBRead lock( config.ns );
                         // This context does no version check, safe b/c we checked earlier and have an
                         // open cursor
-                        Client::Context ctx(config.ns, dbpath, false);
+                        Client::Context ctx(config.ns, storageGlobalParams.dbpath, false);
 
                         // obtain full cursor on data to apply mr to
                         shared_ptr<Cursor> temp = getOptimizedCursor( config.ns.c_str(),
                                                                       config.filter,
                                                                       config.sort );
                         uassert( 16052, str::stream() << "could not create cursor over " << config.ns << " for query : " << config.filter << " sort : " << config.sort, temp.get() );
-                        ClientCursor::Holder cursor(new ClientCursor(QueryOption_NoCursorTimeout,
+                        ClientCursorHolder cursor(new ClientCursor(QueryOption_NoCursorTimeout,
                                                                      temp,
                                                                      config.ns.c_str()));
                         uassert( 16053, str::stream() << "could not create client cursor over " << config.ns << " for query : " << config.filter << " sort : " << config.sort, cursor.get() );
@@ -1232,7 +1268,7 @@ namespace mongo {
                             num++;
                             if ( num % 100 == 0 ) {
                                 // try to yield lock regularly
-                                ClientCursor::YieldLock yield (cursor.get());
+                                ClientCursorYieldLock yield (cursor.get());
                                 Timer t;
                                 // check if map needs to be dumped to disk
                                 state.checkSize();
@@ -1330,7 +1366,7 @@ namespace mongo {
                                                std::vector<Privilege>* out) {
                 ActionSet actions;
                 actions.addAction(ActionType::mapReduceShardedFinish);
-                out->push_back(Privilege(dbname, actions));
+                out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
             }
             bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 ShardedConnectionInfo::addHook();
@@ -1463,6 +1499,9 @@ namespace mongo {
                     if (++index >= chunks.size())
                         break;
                 }
+
+                // Forget temporary input collection, if output is sharded collection
+                ShardConnection::forgetNS( inputNS );
 
                 result.append( "chunkSizes" , chunkSizes.arr() );
 

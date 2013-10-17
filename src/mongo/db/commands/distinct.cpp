@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include <string>
@@ -35,14 +47,15 @@ namespace mongo {
     class DistinctCommand : public Command {
     public:
         DistinctCommand() : Command("distinct") {}
-        virtual bool slaveOk() const { return true; }
+        virtual bool slaveOk() const { return false; }
+        virtual bool slaveOverrideOk() const { return true; }
         virtual LockType locktype() const { return READ; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::find);
-            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
         virtual void help( stringstream &help ) const {
             help << "{ distinct : 'collection name' , key : 'a.b' , query : {} }";
@@ -110,6 +123,24 @@ namespace mongo {
             
             auto_ptr<ClientCursor> cc (new ClientCursor(QueryOption_NoCursorTimeout, cursor, ns));
 
+            // map from indexed field to offset in key object
+            map<string, int> indexedFields;  
+            if (!cursor->modifiedKeys()) {
+                // store index information so we can decide if we can
+                // get something out of the index key rather than full object
+
+                int x = 0;
+                BSONObjIterator i( cursor->indexKeyPattern() );
+                while ( i.more() ) {
+                    BSONElement e = i.next();
+                    if ( e.isNumber() ) {
+                        // only want basic index fields, not "2d" etc
+                        indexedFields[e.fieldName()] = x;
+                    }
+                    x++;
+                }
+            }
+
             while ( cursor->ok() ) {
                 nscanned++;
                 bool loadedRecord = false;
@@ -119,7 +150,8 @@ namespace mongo {
 
                     BSONObj holder;
                     BSONElementSet temp;
-                    loadedRecord = ! cc->getFieldsDotted( key , temp, holder );
+                    // Try to get the record from the key fields.
+                    loadedRecord = !getFieldsDotted(indexedFields, cursor, key, temp, holder);
 
                     for ( BSONElementSet::iterator i=temp.begin(); i!=temp.end(); ++i ) {
                         BSONElement e = *i;
@@ -164,6 +196,30 @@ namespace mongo {
                 result.append( "stats" , b.obj() );
             }
 
+            return true;
+        }
+    private:
+        /**
+         * Tries to get the fields from the key first, then the object if the keys don't have it.
+         */
+        bool getFieldsDotted(const map<string, int>& indexedFields, shared_ptr<Cursor> cursor,
+                             const string& name, BSONElementSet &ret, BSONObj& holder) {
+            map<string,int>::const_iterator i = indexedFields.find( name );
+            if ( i == indexedFields.end() ) {
+                cursor->current().getFieldsDotted( name , ret );
+                return false;
+            }
+
+            int x = i->second;
+
+            holder = cursor->currKey();
+            BSONObjIterator it( holder );
+            while ( x && it.more() ) {
+                it.next();
+                x--;
+            }
+            verify( x == 0 );
+            ret.insert( it.next() );
             return true;
         }
 

@@ -17,10 +17,12 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/resource_pattern.h"
 #include "mongo/db/client_basic.h"
 #include "mongo/db/jsobj.h"
 
@@ -31,15 +33,32 @@ namespace mongo {
     class Client;
     class Timer;
 
+namespace mutablebson {
+    class Document;
+}  // namespace mutablebson
+
     /** mongodb "commands" (sent via db.$cmd.findOne(...))
         subclass to make a command.  define a singleton object for it.
         */
     class Command {
     protected:
+        // The type of the first field in 'cmdObj' must be mongo::String. The first field is
+        // interpreted as a collection name.
         string parseNsFullyQualified(const string& dbname, const BSONObj& cmdObj) const;
     public:
-        // only makes sense for commands where 1st parm is the collection.
+
+        // Return the namespace for the command. If the first field in 'cmdObj' is of type
+        // mongo::String, then that field is interpreted as the collection name, and is
+        // appended to 'dbname' after a '.' character. If the first field is not of type
+        // mongo::String, then 'dbname' is returned unmodified.
         virtual string parseNs(const string& dbname, const BSONObj& cmdObj) const;
+
+        // Utility that returns a ResourcePattern for the namespace returned from
+        // parseNs(dbname, cmdObj).  This will be either an exact namespace resource pattern
+        // or a database resource pattern, depending on whether parseNs returns a fully qualifed
+        // collection name or just a database name.
+        ResourcePattern parseResourcePattern(const std::string& dbname,
+                                             const BSONObj& cmdObj) const;
 
         // warning: isAuthorized uses the lockType() return values, and values are being passed 
         // around as ints so be careful as it isn't really typesafe and will need cleanup later
@@ -118,6 +137,13 @@ namespace mongo {
         virtual Status checkAuthForCommand(ClientBasic* client,
                                            const std::string& dbname,
                                            const BSONObj& cmdObj);
+
+        /**
+         * Redacts "cmdObj" in-place to a form suitable for writing to logs.
+         *
+         * The default implementation does nothing.
+         */
+        virtual void redactForLogging(mutablebson::Document* cmdObj);
 
         /* Return true if a replica set secondary should go into "recovering"
            (unreadable) state while running this command.

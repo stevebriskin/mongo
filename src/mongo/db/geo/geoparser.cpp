@@ -1,23 +1,36 @@
 /**
-*    Copyright (C) 2012 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
+ *    Copyright (C) 2012 10gen Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
+
+#include "mongo/db/geo/geoparser.h"
 
 #include <string>
 #include <vector>
 
-#include "mongo/db/geo/geoparser.h"
 #include "mongo/db/geo/shapes.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/util/mongoutils/str.h"
@@ -39,6 +52,10 @@ namespace mongo {
     static const string GEOJSON_COORDINATES = "coordinates";
     static const string GEOJSON_GEOMETRIES = "geometries";
 
+    bool isValidLngLat(double lng, double lat) {
+        return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+    }
+
     static bool isGeoJSONPoint(const BSONObj& obj) {
         BSONElement type = obj.getFieldDotted(GEOJSON_TYPE);
         if (type.eoo() || (String != type.type())) { return false; }
@@ -57,7 +74,7 @@ namespace mongo {
         if (!coordinates[0].isNumber() || !coordinates[1].isNumber()) { return false; }
         double lat = coordinates[1].Number();
         double lng = coordinates[0].Number();
-        return lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+        return isValidLngLat(lng, lat);
     }
 
     static bool isLegacyPoint(const BSONObj &obj) {
@@ -73,8 +90,18 @@ namespace mongo {
     }
 
     static S2Point coordToPoint(double lng, double lat) {
+        // We don't rely on drem to clean up non-sane points.  We just don't let them become
+        // spherical.
+        verify(isValidLngLat(lng, lat));
         // Note that it's (lat, lng) for S2 but (lng, lat) for MongoDB.
-        return S2LatLng::FromDegrees(lat, lng).Normalized().ToPoint();
+        S2LatLng ll = S2LatLng::FromDegrees(lat, lng).Normalized();
+        // This shouldn't happen since we should only have valid lng/lats.
+        if (!ll.is_valid()) {
+            stringstream ss;
+            ss << "coords invalid after normalization, lng = " << lng << " lat = " << lat << endl;
+            uasserted(17125, ss.str());
+        }
+        return ll.ToPoint();
     }
 
     static void eraseDuplicatePoints(vector<S2Point>* vertices) {
@@ -98,37 +125,42 @@ namespace mongo {
             for (size_t j = 0; j < thisCoord.size(); ++j) {
                 if (!thisCoord[j].isNumber()) { return false; }
             }
-            // ...where the latitude is valid
+            // ...where the longitude, latitude is valid
             double lat = thisCoord[1].Number();
             double lng = thisCoord[0].Number();
-            if (lat < -90 || lat > 90) { return false; }
-            if (lng < -180 || lng > 180) { return false; }
+            if (!isValidLngLat(lng, lat)) { return false; }
         }
         return true;
     }
 
-    static void parsePoints(const vector<BSONElement>& coordElt, vector<S2Point>* out) {
+    static bool parsePoints(const vector<BSONElement>& coordElt, vector<S2Point>* out) {
         for (size_t i = 0; i < coordElt.size(); ++i) {
             const vector<BSONElement>& pointElt = coordElt[i].Array();
             if (pointElt.empty()) { continue; }
+            if (!isValidLngLat(pointElt[0].Number(), pointElt[1].Number())) {
+                return false;
+            }
             out->push_back(coordToPoint(pointElt[0].Number(), pointElt[1].Number()));
         }
+
+        return true;
     }
 
     static bool isValidLineString(const vector<BSONElement>& coordinateArray) {
         if (coordinateArray.size() < 2) { return false; }
         if (!isArrayOfCoordinates(coordinateArray)) { return false; }
         vector<S2Point> vertices;
-        parsePoints(coordinateArray, &vertices);
+        if (!parsePoints(coordinateArray, &vertices)) { return false; }
         eraseDuplicatePoints(&vertices);
         return S2Polyline::IsValid(vertices);
     }
 
-    static void parseGeoJSONPolygonCoordinates(const vector<BSONElement>& coordinates,
+    static bool parseGeoJSONPolygonCoordinates(const vector<BSONElement>& coordinates,
                                                const BSONObj &sourceObject, S2Polygon *out) {
         const vector<BSONElement>& exteriorRing = coordinates[0].Array();
         vector<S2Point> exteriorVertices;
-        parsePoints(exteriorRing, &exteriorVertices);
+        if (!parsePoints(exteriorRing, &exteriorVertices)) { return false; }
+        eraseDuplicatePoints(&exteriorVertices);
         // The last point is duplicated.  We drop it, since S2Loop expects no
         // duplicate points
         exteriorVertices.resize(exteriorVertices.size() - 1);
@@ -143,37 +175,36 @@ namespace mongo {
         if (exteriorLoop.is_hole()) {
             exteriorLoop.Invert();
         }
-        uassert(16693, "Exterior shell of polygon is invalid: " + sourceObject.toString(),
-                exteriorLoop.IsValid());
+        if (!exteriorLoop.IsValid()) { return false; }
         polyBuilder.AddLoop(&exteriorLoop);
 
         // Subsequent arrays of coordinates are interior rings/holes.
         for (size_t i = 1; i < coordinates.size(); ++i) {
             vector<S2Point> holePoints;
-            parsePoints(coordinates[i].Array(), &holePoints);
+            if (!parsePoints(coordinates[i].Array(), &holePoints)) { return false; }
+            eraseDuplicatePoints(&holePoints);
             // Drop the duplicated last point.
             holePoints.resize(holePoints.size() - 1);
             // Interior rings are clockwise.
             S2Loop holeLoop(holePoints);
             holeLoop.Normalize();
-            uassert(16694, "Interior hole of polygon is invalid: " + sourceObject.toString(),
-                    holeLoop.IsValid());
+            if (!holeLoop.IsValid()) { return false; }
             if (!holeLoop.is_hole()) {
                 holeLoop.Invert();
             }
             polyBuilder.AddLoop(&holeLoop);
         }
 
-        uassert(16695, "Couldn't assemble polygon: " + sourceObject.toString(),
-                polyBuilder.AssemblePolygon(out, NULL));
+        return polyBuilder.AssemblePolygon(out, NULL);
     }
 
-    static void parseLegacyPoint(const BSONObj &obj, Point *out) {
+    static bool parseLegacyPoint(const BSONObj &obj, Point *out) {
         BSONObjIterator it(obj);
         BSONElement x = it.next();
         BSONElement y = it.next();
         out->x = x.number();
         out->y = y.number();
+        return true;
     }
 
     // Coordinates looks like [[0,0],[5,0],[5,5],[0,5],[0,0]]
@@ -260,6 +291,11 @@ namespace mongo {
         BSONElement center = objIt.next();
         if (!center.isABSONObj()) { return false; }
         if (!isLegacyPoint(center.Obj())) { return false; }
+        // Check to make sure the points are valid lng/lat.
+        BSONObjIterator coordIt(center.Obj());
+        BSONElement lng = coordIt.next();
+        BSONElement lat = coordIt.next();
+        if (!isValidLngLat(lng.Number(), lat.Number())) { return false; }
         if (!objIt.more()) { return false; }
         BSONElement radius = objIt.next();
         if (!radius.isNumber()) { return false; }
@@ -272,7 +308,7 @@ namespace mongo {
         return isGeoJSONPoint(obj) || isLegacyPoint(obj);
     }
 
-    void GeoParser::parsePoint(const BSONObj &obj, PointWithCRS *out) {
+    bool GeoParser::parsePoint(const BSONObj &obj, PointWithCRS *out) {
         if (isGeoJSONPoint(obj)) {
             const vector<BSONElement>& coords = obj.getFieldDotted(GEOJSON_COORDINATES).Array();
             out->point = coordToPoint(coords[0].Number(), coords[1].Number());
@@ -284,12 +320,17 @@ namespace mongo {
             BSONObjIterator it(obj);
             BSONElement x = it.next();
             BSONElement y = it.next();
-            out->point = coordToPoint(x.Number(), y.Number());
-            out->cell = S2Cell(out->point);
+            if (isValidLngLat(x.Number(), y.Number())) {
+                out->flatUpgradedToSphere = true;
+                out->point = coordToPoint(x.Number(), y.Number());
+                out->cell = S2Cell(out->point);
+            }
             out->oldPoint.x = x.Number();
             out->oldPoint.y = y.Number(); 
             out->crs = FLAT;
         }
+
+        return true;
     }
 
     bool GeoParser::isLine(const BSONObj& obj) {
@@ -308,12 +349,15 @@ namespace mongo {
         return isValidLineString(coordElt.Array());
     }
 
-    void GeoParser::parseLine(const BSONObj& obj, LineWithCRS* out) {
+    bool GeoParser::parseLine(const BSONObj& obj, LineWithCRS* out) {
         vector<S2Point> vertices;
-        parsePoints(obj.getFieldDotted(GEOJSON_COORDINATES).Array(), &vertices);
+        if (!parsePoints(obj.getFieldDotted(GEOJSON_COORDINATES).Array(), &vertices)) {
+            return false;
+        }
         eraseDuplicatePoints(&vertices);
         out->line.Init(vertices);
         out->crs = SPHERE;
+        return true;
     }
 
     bool GeoParser::isBox(const BSONObj &obj) {
@@ -332,21 +376,22 @@ namespace mongo {
         return true;
     }
 
-    void GeoParser::parseBox(const BSONObj &obj, BoxWithCRS *out) {
+    bool GeoParser::parseBox(const BSONObj &obj, BoxWithCRS *out) {
         BSONObjIterator typeIt(obj);
         BSONElement type = typeIt.next();
         BSONObjIterator coordIt(type.embeddedObject());
         BSONElement minE = coordIt.next();
         BSONElement maxE = coordIt.next();
-        parseLegacyPoint(minE.Obj(), &out->box._min);
-        parseLegacyPoint(maxE.Obj(), &out->box._max);
+        if (!parseLegacyPoint(minE.Obj(), &out->box._min) ||
+            !parseLegacyPoint(maxE.Obj(), &out->box._max)) { return false; }
         out->crs = FLAT;
+        return true;
     }
 
-    void GeoParser::parsePolygon(const BSONObj &obj, PolygonWithCRS *out) {
+    bool GeoParser::parsePolygon(const BSONObj &obj, PolygonWithCRS *out) {
         if (isGeoJSONPolygon(obj)) {
             const vector<BSONElement>& coordinates = obj.getFieldDotted(GEOJSON_COORDINATES).Array();
-            parseGeoJSONPolygonCoordinates(coordinates, obj, &out->polygon);
+            if (!parseGeoJSONPolygonCoordinates(coordinates, obj, &out->polygon)) { return false; }
             out->crs = SPHERE;
         } else {
             BSONObjIterator typeIt(obj);
@@ -355,12 +400,13 @@ namespace mongo {
             vector<Point> points;
             while (coordIt.more()) {
                 Point p;
-                parseLegacyPoint(coordIt.next().Obj(), &p);
+                if (!parseLegacyPoint(coordIt.next().Obj(), &p)) { return false; }
                 points.push_back(p);
             }
             out->oldPolygon = Polygon(points);
             out->crs = FLAT;
         }
+        return true;
     }
 
     bool GeoParser::isMultiPoint(const BSONObj &obj) {
@@ -381,7 +427,7 @@ namespace mongo {
         return isArrayOfCoordinates(coordinates);
     }
 
-    void GeoParser::parseMultiPoint(const BSONObj &obj, MultiPointWithCRS *out) {
+    bool GeoParser::parseMultiPoint(const BSONObj &obj, MultiPointWithCRS *out) {
         out->points.clear();
         BSONElement coordElt = obj.getFieldDotted(GEOJSON_COORDINATES);
         const vector<BSONElement>& coordinates = coordElt.Array();
@@ -392,6 +438,8 @@ namespace mongo {
             out->points[i] = coordToPoint(thisCoord[0].Number(), thisCoord[1].Number());
             out->cells[i] = S2Cell(out->points[i]);
         }
+
+        return true;
     }
 
     bool GeoParser::isMultiLine(const BSONObj &obj) {
@@ -418,17 +466,19 @@ namespace mongo {
         return true;
     }
 
-    void GeoParser::parseMultiLine(const BSONObj &obj, MultiLineWithCRS *out) {
+    bool GeoParser::parseMultiLine(const BSONObj &obj, MultiLineWithCRS *out) {
         vector<BSONElement> coordElt = obj.getFieldDotted(GEOJSON_COORDINATES).Array();
         out->lines.mutableVector().clear();
         out->lines.mutableVector().resize(coordElt.size());
 
         for (size_t i = 0; i < coordElt.size(); ++i) {
             vector<S2Point> vertices;
-            parsePoints(coordElt[i].Array(), &vertices);
+            if (!parsePoints(coordElt[i].Array(), &vertices)) { return false; }
             out->lines.mutableVector()[i] = new S2Polyline();
             out->lines.mutableVector()[i]->Init(vertices);
         }
+
+        return true;
     }
 
     bool GeoParser::isMultiPolygon(const BSONObj &obj) {
@@ -454,15 +504,20 @@ namespace mongo {
         return true;
     }
 
-    void GeoParser::parseMultiPolygon(const BSONObj &obj, MultiPolygonWithCRS *out) {
+    bool GeoParser::parseMultiPolygon(const BSONObj &obj, MultiPolygonWithCRS *out) {
         vector<BSONElement> coordElt = obj.getFieldDotted(GEOJSON_COORDINATES).Array();
         out->polygons.mutableVector().clear();
         out->polygons.mutableVector().resize(coordElt.size());
 
         for (size_t i = 0; i < coordElt.size(); ++i) {
             out->polygons.mutableVector()[i] = new S2Polygon();
-            parseGeoJSONPolygonCoordinates(coordElt[i].Array(), obj, out->polygons.vector()[i]);
+            if (!parseGeoJSONPolygonCoordinates(
+                    coordElt[i].Array(), obj, out->polygons.vector()[i])) {
+                return false;
+            }
         }
+
+        return true;
     }
 
     bool GeoParser::isGeometryCollection(const BSONObj &obj) {
@@ -519,17 +574,18 @@ namespace mongo {
         return isLegacyCenter(obj) || isLegacyCenterSphere(obj);
     }
 
-    void GeoParser::parseCap(const BSONObj& obj, CapWithCRS *out) {
+    bool GeoParser::parseCap(const BSONObj& obj, CapWithCRS *out) {
         if (isLegacyCenter(obj)) {
             BSONObjIterator typeIt(obj);
             BSONElement type = typeIt.next();
             BSONObjIterator objIt(type.embeddedObject());
             BSONElement center = objIt.next();
-            parseLegacyPoint(center.Obj(), &out->circle.center);
+            if (!parseLegacyPoint(center.Obj(), &out->circle.center)) { return false; }
             BSONElement radius = objIt.next();
             out->circle.radius = radius.number();
             out->crs = FLAT;
         } else {
+            verify(isLegacyCenterSphere(obj));
             BSONObjIterator typeIt(obj);
             BSONElement type = typeIt.next();
             BSONObjIterator objIt(type.embeddedObject());
@@ -539,15 +595,16 @@ namespace mongo {
             BSONObjIterator it(centerObj);
             BSONElement x = it.next();
             BSONElement y = it.next();
-            centerPoint = S2LatLng::FromDegrees(y.Number(), x.Number()).Normalized().ToPoint();
+            centerPoint = coordToPoint(x.Number(), y.Number());
             BSONElement radiusElt = objIt.next();
             double radius = radiusElt.number();
             out->cap = S2Cap::FromAxisAngle(centerPoint, S1Angle::Radians(radius));
             out->crs = SPHERE;
         }
+        return true;
     }
 
-    void GeoParser::parseGeometryCollection(const BSONObj &obj, GeometryCollection *out) {
+    bool GeoParser::parseGeometryCollection(const BSONObj &obj, GeometryCollection *out) {
         BSONElement coordElt = obj.getFieldDotted(GEOJSON_GEOMETRIES);
         const vector<BSONElement>& geometries = coordElt.Array();
 
@@ -556,26 +613,34 @@ namespace mongo {
 
             if (isGeoJSONPoint(geoObj)) {
                 PointWithCRS point;
-                parsePoint(geoObj, &point);
+                if (!parsePoint(geoObj, &point)) { return false; }
                 out->points.push_back(point);
             } else if (isLine(geoObj)) {
                 out->lines.mutableVector().push_back(new LineWithCRS());
-                parseLine(geoObj, out->lines.vector().back());
+                if (!parseLine(geoObj, out->lines.vector().back())) { return false; }
             } else if (isGeoJSONPolygon(geoObj)) {
                 out->polygons.mutableVector().push_back(new PolygonWithCRS());
-                parsePolygon(geoObj, out->polygons.vector().back());
+                if (!parsePolygon(geoObj, out->polygons.vector().back())) { return false; }
             } else if (isMultiPoint(geoObj)) {
                 out->multiPoints.mutableVector().push_back(new MultiPointWithCRS());
-                parseMultiPoint(geoObj, out->multiPoints.mutableVector().back());
+                if (!parseMultiPoint(geoObj, out->multiPoints.mutableVector().back())) {
+                    return false;
+                }
             } else if (isMultiPolygon(geoObj)) {
                 out->multiPolygons.mutableVector().push_back(new MultiPolygonWithCRS());
-                parseMultiPolygon(geoObj, out->multiPolygons.mutableVector().back());
+                if (!parseMultiPolygon(geoObj, out->multiPolygons.mutableVector().back())) {
+                    return false;
+                }
             } else {
                 verify(isMultiLine(geoObj));
                 out->multiLines.mutableVector().push_back(new MultiLineWithCRS());
-                parseMultiLine(geoObj, out->multiLines.mutableVector().back());
+                if (!parseMultiLine(geoObj, out->multiLines.mutableVector().back())) {
+                    return false;
+                }
             }
         }
+
+        return true;
     }
 
 }  // namespace mongo

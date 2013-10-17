@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
@@ -24,12 +36,14 @@
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
     using mongo::BSONObj;
+    using mongo::LogBuilder;
     using mongo::ModifierPullAll;
     using mongo::ModifierInterface;
     using mongo::NumberInt;
@@ -48,7 +62,8 @@ namespace {
         explicit Mod(BSONObj modObj)
             : _modObj(modObj)
             , _mod() {
-            ASSERT_OK(_mod.init(_modObj["$pullAll"].embeddedObject().firstElement()));
+            ASSERT_OK(_mod.init(_modObj["$pullAll"].embeddedObject().firstElement(),
+                                ModifierInterface::Options::normal()));
         }
 
         Status prepare(Element root,
@@ -61,8 +76,8 @@ namespace {
             return _mod.apply();
         }
 
-        Status log(Element logRoot) const {
-            return _mod.log(logRoot);
+        Status log(LogBuilder* logBuilder) const {
+            return _mod.log(logBuilder);
         }
 
         ModifierPullAll& mod() { return _mod; }
@@ -77,16 +92,20 @@ namespace {
         ModifierPullAll mod;
 
         modObj = fromjson("{$pullAll: {a:1}}");
-        ASSERT_NOT_OK(mod.init(modObj["$pullAll"].embeddedObject().firstElement()));
+        ASSERT_NOT_OK(mod.init(modObj["$pullAll"].embeddedObject().firstElement(),
+                               ModifierInterface::Options::normal()));
 
         modObj = fromjson("{$pullAll: {a:'test'}}");
-        ASSERT_NOT_OK(mod.init(modObj["$pullAll"].embeddedObject().firstElement()));
+        ASSERT_NOT_OK(mod.init(modObj["$pullAll"].embeddedObject().firstElement(),
+                               ModifierInterface::Options::normal()));
 
         modObj = fromjson("{$pullAll: {a:{}}}");
-        ASSERT_NOT_OK(mod.init(modObj["$pullAll"].embeddedObject().firstElement()));
+        ASSERT_NOT_OK(mod.init(modObj["$pullAll"].embeddedObject().firstElement(),
+                               ModifierInterface::Options::normal()));
 
         modObj = fromjson("{$pullAll: {a:true}}");
-        ASSERT_NOT_OK(mod.init(modObj["$pullAll"].embeddedObject().firstElement()));
+        ASSERT_NOT_OK(mod.init(modObj["$pullAll"].embeddedObject().firstElement(),
+                               ModifierInterface::Options::normal()));
 
     }
 
@@ -97,9 +116,9 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_FALSE(execInfo.noOp);
-        ASSERT_FALSE(execInfo.inPlace);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : ['a', {r:1, b:2}] }"), doc);
     }
 
@@ -110,9 +129,9 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_TRUE(execInfo.noOp);
-        ASSERT_TRUE(execInfo.inPlace);
 
         ASSERT_OK(mod.apply());
+        ASSERT_TRUE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : [1, 'a', {r:1, b:2}] }"), doc);
     }
 
@@ -123,9 +142,9 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_FALSE(execInfo.noOp);
-        ASSERT_FALSE(execInfo.inPlace);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : [{r:1, b:2}] }"), doc);
     }
 
@@ -136,13 +155,14 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_FALSE(execInfo.noOp);
-        ASSERT_FALSE(execInfo.inPlace);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : [] }"), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [] } }"), logDoc);
     }
 
@@ -153,13 +173,14 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_FALSE(execInfo.noOp);
-        ASSERT_FALSE(execInfo.inPlace);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : [] }"), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [] } }"), logDoc);
     }
 
@@ -170,13 +191,14 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_FALSE(execInfo.noOp);
-        ASSERT_FALSE(execInfo.inPlace);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : [] }"), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [] } }"), logDoc);
     }
 
@@ -187,10 +209,10 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_TRUE(execInfo.noOp);
-        ASSERT_TRUE(execInfo.inPlace);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [1, 'a', {r:1, b:2}] } }"), logDoc);
     }
 
@@ -201,10 +223,10 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_TRUE(execInfo.noOp);
-        ASSERT_TRUE(execInfo.inPlace);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $unset : { b : true } }"), logDoc);
     }
 

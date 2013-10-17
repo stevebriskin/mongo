@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -37,7 +49,7 @@ namespace mongo {
         For example <dbname>.system.users is ok for regular clients to update.
         @param write used when .system.js
     */
-    bool legalClientSystemNS( const string& ns , bool write );
+    bool legalClientSystemNS( const StringData& ns , bool write );
 
     /* deleted lists -- linked lists of deleted records -- are placed in 'buckets' of various sizes
        so you can look for a deleterecord about the right size.
@@ -279,10 +291,9 @@ namespace mongo {
         IndexDetails& getNextIndexDetails(const char* thisns);
 
         /**
-         * Add a new index.  This does not add it to system.indexes etc. - just to NamespaceDetails.
-         * This resets the transient namespace details.
+         * incremements _nIndexes
          */
-        void addIndex(const char* thisns);
+        void addIndex();
 
         void aboutToDeleteAnIndex() { 
             clearSystemFlag( Flag_HaveIdIndex );
@@ -339,7 +350,7 @@ namespace mongo {
         }
 
         // @return offset in indexes[]
-        int findIndexByName(const char *name, bool includeBackgroundInProgress = false);
+        int findIndexByName(const StringData& name, bool includeBackgroundInProgress = false);
 
         // @return offset in indexes[]
         int findIndexByKeyPattern(const BSONObj& keyPattern, 
@@ -515,131 +526,5 @@ namespace mongo {
         BOOST_STATIC_ASSERT( sizeof(NamespaceDetails::Extra) == 496 );
     }; // NamespaceDetails
 #pragma pack()
-
-    /* NamespaceDetailsTransient
-
-       these are things we know / compute about a namespace that are transient -- things
-       we don't actually store in the .ns file.  so mainly caching of frequently used
-       information.
-
-       CAUTION: Are you maintaining this properly on a collection drop()?  A dropdatabase()?  Be careful.
-                The current field "allIndexKeys" may have too many keys in it on such an occurrence;
-                as currently used that does not cause anything terrible to happen.
-
-       todo: cleanup code, need abstractions and separation
-    */
-    // todo: multiple db's with the same name (repairDatabase) is not handled herein.  that may be
-    //       the way to go, if not used by repair, but need some sort of enforcement / asserts.
-    class NamespaceDetailsTransient : boost::noncopyable {
-        BOOST_STATIC_ASSERT( sizeof(NamespaceDetails) == 496 );
-
-        //Database *database;
-        const string _ns;
-        void reset();
-        
-        // < db -> < fullns -> NDT > >
-        typedef unordered_map< string, shared_ptr<NamespaceDetailsTransient> > CMap;
-        typedef unordered_map< string, CMap*, NamespaceDBHash, NamespaceDBEquals > DMap;
-        static DMap _nsdMap;
-
-        NamespaceDetailsTransient(Database*,const string& ns);
-    public:
-        ~NamespaceDetailsTransient();
-        void addedIndex() { reset(); }
-        void deletedIndex() { reset(); }
-
-        /**
-         * reset stats for a given collection
-         */
-        static void resetCollection(const string& ns );
-
-        /**
-         * remove entry for a collection
-         */
-        static void eraseCollection(const string& ns);
-
-        /**
-         * remove all entries for db
-         */
-        static void eraseDB(const string& db);
-
-        /* indexKeys() cache ---------------------------------------------------- */
-        /* assumed to be in write lock for this */
-    private:
-        bool _keysComputed;
-        IndexPathSet _indexedPaths;
-        void computeIndexKeys();
-    public:
-        /* get set of index keys for this namespace.  handy to quickly check if a given
-           field is indexed (Note it might be a secondary component of a compound index.)
-        */
-        const IndexPathSet& indexKeys() {
-            DEV Lock::assertWriteLocked(_ns);
-            if ( !_keysComputed )
-                computeIndexKeys();
-            return _indexedPaths;
-        }
-
-        /* query cache (for query optimizer) ------------------------------------- */
-    private:
-        int _qcWriteCount;
-        map<QueryPattern,CachedQueryPlan> _qcCache;
-        static NamespaceDetailsTransient& make_inlock(const string& ns);
-        static CMap& get_cmap_inlock(const string& ns);
-    public:
-        static SimpleMutex _qcMutex;
-
-        /* you must be in the qcMutex when calling this.
-           A NamespaceDetailsTransient object will not go out of scope on you if you are
-           d.dbMutex.atLeastReadLocked(), so you do't have to stay locked.
-           Creates a NamespaceDetailsTransient before returning if one DNE. 
-           todo: avoid creating too many on erroneous ns queries.
-           */
-        static NamespaceDetailsTransient& get_inlock(const string& ns);
-
-        static NamespaceDetailsTransient& get(const char *ns) {
-            // todo : _qcMutex will create bottlenecks in our parallelism
-            SimpleMutex::scoped_lock lk(_qcMutex);
-            return get_inlock(ns);
-        }
-
-        void clearQueryCache() {
-            _qcCache.clear();
-            _qcWriteCount = 0;
-        }
-        /* you must notify the cache if you are doing writes, as query plan utility will change */
-        void notifyOfWriteOp() {
-            if ( _qcCache.empty() )
-                return;
-            if ( ++_qcWriteCount >= 100 )
-                clearQueryCache();
-        }
-        CachedQueryPlan cachedQueryPlanForPattern( const QueryPattern &pattern ) {
-            return _qcCache[ pattern ];
-        }
-        void registerCachedQueryPlanForPattern( const QueryPattern &pattern,
-                                               const CachedQueryPlan &cachedQueryPlan ) {
-            _qcCache[ pattern ] = cachedQueryPlan;
-        }
-
-    }; /* NamespaceDetailsTransient */
-
-    inline NamespaceDetailsTransient& NamespaceDetailsTransient::get_inlock(const string& ns) {
-        CMap& m = get_cmap_inlock(ns);
-        CMap::iterator i = m.find( ns );
-        if ( i != m.end() && 
-             i->second.get() ) { // could be null ptr from clearForPrefix
-            return *i->second;
-        }
-        return make_inlock(ns);
-    }
-
-    extern string dbpath; // --dbpath parm
-    extern bool directoryperdb;
-
-    // Rename a namespace within current 'client' db.
-    // (Arguments should include db name)
-    void renameNamespace( const char *from, const char *to, bool stayTemp);
-
 
 } // namespace mongo

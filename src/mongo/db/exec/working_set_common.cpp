@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/exec/working_set.h"
@@ -21,36 +33,18 @@
 namespace mongo {
 
     // static
-    bool WorkingSetCommon::fetch(WorkingSetMember* member) {
-        // Already fetched.
-        if (member->hasObj()) {
-            // If we did a fetch we shouldn't have this around...
-            verify(member->keyData.empty());
-            return true;
-        }
-
-        if (!member->hasLoc()) { return false; }
-
-        member->obj = member->loc.obj();
-        member->state = WorkingSetMember::LOC_AND_OWNED_OBJ;
-
-        // We have an obj. so get rid of the key data.
-        member->keyData.clear();
-        return true;
-    }
-
-    // static
     bool WorkingSetCommon::fetchAndInvalidateLoc(WorkingSetMember* member) {
         // Already in our desired state.
         if (member->state == WorkingSetMember::OWNED_OBJ) { return true; }
 
-        if (fetch(member)) {
-            member->obj = member->obj.getOwned();
-            member->state = WorkingSetMember::OWNED_OBJ;
-            member->loc = DiskLoc();
-            return true;
-        }
-        else { return false; }
+        // We can't do anything without a DiskLoc.
+        if (!member->hasLoc()) { return false; }
+
+        // Do the fetch, invalidate the DL.
+        member->obj = member->loc.obj().getOwned();
+        member->state = WorkingSetMember::OWNED_OBJ;
+        member->loc = DiskLoc();
+        return true;
     }
 
 }  // namespace mongo

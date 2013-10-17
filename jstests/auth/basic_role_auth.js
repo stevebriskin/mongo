@@ -15,8 +15,7 @@ var AUTH_INFO = {
     admin: {
         root: {
             pwd: 'root',
-            roles: [ 'readWriteAnyDatabase', 'userAdminAnyDatabase',
-                'dbAdminAnyDatabase', 'clusterAdmin' ]
+            roles: [ 'root' ]
         },
         cluster: {
             pwd: 'cluster',
@@ -187,12 +186,15 @@ var testOps = function(db, allowedActions) {
     }, db);
 
     checkErr(allowedActions.hasOwnProperty('user_r'), function() {
-        db.system.users.findOne();
+        var result = db.runCommand({usersInfo: 1});
+        if (!result.ok) {
+            throw new Error(tojson(result));
+        }
     });
 
     checkErr(allowedActions.hasOwnProperty('user_w'), function() {
-        db.addUser('a', 'a');
-        db.system.users.remove({ user: 'a' });
+        db.addUser({user:'a', pwd: 'a', roles: jsTest.basicUserRoles});
+        db.dropUser('a');
     }, db);
 
     // Test for kill cursor
@@ -485,7 +487,7 @@ var runTests = function(conn) {
         }
 
         adminDB.addUser({ user: 'root', pwd: AUTH_INFO.admin.root.pwd,
-            roles: AUTH_INFO.admin.root.roles });
+                          roles: AUTH_INFO.admin.root.roles });
         adminDB.auth('root', AUTH_INFO.admin.root.pwd);
 
         for (var dbName in AUTH_INFO) {
@@ -524,6 +526,7 @@ var runTests = function(conn) {
             testFunc.test(newConn);
         } catch (x) {
             failures.push(testFunc.name);
+            jsTestLog(x);
         }
     });
 

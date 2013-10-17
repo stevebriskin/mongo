@@ -18,20 +18,19 @@
 
 #include <boost/algorithm/string.hpp>
 #include <boost/filesystem/operations.hpp>
-#include <boost/program_options.hpp>
 #include <fstream>
 #include <iostream>
 
 #include "mongo/base/initializer.h"
 #include "mongo/db/json.h"
+#include "mongo/tools/mongoimport_options.h"
 #include "mongo/tools/tool.h"
+#include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/text.h"
 
 using namespace mongo;
 using std::string;
 using std::stringstream;
-
-namespace po = boost::program_options;
 
 class Import : public Tool {
 
@@ -39,11 +38,6 @@ class Import : public Tool {
     Type _type;
 
     const char * _sep;
-    bool _ignoreBlanks;
-    bool _headerLine;
-    bool _upsert;
-    bool _doimport;
-    vector<string> _upsertFields;
     static const int BUF_SIZE;
 
     void csvTokenizeRow(const string& row, vector<string>& tokens) {
@@ -92,7 +86,7 @@ class Import : public Tool {
     }
 
     void _append( BSONObjBuilder& b , const string& fieldName , const string& data ) {
-        if ( _ignoreBlanks && data.size() == 0 )
+        if (mongoImportGlobalParams.ignoreBlanks && data.size() == 0)
             return;
 
         if ( b.appendAsNumber( fieldName , data ) )
@@ -117,7 +111,9 @@ class Import : public Tool {
 
         uassert(16329, str::stream() << "read error, or input line too long (max length: "
                 << BUF_SIZE << ")", !(in->rdstate() & ios_base::failbit));
-        LOG(1) << "got line:" << buf << endl;
+        if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1))) {
+            toolInfoLog() << "got line:" << buf << std::endl;
+        }
 
         uassert( 10263 ,  "unknown error reading file" ,
                  (!(in->rdstate() & ios_base::badbit)) &&
@@ -251,13 +247,13 @@ class Import : public Tool {
         unsigned int pos=0;
         for (vector<string>::iterator it = tokens.begin(); it != tokens.end(); ++it) {
             string token = *it;
-            if ( _headerLine ) {
-                _fields.push_back(token);
+            if (mongoImportGlobalParams.headerLine) {
+                toolGlobalParams.fields.push_back(token);
             }
             else {
                 string name;
-                if ( pos < _fields.size() ) {
-                    name = _fields[pos];
+                if (pos < toolGlobalParams.fields.size()) {
+                    name = toolGlobalParams.fields[pos];
                 }
                 else {
                     stringstream ss;
@@ -274,35 +270,12 @@ class Import : public Tool {
     }
 
 public:
-    Import() : Tool( "import" ) {
-        addFieldOptions();
-        add_options()
-        ("ignoreBlanks","if given, empty fields in csv and tsv will be ignored")
-        ("type",po::value<string>() , "type of file to import.  default: json (json,csv,tsv)")
-        ("file",po::value<string>() , "file to import from; if not specified stdin is used" )
-        ("drop", "drop collection first " )
-        ("headerline","first line in input file is a header (CSV and TSV only)")
-        ("upsert", "insert or update objects that already exist" )
-        ("upsertFields", po::value<string>(), "comma-separated fields for the query part of the upsert. You should make sure this is indexed" )
-        ("stopOnError", "stop importing at first error rather than continuing" )
-        ("jsonArray", "load a json array, not one item per line. Currently limited to 16MB." )
-        ;
-        add_hidden_options()
-        ("noimport", "don't actually import. useful for benchmarking parser" )
-        ;
-        addPositionArg( "file" , 1 );
+    Import() : Tool() {
         _type = JSON;
-        _ignoreBlanks = false;
-        _headerLine = false;
-        _upsert = false;
-        _doimport = true;
     }
-    ;
-    virtual void printExtraHelp( ostream & out ) {
-        out << "Import CSV, TSV or JSON data into MongoDB.\n" << endl;
-        out << "When importing JSON documents, each document must be a separate line of the input file.\n";
-        out << "\nExample:\n";
-        out << "  mongoimport --host myhost --db my_cms --collection docs < mydocfile.json\n" << endl;
+
+    virtual void printHelp( ostream & out ) {
+        printMongoImportHelp(&out);
     }
 
     unsigned long long lastErrorFailures;
@@ -314,11 +287,11 @@ public:
             if( str::contains(s,"uplicate") ) {
                 // we don't want to return an error from the mongoimport process for
                 // dup key errors
-                log() << s << endl;
+                toolInfoLog() << s << endl;
             }
             else {
                 lastErrorFailures++;
-                log() << "error: " << s << endl;
+                toolInfoLog() << "error: " << s << endl;
                 return false;
             }
         }
@@ -326,11 +299,11 @@ public:
     }
 
     void importDocument (const std::string &ns, const BSONObj& o) {
-        bool doUpsert = _upsert;
+        bool doUpsert = mongoImportGlobalParams.upsert;
         BSONObjBuilder b;
-        if (_upsert) {
-            for (vector<string>::const_iterator it = _upsertFields.begin(),
-                 end = _upsertFields.end(); it != end; ++it) {
+        if (mongoImportGlobalParams.upsert) {
+            for (vector<string>::const_iterator it = mongoImportGlobalParams.upsertFields.begin(),
+                 end = mongoImportGlobalParams.upsertFields.end(); it != end; ++it) {
                 BSONElement e = o.getFieldDotted(it->c_str());
                 if (e.eoo()) {
                     doUpsert = false;
@@ -349,21 +322,22 @@ public:
     }
 
     int run() {
-        string filename = getParam( "file" );
         long long fileSize = 0;
         int headerRows = 0;
 
         istream * in = &cin;
 
-        ifstream file( filename.c_str() , ios_base::in);
+        ifstream file(mongoImportGlobalParams.filename.c_str(), ios_base::in);
 
-        if ( filename.size() > 0 && filename != "-" ) {
-            if ( ! boost::filesystem::exists( filename ) ) {
-                error() << "file doesn't exist: " << filename << endl;
+        if (mongoImportGlobalParams.filename.size() > 0 &&
+            mongoImportGlobalParams.filename != "-") {
+            if ( ! boost::filesystem::exists(mongoImportGlobalParams.filename) ) {
+                toolError() << "file doesn't exist: " << mongoImportGlobalParams.filename
+                          << std::endl;
                 return -1;
             }
             in = &file;
-            fileSize = boost::filesystem::file_size( filename );
+            fileSize = boost::filesystem::file_size(mongoImportGlobalParams.filename);
         }
 
         // check if we're actually talking to a machine that can write
@@ -376,69 +350,67 @@ public:
         try {
             ns = getNS();
         }
+        catch (int e) {
+            if (e == -1) {
+                // no collection specified - use name of collection that was dumped from
+                string oldCollName =
+                    boost::filesystem::path(mongoImportGlobalParams.filename).leaf().string();
+                oldCollName = oldCollName.substr( 0 , oldCollName.find_last_of( "." ) );
+                cerr << "using filename '" << oldCollName << "' as collection." << endl;
+                ns = toolGlobalParams.db + "." + oldCollName;
+            }
+            else {
+                printHelp(cerr);
+                return -1;
+            }
+        }
         catch (...) {
             printHelp(cerr);
             return -1;
         }
 
-        LOG(1) << "ns: " << ns << endl;
-
-        if ( hasParam( "drop" ) ) {
-            log() << "dropping: " << ns << endl;
-            conn().dropCollection( ns.c_str() );
+        if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1))) {
+            toolInfoLog() << "ns: " << ns << endl;
         }
 
-        if ( hasParam( "ignoreBlanks" ) ) {
-            _ignoreBlanks = true;
+        if (mongoImportGlobalParams.drop) {
+            toolInfoLog() << "dropping: " << ns << endl;
+            conn().dropCollection(ns.c_str());
         }
 
-        if ( hasParam( "upsert" ) || hasParam( "upsertFields" )) {
-            _upsert = true;
-
-            string uf = getParam("upsertFields");
-            if (uf.empty()) {
-                _upsertFields.push_back("_id");
-            }
-            else {
-                StringSplitter(uf.c_str(), ",").split(_upsertFields);
-            }
+        if (mongoImportGlobalParams.type == "json")
+            _type = JSON;
+        else if (mongoImportGlobalParams.type == "csv") {
+            _type = CSV;
+            _sep = ",";
+        }
+        else if (mongoImportGlobalParams.type == "tsv") {
+            _type = TSV;
+            _sep = "\t";
+        }
+        else {
+            toolError() << "don't know what type [" << mongoImportGlobalParams.type << "] is"
+                      << std::endl;
+            return -1;
         }
 
-        if ( hasParam( "noimport" ) ) {
-            _doimport = false;
-        }
-
-        if ( hasParam( "type" ) ) {
-            string type = getParam( "type" );
-            if ( type == "json" )
-                _type = JSON;
-            else if ( type == "csv" ) {
-                _type = CSV;
-                _sep = ",";
-            }
-            else if ( type == "tsv" ) {
-                _type = TSV;
-                _sep = "\t";
-            }
-            else {
-                error() << "don't know what type [" << type << "] is" << endl;
-                return -1;
-            }
-        }
-
-        if ( _type == CSV || _type == TSV ) {
-            _headerLine = hasParam( "headerline" );
-            if ( _headerLine ) {
+        if (_type == CSV || _type == TSV) {
+            if (mongoImportGlobalParams.headerLine) {
                 headerRows = 1;
             }
             else {
-                needFields();
+                if (!toolGlobalParams.fieldsSpecified) {
+                    throw UserException(9998, "You need to specify fields or have a headerline to "
+                                              "import this file type");
+                }
             }
         }
 
 
         time_t start = time(0);
-        LOG(1) << "filesize: " << fileSize << endl;
+        if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1))) {
+            toolInfoLog() << "filesize: " << fileSize << endl;
+        }
         ProgressMeter pm( fileSize );
         int num = 0;
         int lastNumChecked = num;
@@ -447,7 +419,7 @@ public:
         int len = 0;
 
         // We have to handle jsonArrays differently since we can't read line by line
-        if (_type == JSON && hasParam("jsonArray")) {
+        if (_type == JSON && mongoImportGlobalParams.jsonArray) {
 
             // We cycle through these buffers in order to continuously read from the stream
             boost::scoped_array<char> buffer1(new char[BUF_SIZE]);
@@ -480,7 +452,7 @@ public:
                     }
 
                     // Import documents
-                    if (_doimport) {
+                    if (mongoImportGlobalParams.doimport) {
                         importDocument(ns, o);
 
                         if (num < 10) {
@@ -517,8 +489,8 @@ public:
                     num++;
                 }
                 catch ( const std::exception& e ) {
-                    log() << "exception: " << e.what()
-                          << ", current buffer: " << current_buffer << endl;
+                    toolError() << "exception: " << e.what()
+                              << ", current buffer: " << current_buffer << std::endl;
                     errors++;
 
                     // Since we only support JSON arrays all on one line, we might as well stop now
@@ -526,8 +498,11 @@ public:
                     break;
                 }
 
-                if ( pm.hit( len + 1 ) ) {
-                    log() << "\t\t\t" << num << "\t" << ( num / ( time(0) - start ) ) << "/second" << endl;
+                if (!toolGlobalParams.quiet) {
+                    if (pm.hit(len + 1)) {
+                        log() << "\t\t\t" << num << "\t" << (num / (time(0) - start)) << "/second"
+                              << std::endl;
+                    }
                 }
             }
         }
@@ -540,10 +515,10 @@ public:
                         continue;
                     }
 
-                    if ( _headerLine ) {
-                        _headerLine = false;
+                    if (mongoImportGlobalParams.headerLine) {
+                        mongoImportGlobalParams.headerLine = false;
                     }
-                    else if (_doimport) {
+                    else if (mongoImportGlobalParams.doimport) {
                         importDocument(ns, o);
 
                         if (num < 10) {
@@ -557,15 +532,18 @@ public:
                     num++;
                 }
                 catch ( const std::exception& e ) {
-                    log() << "exception:" << e.what() << endl;
+                    toolError() << "exception:" << e.what() << std::endl;
                     errors++;
 
-                    if (hasParam("stopOnError"))
+                    if (mongoImportGlobalParams.stopOnError)
                         break;
                 }
 
-                if ( pm.hit( len + 1 ) ) {
-                    log() << "\t\t\t" << num << "\t" << ( num / ( time(0) - start ) ) << "/second" << endl;
+                if (!toolGlobalParams.quiet) {
+                    if (pm.hit(len + 1)) {
+                        log() << "\t\t\t" << num << "\t" << (num / (time(0) - start)) << "/second"
+                              << std::endl;
+                    }
                 }
             }
         }
@@ -573,7 +551,7 @@ public:
         // this is for two reasons: to wait for all operations to reach the server and be processed, and this will wait until all data reaches the server,
         // and secondly to check if there were an error (on the last op)
         if( lastNumChecked+1 != num ) { // avoid redundant log message if already reported above
-            log() << "check " << lastNumChecked << " " << num << endl;
+            toolInfoLog() << "check " << lastNumChecked << " " << num << endl;
             checkLastError();
         }
 
@@ -581,38 +559,19 @@ public:
 
         // the message is vague on lastErrorFailures as we don't call it on every single operation. 
         // so if we have a lastErrorFailure there might be more than just what has been counted.
-        log() << (lastErrorFailures ? "tried to import " : "imported ") << ( num - headerRows ) << " objects" << endl;
+        toolInfoLog() << (lastErrorFailures ? "tried to import " : "imported ")
+                      << (num - headerRows) << " objects" << std::endl;
 
         if ( !hadErrors )
             return 0;
 
-        error() << "encountered " << (lastErrorFailures?"at least ":"") << lastErrorFailures+errors <<  " error(s)" << ( lastErrorFailures+errors == 1 ? "" : "s" ) << endl;
+        toolError() << "encountered " << (lastErrorFailures?"at least ":"")
+                  << lastErrorFailures+errors <<  " error(s)"
+                  << (lastErrorFailures+errors == 1 ? "" : "s") << std::endl;
         return -1;
     }
 };
 
 const int Import::BUF_SIZE(1024 * 1024 * 16);
 
-int toolMain( int argc , char ** argv, char** envp ) {
-    mongo::runGlobalInitializersOrDie(argc, argv, envp);
-    Import import;
-    return import.main( argc , argv );
-}
-
-#if defined(_WIN32)
-// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
-// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
-// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
-// and makes them available through the argv() and envp() members.  This enables toolMain()
-// to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = toolMain(argc, wcl.argv(), wcl.envp());
-    ::_exit(exitCode);
-}
-#else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = toolMain(argc, argv, envp);
-    ::_exit(exitCode);
-}
-#endif
+REGISTER_MONGO_TOOL(Import);

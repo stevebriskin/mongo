@@ -63,278 +63,28 @@ DB.prototype.adminCommand = function( obj ){
 
 DB.prototype._adminCommand = DB.prototype.adminCommand; // alias old name
 
-function printUserObj(userObj) {
-    var pwd = userObj.pwd;
-    delete userObj.pwd;
-    print(tojson(userObj));
-    userObj.pwd = pwd;
-}
-
-/**
- * Used for creating users in systems with v1 style user information (ie MongoDB v2.4 and prior)
- */
-DB.prototype._createUserV1 = function(userObj, replicatedTo, timeout) {
-    var c = this.getCollection( "system.users" );
-    var oldPwd;
-    if (userObj.pwd != null) {
-        oldPwd = userObj.pwd;
-        userObj.pwd = _hashPassword(userObj.user, userObj.pwd);
-    }
-    try {
-        c.save(userObj);
-    } catch (e) {
-        // SyncClusterConnections call GLE automatically after every write and will throw an
-        // exception if the insert failed.
-        if ( tojson(e).indexOf( "login" ) >= 0 ){
-            // TODO: this check is a hack
-            print( "Creating user seems to have succeeded but threw an exception because we no " +
-                   "longer have auth." );
-        } else {
-            throw "Could not insert into system.users: " + tojson(e);
-        }
-    } finally {
-        if (userObj.pwd != null)
-            userObj.pwd = oldPwd;
-    }
-    printUserObj(userObj);
-
-    //
-    // When saving users to replica sets, the shell user will want to know if the user hasn't
-    // been fully replicated everywhere, since this will impact security.  By default, replicate to
-    // majority of nodes with wtimeout 15 secs, though user can override
-    //
-    
-    replicatedTo = replicatedTo != undefined && replicatedTo != null ? replicatedTo : "majority"
-    
-    // in mongod version 2.1.0-, this worked
-    var le = {};
-    try {        
-        le = this.getLastErrorObj( replicatedTo, timeout || 30 * 1000 );
-        // printjson( le )
-    }
-    catch (e) {
-        errjson = tojson(e);
-        if ( errjson.indexOf( "login" ) >= 0 || errjson.indexOf( "unauthorized" ) >= 0 ) {
-            // TODO: this check is a hack
-            print( "addUser succeeded, but cannot wait for replication since we no longer have auth" );
-            return "";
-        }
-        print( "could not find getLastError object : " + tojson( e ) )
-    }
-
-    if (!le.err) {
-        return;
-    }
-
-    // We can't detect replica set shards via mongos, so we'll sometimes get this error
-    // In this case though, we've already checked the local error before returning norepl, so
-    // the user has been written and we're happy
-    if (le.err == "norepl" || le.err == "noreplset") {
-        // nothing we can do
-        return;
-    }
-
-    if (le.err == "timeout") {
-        throw "timed out while waiting for user authentication to replicate - " +
-              "database will not be fully secured until replication finishes"
-    }
-
-    if (le.err.startsWith("E11000 duplicate key error")) {
-        throw "User already exists with that username/userSource combination";
-    }
-
-    throw "couldn't add user: " + le.err;
-}
-
-DB.prototype._createUser = function(userObj, replicatedTo, timeout) {
-    var cmdObj = {createUser:1};
-    cmdObj = Object.extend(cmdObj, userObj);
-
-    var res = this.runCommand(cmdObj);
-
-    if (res.ok) {
-        printUserObj(userObj);
-        return;
-    }
-
-    if (res.errmsg == "no such cmd: createUser") {
-        return this._createUserV1(userObj, replicatedTo, timeout);
-    }
-
-    // We can't detect replica set shards via mongos, so we'll sometimes get this error
-    // In this case though, we've already checked the local error before returning norepl, so
-    // the user has been written and we're happy
-    if (res.errmsg == "norepl" || res.errmsg == "noreplset") {
-        // nothing we can do
-        return;
-    }
-
-    if (res.errmsg == "timeout") {
-        throw "timed out while waiting for user authentication to replicate - " +
-              "database will not be fully secured until replication finishes"
-    }
-
-    throw "couldn't add user: " + res.errmsg;
-}
-
-function _hashPassword(username, password) {
-    return hex_md5(username + ":mongo:" + password);
-}
-
-// For adding old-style user documents for backwards compatibily with pre-2.4 versions of MongoDB.
-DB.prototype._addUserV0 = function( username , pass, readOnly, replicatedTo, timeout ) {
-    if ( pass == null || pass.length == 0 )
-        throw "password can't be empty";
-
-    readOnly = readOnly || false;
-    var c = this.getCollection( "system.users" );
-    var u = { user : username, readOnly : readOnly, pwd : pass };
-
-    this._createUser(u, replicatedTo, timeout);
-}
-
-DB.prototype._addUser = function(userObj, replicatedTo, timeout) {
-    // To prevent creating old-style privilege documents
-    if (userObj['roles'] == null) {
-        throw Error("'roles' field must be provided");
-    }
-
-    this._createUser(userObj, replicatedTo, timeout);
-}
-
-DB.prototype.addUser = function() {
-    if (arguments.length == 0) {
-        throw Error("No arguments provided to addUser");
-    }
-    if (typeof arguments[0] == "object") {
-        this._addUser.apply(this, arguments);
-    } else {
-        this._addUserV0.apply(this, arguments);
-    }
-}
-
-/**
- * Used for updating users' passwords/extraData in systems with V1 style user information
- * (ie MongoDB v2.4 and prior)
- */
-DB.prototype._updateUserV1 = function(updateObject) {
-    var setObj = {};
-    if (updateObject.pwd) {
-        setObj["pwd"] = _hashPassword(updateObject.user, updateObject.pwd);
-    }
-    if (updateObject.extraData) {
-        setObj["extraData"] = updateObject.extraData;
-    }
-    db.system.users.update({user : updateObject.user, userSource : null},
-                           {$set : setObj});
-    var err = db.getLastError();
-    if (err) {
-        throw Error("Updating user failed: " + err);
-    }
-};
-
-DB.prototype.updateUser = function(updateObject) {
-    var cmdObj = {updateUser:1};
-    cmdObj = Object.extend(cmdObj, updateObject);
-    var res = this.runCommand(cmdObj);
-    if (res.ok) {
-        return;
-    }
-
-    if (res.errmsg == "no such cmd: updateUser") {
-        this._updateUserV1(updateObject);
-        return;
-    }
-
-    if (res.errmsg == "noreplset") {
-        // nothing we can do
-        return;
-    }
-
-    throw Error("Updating user failed: " + res.errmsg);
-};
-
-DB.prototype.changeUserPassword = function(username, password) {
-    var updateObject = { user: username, pwd: password};
-    this.updateUser(updateObject);
-};
-
-DB.prototype.logout = function(){
-    return this.getMongo().logout(this.getName());
-};
-
-DB.prototype.removeUser = function( username ){
-    this.getCollection( "system.users" ).remove( { user : username } );
-}
-
-DB.prototype.__pwHash = function( nonce, username, pass ) {
-    return hex_md5(nonce + username + _hashPassword(username, pass));
-}
-
-DB.prototype._defaultAuthenticationMechanism = "MONGODB-CR";
-
-DB.prototype._authOrThrow = function () {
-    var params;
-    if (arguments.length == 2) {
-        params = { user: arguments[0], pwd: arguments[1] };
-    }
-    else if (arguments.length == 1) {
-        if (typeof(arguments[0]) != "object")
-            throw Error("Single-argument form of auth expects a parameter object");
-        params = arguments[0];
-    }
-    else {
-        throw Error(
-            "auth expects either (username, password) or ({ user: username, pwd: password })");
-    }
-
-    if (params.mechanism === undefined)
-        params.mechanism = this._defaultAuthenticationMechanism;
-
-    if (params.userSource !== undefined) {
-        throw Error("Do not override userSource field on db.auth().  " +
-                    "Use getMongo().auth(), instead.");
-    }
-
-    params.userSource = this.getName();
-    return this.getMongo().auth(params);
-}
-
-
-DB.prototype.auth = function() {
-    var ex;
-    try {
-        this._authOrThrow.apply(this, arguments);
-    } catch (ex) {
-        print(ex);
-        return 0;
-    }
-    return 1;
-}
-
 /**
   Create a new collection in the database.  Normally, collection creation is automatic.  You would
    use this function if you wish to specify special options on creation.
 
    If the collection already exists, no action occurs.
-   
-   <p>Options:</p>
-   <ul>
-   	<li>
-     size: desired initial extent size for the collection.  Must be <= 1000000000.
-           for fixed size (capped) collections, this size is the total/max size of the 
-           collection.
+
+    <p>Options:</p>
+    <ul>
+    <li>
+        size: desired initial extent size for the collection.  Must be <= 1000000000.
+              for fixed size (capped) collections, this size is the total/max size of the 
+              collection.
     </li>
     <li>
-     capped: if true, this is a capped collection (where old data rolls out).
+        capped: if true, this is a capped collection (where old data rolls out).
     </li>
     <li> max: maximum number of objects if capped (optional).</li>
     </ul>
 
-   <p>Example: </p>
-   
-   <code>db.createCollection("movies", { size: 10 * 1024 * 1024, capped:true } );</code>
- 
+    <p>Example:</p>
+    <code>db.createCollection("movies", { size: 10 * 1024 * 1024, capped:true } );</code>
+
  * @param {String} name Name of new collection to create 
  * @param {Object} options Object with options for call.  Options are listed above.
  * @return SOMETHING_FIXME
@@ -382,7 +132,7 @@ DB.prototype.getProfilingStatus  = function() {
   Erase the entire database.  (!)
 
  * @return Object returned has member ok set to true if operation succeeds, false otherwise.
-*/
+ */
 DB.prototype.dropDatabase = function() {
     if ( arguments.length )
         throw "dropDatabase doesn't take arguments";
@@ -399,7 +149,7 @@ DB.prototype.dropDatabase = function() {
  */
 DB.prototype.shutdownServer = function(opts) {
     if( "admin" != this._name ){
-	return "shutdown command only works with the admin database; try 'use admin'";
+        return "shutdown command only works with the admin database; try 'use admin'";
     }
 
     cmd = {"shutdown" : 1};
@@ -410,9 +160,9 @@ DB.prototype.shutdownServer = function(opts) {
 
     try {
         var res = this.runCommand(cmd);
-	if( res )
-	    throw "shutdownServer failed: " + res.errmsg;
-	throw "shutdownServer failed";
+        if( res )
+            throw "shutdownServer failed: " + res.errmsg;
+        throw "shutdownServer failed";
     }
     catch ( e ){
         assert( tojson( e ).indexOf( "error doing query: failed" ) >= 0 , "unexpected error: " + tojson( e ) );
@@ -434,7 +184,7 @@ DB.prototype.shutdownServer = function(opts) {
                    (self) as you cannot clone to yourself.
  * @return Object returned has member ok set to true if operation succeeds, false otherwise.
  * See also: db.copyDatabase()
-*/
+ */
 DB.prototype.cloneDatabase = function(from) { 
     assert( isString(from) && from.length );
     return this._dbCommand( { clone: from } );
@@ -545,7 +295,7 @@ DB.prototype.help = function() {
     print("\tdb.printReplicationInfo()");
     print("\tdb.printShardingStatus()");
     print("\tdb.printSlaveReplicationInfo()");
-    print("\tdb.removeUser(username)");
+    print("\tdb.dropUser(username)");
     print("\tdb.repairDatabase()");
     print("\tdb.resetError()");
     print("\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into { cmdObj : 1 }");
@@ -602,11 +352,14 @@ DB.prototype.printCollectionStats = function(scale) {
 DB.prototype.setProfilingLevel = function(level,slowms) {
     
     if (level < 0 || level > 2) { 
-        throw { dbSetProfilingException : "input level " + level + " is out of range [0..2]" };        
+        var errorText = "input level " + level + " is out of range [0..2]";
+        var errorObject = new Error(errorText);
+        errorObject['dbSetProfilingException'] = errorText;
+        throw errorObject;
     }
 
     var cmd = { profile: level };
-    if ( slowms )
+    if ( isNumber( slowms ) )
         cmd["slowms"] = slowms;
     return this._dbCommand( cmd );
 }
@@ -634,13 +387,13 @@ DB.prototype.setProfilingLevel = function(level,slowms) {
 DB.prototype.eval = function(jsfunction) {
     var cmd = { $eval : jsfunction };
     if ( arguments.length > 1 ) {
-	cmd.args = argumentsToArray( arguments ).slice(1);
+        cmd.args = argumentsToArray( arguments ).slice(1);
     }
     
     var res = this._dbCommand( cmd );
     
     if (!res.ok)
-    	throw tojson( res );
+        throw tojson( res );
     
     return res.retval;
 }
@@ -660,16 +413,16 @@ DB.prototype.dbEval = DB.prototype.eval;
  *  </p>
  * 
  *  <code>
-     db.group(
-       {
-         ns: "coll",
-         key: { a:true, b:true },
-	 // keyf: ...,
-	 cond: { active:1 },
-	 reduce: function(obj,prev) { prev.csum += obj.c; } ,
-	 initial: { csum: 0 }
-	 });
-	 </code>
+    db.group(
+        {
+            ns: "coll",
+            key: { a:true, b:true },
+            // keyf: ...,
+            cond: { active:1 },
+            reduce: function(obj,prev) { prev.csum += obj.c; },
+            initial: { csum: 0 }
+        });
+    </code>
  *
  * 
  * <p>
@@ -683,41 +436,41 @@ DB.prototype.dbEval = DB.prototype.eval;
      cond may be null if you want to run against all rows in the collection
      keyf is a function which takes an object and returns the desired key.  set either key or keyf (not both).
  * </p>
-*/
+ */
 DB.prototype.groupeval = function(parmsObj) {
-	
+
     var groupFunction = function() {
-	var parms = args[0];
-    	var c = db[parms.ns].find(parms.cond||{});
-    	var map = new Map();
+        var parms = args[0];
+        var c = db[parms.ns].find(parms.cond||{});
+        var map = new Map();
         var pks = parms.key ? Object.keySet( parms.key ) : null;
         var pkl = pks ? pks.length : 0;
         var key = {};
-        
-    	while( c.hasNext() ) {
-	    var obj = c.next();
-	    if ( pks ) {
-	    	for( var i=0; i<pkl; i++ ){
-                    var k = pks[i];
-		    key[k] = obj[k];
-                }
-	    }
-	    else {
-	    	key = parms.$keyf(obj);
-	    }
 
-	    var aggObj = map.get(key);
-	    if( aggObj == null ) {
-		var newObj = Object.extend({}, key); // clone
-	    	aggObj = Object.extend(newObj, parms.initial)
-                map.put( key , aggObj );
-	    }
-	    parms.$reduce(obj, aggObj);
-	}
-        
-	return map.values();
+        while( c.hasNext() ) {
+            var obj = c.next();
+            if ( pks ) {
+                for ( var i=0; i<pkl; i++ ) {
+                    var k = pks[i];
+                    key[k] = obj[k];
+                }
+            }
+            else {
+                key = parms.$keyf(obj);
+            }
+
+            var aggObj = map.get(key);
+            if( aggObj == null ) {
+                var newObj = Object.extend({}, key); // clone
+                aggObj = Object.extend(newObj, parms.initial);
+                map.put( key, aggObj );
+            }
+            parms.$reduce(obj, aggObj);
+        }
+
+        return map.values();
     }
-    
+
     return this.eval(groupFunction, this._groupFixParms( parmsObj ));
 }
 
@@ -733,17 +486,17 @@ DB.prototype.group = DB.prototype.groupcmd;
 
 DB.prototype._groupFixParms = function( parmsObj ){
     var parms = Object.extend({}, parmsObj);
-    
+
     if( parms.reduce ) {
-	parms.$reduce = parms.reduce; // must have $ to pass to db
-	delete parms.reduce;
+        parms.$reduce = parms.reduce; // must have $ to pass to db
+        delete parms.reduce;
     }
-    
+
     if( parms.keyf ) {
-	parms.$keyf = parms.keyf;
-	delete parms.keyf;
+        parms.$keyf = parms.keyf;
+        delete parms.keyf;
     }
-    
+
     return parms;
 }
 
@@ -873,10 +626,10 @@ DB.prototype.getReplicationInfo = function() {
         result.errmsg = "neither master/slave nor replica set replication detected";
         return result;
     }
-    
+
     var ol_entry = db.system.namespaces.findOne({name:"local."+oplog});
     if( ol_entry && ol_entry.options ) {
-	result.logSizeMB = ol_entry.options.size / ( 1024 * 1024 );
+        result.logSizeMB = ol_entry.options.size / ( 1024 * 1024 );
     } else {
         result.errmsg  = "local."+oplog+", or its options, not found in system.namespaces collection";
         return result;
@@ -885,33 +638,31 @@ DB.prototype.getReplicationInfo = function() {
 
     result.usedMB = ol.stats().size / ( 1024 * 1024 );
     result.usedMB = Math.ceil( result.usedMB * 100 ) / 100;
-    
+
     var firstc = ol.find().sort({$natural:1}).limit(1);
     var lastc = ol.find().sort({$natural:-1}).limit(1);
     if( !firstc.hasNext() || !lastc.hasNext() ) { 
-	result.errmsg = "objects not found in local.oplog.$main -- is this a new and empty db instance?";
-	result.oplogMainRowCount = ol.count();
-	return result;
+        result.errmsg = "objects not found in local.oplog.$main -- is this a new and empty db instance?";
+        result.oplogMainRowCount = ol.count();
+        return result;
     }
 
     var first = firstc.next();
     var last = lastc.next();
-    {
-	var tfirst = first.ts;
-	var tlast = last.ts;
-        
-	if( tfirst && tlast ) { 
-	    tfirst = DB.tsToSeconds( tfirst ); 
-	    tlast = DB.tsToSeconds( tlast );
-	    result.timeDiff = tlast - tfirst;
-	    result.timeDiffHours = Math.round(result.timeDiff / 36)/100;
-	    result.tFirst = (new Date(tfirst*1000)).toString();
-	    result.tLast  = (new Date(tlast*1000)).toString();
-	    result.now = Date();
-	}
-	else { 
-	    result.errmsg = "ts element not found in oplog objects";
-	}
+    var tfirst = first.ts;
+    var tlast = last.ts;
+
+    if( tfirst && tlast ) { 
+        tfirst = DB.tsToSeconds( tfirst ); 
+        tlast = DB.tsToSeconds( tlast );
+        result.timeDiff = tlast - tfirst;
+        result.timeDiffHours = Math.round(result.timeDiff / 36)/100;
+        result.tFirst = (new Date(tfirst*1000)).toString();
+        result.tLast  = (new Date(tlast*1000)).toString();
+        result.now = Date();
+    }
+    else { 
+        result.errmsg = "ts element not found in oplog objects";
     }
 
     return result;
@@ -925,8 +676,8 @@ DB.prototype.printReplicationInfo = function() {
             this.printSlaveReplicationInfo();
             return;
         }
-	print(tojson(result));
-	return;
+        print(tojson(result));
+        return;
     }
     print("configured oplog size:   " + result.logSizeMB + "MB");
     print("log length start to end: " + result.timeDiff + "secs (" + result.timeDiffHours + "hrs)");
@@ -974,7 +725,7 @@ DB.prototype.printSlaveReplicationInfo = function() {
 
     function r(x) {
         assert( x , "how could this be null (printSlaveReplicationInfo rx)" );
-        if ( x.state == 1 ) {
+        if ( x.state == 1 || x.state == 7 ) {  // ignore primaries (1) and arbiters (7)
             return;
         }
         
@@ -1093,6 +844,504 @@ DB.prototype.getSlaveOk = function() {
 */
 DB.prototype.loadServerScripts = function(){
     this.system.js.find().forEach(function(u){eval(u._id + " = " + u.value);});
+}
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////// Security shell helpers below //////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+var _defaultWriteConcern = { w: 'majority', wtimeout: 30 * 1000 }
+
+function printUserObj(userObj) {
+    var pwd = userObj.pwd;
+    delete userObj.pwd;
+    print(tojson(userObj));
+    userObj.pwd = pwd;
+}
+
+/**
+ * Used for creating users in systems with v1 style user information (ie MongoDB v2.4 and prior)
+ */
+DB.prototype._createUserWithInsert = function(userObj, replicatedTo, timeout) {
+    var c = this.getCollection( "system.users" );
+    var oldPwd;
+    if (userObj.pwd != null) {
+        oldPwd = userObj.pwd;
+        userObj.pwd = _hashPassword(userObj.user, userObj.pwd);
+    }
+    try {
+        c.save(userObj);
+    } catch (e) {
+        // SyncClusterConnections call GLE automatically after every write and will throw an
+        // exception if the insert failed.
+        if ( tojson(e).indexOf( "login" ) >= 0 ){
+            // TODO: this check is a hack
+            print( "Creating user seems to have succeeded but threw an exception because we no " +
+                   "longer have auth." );
+        } else {
+            throw "Could not insert into system.users: " + tojson(e);
+        }
+    } finally {
+        if (userObj.pwd != null)
+            userObj.pwd = oldPwd;
+    }
+    printUserObj(userObj);
+
+    //
+    // When saving users to replica sets, the shell user will want to know if the user hasn't
+    // been fully replicated everywhere, since this will impact security.  By default, replicate to
+    // majority of nodes with wtimeout 15 secs, though user can override
+    //
+    
+    replicatedTo = replicatedTo != undefined && replicatedTo != null ? replicatedTo : "majority"
+    
+    // in mongod version 2.1.0-, this worked
+    var le = {};
+    try {        
+        le = this.getLastErrorObj( replicatedTo, timeout || 30 * 1000 );
+        // printjson( le )
+    }
+    catch (e) {
+        errjson = tojson(e);
+        if ( errjson.indexOf( "login" ) >= 0 || errjson.indexOf( "unauthorized" ) >= 0 ) {
+            // TODO: this check is a hack
+            print( "addUser succeeded, but cannot wait for replication since we no longer have auth" );
+            return "";
+        }
+        print( "could not find getLastError object : " + tojson( e ) )
+    }
+
+    if (!le.err) {
+        return;
+    }
+
+    // We can't detect replica set shards via mongos, so we'll sometimes get this error
+    // In this case though, we've already checked the local error before returning norepl, so
+    // the user has been written and we're happy
+    if (le.err == "norepl" || le.err == "noreplset") {
+        // nothing we can do
+        return;
+    }
+
+    if (le.err == "timeout") {
+        throw "timed out while waiting for user authentication to replicate - " +
+              "database will not be fully secured until replication finishes"
+    }
+
+    if (le.err.startsWith("E11000 duplicate key error")) {
+        throw "User already exists with that username/userSource combination";
+    }
+
+    throw "couldn't add user: " + le.err;
+}
+
+DB.prototype._createUser = function(userObj, replicatedTo, timeout) {
+    var commandExisted = this._createUserWithCommand(userObj, replicatedTo, timeout);
+    if (!commandExisted) {
+        this._createUserWithInsert(userObj, replicatedTo, timeout);
+    }
+}
+
+// Returns true if it worked, false if the createUser command wasn't found, and throws on all other
+// failures
+DB.prototype._createUserWithCommand = function(userObj, replicatedTo, timeout) {
+    var name = userObj["user"];
+    var cmdObj = {createUser:name};
+    cmdObj = Object.extend(cmdObj, userObj);
+    delete cmdObj["user"];
+
+    replicatedTo = replicatedTo != null ? replicatedTo : "majority";
+    timeout = timeout || 30 * 1000;
+    cmdObj["writeConcern"] = { w: replicatedTo, wtimeout: timeout };
+
+    var res = this.runCommand(cmdObj);
+
+    if (res.ok) {
+        printUserObj(userObj);
+        return true;
+    }
+
+    if (res.errmsg == "no such cmd: createUser") {
+        return false;
+    }
+
+    // We can't detect replica set shards via mongos, so we'll sometimes get this error
+    // In this case though, we've already checked the local error before returning norepl, so
+    // the user has been written and we're happy
+    if (res.errmsg == "norepl" || res.errmsg == "noreplset") {
+        // nothing we can do
+        return true;
+    }
+
+    if (res.errmsg == "timeout") {
+        throw Error("timed out while waiting for user authentication to replicate - " +
+                    "database will not be fully secured until replication finishes");
+    }
+
+    throw Error("couldn't add user: " + res.errmsg);
+}
+
+function _hashPassword(username, password) {
+    return hex_md5(username + ":mongo:" + password);
+}
+
+// We need to continue to support the addUser(username, password, readOnly) form of addUser for at
+// least one release, even though its behavior of creating a super-user by default is bad.
+// TODO(spencer): remove this form from v2.8
+DB.prototype._createUserDeprecatedV22Version = function(username, pass, readOnly, replicatedTo, timeout) {
+    print("WARNING: This form of the addUser shell helper (that takes username, password, " +
+          "and readOnly boolean) is DEPRECATED. Use the form that takes a user object instead");
+
+    if ( pass == null || pass.length == 0 )
+        throw "password can't be empty";
+
+    var userObjForCommand = { user: username, pwd: pass };
+    if (this.getName() == "admin") {
+        if (readOnly) {
+            userObjForCommand["roles"] = ['readAnyDatabase'];
+        } else {
+            userObjForCommand["roles"] = ['root'];
+        }
+    } else {
+        if (readOnly) {
+            userObjForCommand["roles"] = ['read'];
+        } else {
+            userObjForCommand["roles"] = ['dbOwner'];
+        }
+    }
+
+    var commandExisted = this._createUserWithCommand(userObjForCommand, replicatedTo, timeout);
+    if (!commandExisted) {
+        var userObjForInsert = { user: username, pwd: pass, readOnly: readOnly || false };
+        this._createUserWithInsert(userObjForInsert, replicatedTo, timeout);
+    }
+}
+
+// TODO(spencer): properly handle write concern objects in addUser
+DB.prototype.addUser = function() {
+    if (arguments.length == 0) {
+        throw Error("No arguments provided to addUser");
+    }
+
+    if (typeof arguments[0] == "object") {
+        this._createUser.apply(this, arguments);
+    } else {
+        this._createUserDeprecatedV22Version.apply(this, arguments);
+    }
+}
+
+/**
+ * Used for updating users in systems with V1 style user information
+ * (ie MongoDB v2.4 and prior)
+ */
+DB.prototype._updateUserV1 = function(name, updateObject, writeConcern) {
+    var setObj = {};
+    if (updateObject.pwd) {
+        setObj["pwd"] = _hashPassword(name, updateObject.pwd);
+    }
+    if (updateObject.extraData) {
+        setObj["extraData"] = updateObject.extraData;
+    }
+    if (updateObject.roles) {
+        setObj["roles"] = updateObject.roles;
+    }
+
+    db.system.users.update({user : name, userSource : null},
+                           {$set : setObj});
+    var err = db.getLastError(writeConcern['w'], writeConcern['wtimeout']);
+    if (err) {
+        throw Error("Updating user failed: " + err);
+    }
+};
+
+DB.prototype.updateUser = function(name, updateObject, writeConcern) {
+    var cmdObj = {updateUser:name};
+    cmdObj = Object.extend(cmdObj, updateObject);
+    cmdObj['writeConcern'] =  writeConcern ? writeConcern : _defaultWriteConcern;
+    var res = this.runCommand(cmdObj);
+    if (res.ok) {
+        return;
+    }
+
+    if (res.errmsg == "no such cmd: updateUser") {
+        this._updateUserV1(name, updateObject, cmdObj['writeConcern']);
+        return;
+    }
+
+    if (res.errmsg == "noreplset") {
+        // nothing we can do
+        return;
+    }
+
+    throw Error("Updating user failed: " + res.errmsg);
+};
+
+DB.prototype.changeUserPassword = function(username, password, writeConcern) {
+    this.updateUser(username, {pwd:password}, writeConcern);
+};
+
+DB.prototype.logout = function(){
+    return this.getMongo().logout(this.getName());
+};
+
+// For backwards compatibility
+DB.prototype.removeUser = function( username, writeConcern ) {
+    print("WARNING: db.removeUser has been deprected, please use db.dropUser instead");
+    return db.dropUser(username, writeConcern);
+}
+
+DB.prototype.dropUser = function( username, writeConcern ){
+    var cmdObj = {dropUser: username,
+                  writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
+    var res = this.runCommand(cmdObj);
+
+    if (res.ok) {
+        return true;
+    }
+
+    if (res.code == 11) { // Code 11 = UserNotFound
+        return false;
+    }
+
+    if (res.errmsg == "no such cmd: dropUsers") {
+        return this._removeUserV1(username, cmdObj['writeConcern']);
+    }
+
+    throw Error(res.errmsg);
+}
+
+/**
+ * Used for removing users in systems with V1 style user information
+ * (ie MongoDB v2.4 and prior)
+ */
+DB.prototype._removeUserV1 = function(username, writeConcern) {
+    this.getCollection( "system.users" ).remove( { user : username } );
+
+    var le = db.getLastErrorObj(writeConcern['w'], writeConcern['wtimeout']);
+
+    if (le.err) {
+        throw "Couldn't remove user: " + le.err;
+    }
+
+    if (le.n == 1) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+DB.prototype.dropAllUsers = function(writeConcern) {
+    var res = this.runCommand({dropUsersFromDatabase:1,
+                               writeConcern: writeConcern ? writeConcern : _defaultWriteConcern});
+
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+
+    return res.n;
+}
+
+DB.prototype.__pwHash = function( nonce, username, pass ) {
+    return hex_md5(nonce + username + _hashPassword(username, pass));
+}
+
+DB.prototype._defaultAuthenticationMechanism = "MONGODB-CR";
+
+DB.prototype._authOrThrow = function () {
+    var params;
+    if (arguments.length == 2) {
+        params = { user: arguments[0], pwd: arguments[1] };
+    }
+    else if (arguments.length == 1) {
+        if (typeof(arguments[0]) != "object")
+            throw Error("Single-argument form of auth expects a parameter object");
+        params = arguments[0];
+    }
+    else {
+        throw Error(
+            "auth expects either (username, password) or ({ user: username, pwd: password })");
+    }
+
+    if (params.mechanism === undefined)
+        params.mechanism = this._defaultAuthenticationMechanism;
+
+    if (params.userSource !== undefined) {
+        throw Error("Do not override userSource field on db.auth().  " +
+                    "Use getMongo().auth(), instead.");
+    }
+
+    params.userSource = this.getName();
+    var good = this.getMongo().auth(params);
+    if (good) {
+        // auth enabled, and should try to use isMaster and replSetGetStatus to build prompt
+        this.getMongo().authStatus = {authRequired:true, isMaster:true, replSetGetStatus:true};
+    }
+
+    return good;
+}
+
+
+DB.prototype.auth = function() {
+    var ex;
+    try {
+        this._authOrThrow.apply(this, arguments);
+    } catch (ex) {
+        print(ex);
+        return 0;
+    }
+    return 1;
+}
+
+DB.prototype.grantRolesToUser = function(username, roles, writeConcern) {
+    var cmdObj = {grantRolesToUser: username,
+                  roles: roles,
+                  writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
+    var res = this.runCommand(cmdObj);
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+}
+
+DB.prototype.revokeRolesFromUser = function(username, roles, writeConcern) {
+    var cmdObj = {revokeRolesFromUser: username,
+                  roles: roles,
+                  writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
+    var res = this.runCommand(cmdObj);
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+}
+
+DB.prototype.getUser = function(username) {
+    if (typeof username != "string") {
+        throw Error("User name for getUser shell helper must be a string");
+    }
+    var res = this.runCommand({usersInfo: username});
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+
+    if (res.users.length == 0) {
+        throw Error("User " + username + "@" + db.getName() + " not found");
+    }
+    return res.users[0];
+}
+
+DB.prototype.getUsers = function() {
+    var res = this.runCommand({usersInfo: 1});
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+
+    return res.users;
+}
+
+DB.prototype.addRole = function(roleObj, writeConcern) {
+    var name = roleObj["role"];
+    var cmdObj = {createRole:name};
+    cmdObj = Object.extend(cmdObj, roleObj);
+    delete cmdObj["role"];
+    cmdObj["writeConcern"] = writeConcern ? writeConcern : _defaultWriteConcern;
+
+    var res = this.runCommand(cmdObj);
+
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+    printjson(roleObj);
+}
+
+DB.prototype.updateRole = function(name, updateObject, writeConcern) {
+    var cmdObj = {updateRole:name};
+    cmdObj = Object.extend(cmdObj, updateObject);
+    cmdObj['writeConcern'] =  writeConcern ? writeConcern : _defaultWriteConcern;
+    var res = this.runCommand(cmdObj);
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+};
+
+DB.prototype.dropRole = function(name, writeConcern) {
+    var cmdObj = {dropRole:name,
+                  writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
+    var res = this.runCommand(cmdObj);
+
+    if (res.ok) {
+        return true;
+    }
+
+    if (res.code == 31) { // Code 31 = RoleNotFound
+        return false;
+    }
+
+    throw Error(res.errmsg);
+};
+
+DB.prototype.dropAllRoles = function(writeConcern) {
+    var res = this.runCommand({dropRolesFromDatabase:1,
+                               writeConcern: writeConcern ? writeConcern : _defaultWriteConcern});
+
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+
+    return res.n;
+}
+
+DB.prototype.grantRolesToRole = function(rolename, roles, writeConcern) {
+    var cmdObj = {grantRolesToRole: rolename,
+                  grantedRoles: roles,
+                  writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
+    var res = this.runCommand(cmdObj);
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+}
+
+DB.prototype.revokeRolesFromRole = function(rolename, roles, writeConcern) {
+    var cmdObj = {revokeRolesFromRole: rolename,
+                  revokedRoles: roles,
+                  writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
+    var res = this.runCommand(cmdObj);
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+}
+
+DB.prototype.grantPrivilegesToRole = function(rolename, privileges, writeConcern) {
+    var cmdObj = {grantPrivilegesToRole: rolename,
+                  privileges: privileges,
+                  writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
+    var res = this.runCommand(cmdObj);
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+}
+
+DB.prototype.revokePrivilegesFromRole = function(rolename, privileges, writeConcern) {
+    var cmdObj = {revokePrivilegesFromRole: rolename,
+                  privileges: privileges,
+                  writeConcern: writeConcern ? writeConcern : _defaultWriteConcern};
+    var res = this.runCommand(cmdObj);
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+}
+
+DB.prototype.getRole = function(rolename) {
+    if (typeof rolename != "string") {
+        throw Error("Role name for getRole shell helper must be a string");
+    }
+    var res = this.runCommand({rolesInfo: rolename});
+    if (!res.ok) {
+        throw Error(res.errmsg);
+    }
+
+    if (res.roles.length == 0) {
+        throw Error("Role " + rolename + "@" + db.getName() + " not found");
+    }
+    return res.roles[0];
 }
 
 }());

@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -32,6 +44,7 @@
 #include <sys/types.h>
 
 #include "mongo/db/kill_current_op.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/platform/posix_fadvise.h"
 #include "mongo/util/file.h"
 
@@ -67,7 +80,9 @@ namespace mongo {
                                                  long maxFileSize)
         : _mayInterrupt(boost::make_shared<bool>(false))
         , _sorter(Sorter<BSONObj, DiskLoc>::make(
-                    SortOptions().ExtSortAllowed().MaxMemoryUsageBytes(maxFileSize),
+                    SortOptions().TempDir(storageGlobalParams.dbpath + "/_tmp")
+                                 .ExtSortAllowed()
+                                 .MaxMemoryUsageBytes(maxFileSize),
                     OldExtSortComparator(comp, _mayInterrupt)))
     {}
 }
@@ -112,8 +127,8 @@ namespace mongo {
           _sorted(0) {
 
         stringstream rootpath;
-        rootpath << dbpath;
-        if ( dbpath[dbpath.size()-1] != '/' )
+        rootpath << storageGlobalParams.dbpath;
+        if (storageGlobalParams.dbpath[storageGlobalParams.dbpath.size()-1] != '/')
             rootpath << "/";
 
         unsigned long long thisUniqueNumber;

@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include "mongo/s/collection_metadata.h"
@@ -27,9 +39,9 @@ namespace mongo {
 
     CollectionMetadata::~CollectionMetadata() { }
 
-    CollectionMetadata* CollectionMetadata::cloneMinusChunk( const ChunkType& chunk,
-                                                             const ChunkVersion& newShardVersion,
-                                                             string* errMsg ) const {
+    CollectionMetadata* CollectionMetadata::cloneMigrate( const ChunkType& chunk,
+                                                          const ChunkVersion& newShardVersion,
+                                                          string* errMsg ) const {
         // The error message string is optional.
         string dummy;
         if (errMsg == NULL) {
@@ -334,6 +346,88 @@ namespace mongo {
         return metadata.release();
     }
 
+    CollectionMetadata* CollectionMetadata::cloneMerge( const BSONObj& minKey,
+                                                        const BSONObj& maxKey,
+                                                        const ChunkVersion& newShardVersion,
+                                                        string* errMsg ) const {
+
+        if (newShardVersion <= _shardVersion) {
+
+            *errMsg = stream() << "cannot merge range " << rangeToString( minKey, maxKey )
+                               << ", new shard version " << newShardVersion.toString()
+                               << " is not greater than current version "
+                               << _shardVersion.toString();
+
+            warning() << *errMsg << endl;
+            return NULL;
+        }
+
+        RangeVector overlap;
+        getRangeMapOverlap( _chunksMap, minKey, maxKey, &overlap );
+
+        if ( overlap.empty() || overlap.size() == 1 ) {
+
+            *errMsg = stream() << "cannot merge range " << rangeToString( minKey, maxKey )
+                               << ( overlap.empty() ? ", no chunks found in this range" :
+                                                      ", only one chunk found in this range" );
+
+            warning() << *errMsg << endl;
+            return NULL;
+        }
+
+        bool validStartEnd = true;
+        bool validNoHoles = true;
+        if ( overlap.begin()->first.woCompare( minKey ) != 0 ) {
+            // First chunk doesn't start with minKey
+            validStartEnd = false;
+        }
+        else if ( overlap.rbegin()->second.woCompare( maxKey ) != 0 ) {
+            // Last chunk doesn't end with maxKey
+            validStartEnd = false;
+        }
+        else {
+            // Check that there are no holes
+            BSONObj prevMaxKey = minKey;
+            for ( RangeVector::iterator it = overlap.begin(); it != overlap.end(); ++it ) {
+                if ( it->first.woCompare( prevMaxKey ) != 0 ) {
+                    validNoHoles = false;
+                    break;
+                }
+                prevMaxKey = it->second;
+            }
+        }
+
+        if ( !validStartEnd || !validNoHoles ) {
+
+            *errMsg = stream() << "cannot merge range " << rangeToString( minKey, maxKey )
+                               << ", overlapping chunks " << overlapToString( overlap )
+                               << ( !validStartEnd ? " do not have the same min and max key" :
+                                                     " are not all adjacent" );
+
+            warning() << *errMsg << endl;
+            return NULL;
+        }
+
+        auto_ptr<CollectionMetadata> metadata( new CollectionMetadata );
+        metadata->_keyPattern = this->_keyPattern;
+        metadata->_keyPattern.getOwned();
+        metadata->_pendingMap = this->_pendingMap;
+        metadata->_chunksMap = this->_chunksMap;
+        metadata->_rangesMap = this->_rangesMap;
+        metadata->_shardVersion = newShardVersion;
+        metadata->_collVersion =
+                newShardVersion > _collVersion ? newShardVersion : this->_collVersion;
+
+        for ( RangeVector::iterator it = overlap.begin(); it != overlap.end(); ++it ) {
+            metadata->_chunksMap.erase( it->first );
+        }
+
+        metadata->_chunksMap.insert( make_pair( minKey, maxKey ) );
+
+        dassert(metadata->isValid());
+        return metadata.release();
+    }
+
     bool CollectionMetadata::keyBelongsToMe( const BSONObj& key ) const {
         // For now, collections don't move. So if the collection is not sharded, assume
         // the document with the given key can be accessed.
@@ -350,8 +444,9 @@ namespace mongo {
 
         bool good = rangeContains( it->first, it->second, key );
 
-#ifdef _DEBUG
-        // Logs if in debugging mode and the point doesn't belong here.
+#if 0
+        // DISABLED because of SERVER-11175 - huge amount of logging
+        // Logs if the point doesn't belong here.
         if ( !good ) {
             log() << "bad: " << key << " " << it->first << " " << key.woCompare( it->first ) << " "
                   << key.woCompare( it->second ) << endl;
@@ -382,28 +477,153 @@ namespace mongo {
         return isPending;
     }
 
-    bool CollectionMetadata::getNextChunk(const BSONObj& lookupKey,
-                                         ChunkType* chunk) const {
-        if (_chunksMap.empty()) {
+    bool CollectionMetadata::getNextChunk( const BSONObj& lookupKey, ChunkType* chunk ) const {
+
+        RangeMap::const_iterator upperChunkIt = _chunksMap.upper_bound( lookupKey );
+        RangeMap::const_iterator lowerChunkIt = upperChunkIt;
+        if ( upperChunkIt != _chunksMap.begin() ) --lowerChunkIt;
+        else lowerChunkIt = _chunksMap.end();
+
+        if ( lowerChunkIt != _chunksMap.end() &&
+             lowerChunkIt->second.woCompare( lookupKey ) > 0 ) {
+            chunk->setMin( lowerChunkIt->first );
+            chunk->setMax( lowerChunkIt->second );
             return true;
         }
 
-        RangeMap::const_iterator it;
-        if (lookupKey.isEmpty()) {
-            it = _chunksMap.begin();
-            chunk->setMin(it->first);
-            chunk->setMax(it->second);
-            return _chunksMap.size() == 1;
+        if ( upperChunkIt != _chunksMap.end() ) {
+            chunk->setMin( upperChunkIt->first );
+            chunk->setMax( upperChunkIt->second );
+            return true;
         }
 
-        it = _chunksMap.upper_bound(lookupKey);
-        if (it != _chunksMap.end()) {
-            chunk->setMin(it->first);
-            chunk->setMax(it->second);
-            return false;
+        return false;
+    }
+
+    BSONObj CollectionMetadata::toBSON() const {
+        BSONObjBuilder bb;
+        toBSON( bb );
+        return bb.obj();
+    }
+
+    void CollectionMetadata::toBSONChunks( BSONArrayBuilder& bb ) const {
+
+        if ( _chunksMap.empty() ) return;
+
+        for (RangeMap::const_iterator it = _chunksMap.begin(); it != _chunksMap.end(); ++it ) {
+            BSONArrayBuilder chunkBB( bb.subarrayStart() );
+            chunkBB.append( it->first );
+            chunkBB.append( it->second );
+            chunkBB.done();
+        }
+    }
+
+    void CollectionMetadata::toBSONPending( BSONArrayBuilder& bb ) const {
+
+        if ( _pendingMap.empty() ) return;
+
+        for (RangeMap::const_iterator it = _pendingMap.begin(); it != _pendingMap.end(); ++it ) {
+            BSONArrayBuilder pendingBB( bb.subarrayStart() );
+            pendingBB.append( it->first );
+            pendingBB.append( it->second );
+            pendingBB.done();
+        }
+    }
+
+    void CollectionMetadata::toBSON( BSONObjBuilder& bb ) const {
+
+        _collVersion.addToBSON( bb, "collVersion" );
+        _shardVersion.addToBSON( bb, "shardVersion" );
+        bb.append( "keyPattern", _keyPattern );
+
+        BSONArrayBuilder chunksBB( bb.subarrayStart( "chunks" ) );
+        toBSONChunks( chunksBB );
+        chunksBB.done();
+
+        BSONArrayBuilder pendingBB( bb.subarrayStart( "pending" ) );
+        toBSONPending( pendingBB );
+        pendingBB.done();
+    }
+
+    bool CollectionMetadata::getNextOrphanRange( const BSONObj& origLookupKey,
+                                                 KeyRange* range ) const {
+
+        if ( _keyPattern.isEmpty() ) return false;
+
+        BSONObj lookupKey = origLookupKey;
+        BSONObj maxKey = getMaxKey(); // so we don't keep rebuilding
+        while ( lookupKey.woCompare( maxKey ) < 0 ) {
+
+            RangeMap::const_iterator lowerChunkIt = _chunksMap.end();
+            RangeMap::const_iterator upperChunkIt = _chunksMap.end();
+
+            if ( !_chunksMap.empty() ) {
+                upperChunkIt = _chunksMap.upper_bound( lookupKey );
+                lowerChunkIt = upperChunkIt;
+                if ( upperChunkIt != _chunksMap.begin() ) --lowerChunkIt;
+                else lowerChunkIt = _chunksMap.end();
+            }
+
+            // If we overlap, continue after the overlap
+            // TODO: Could optimize slightly by finding next non-contiguous chunk
+            if ( lowerChunkIt != _chunksMap.end()
+                && lowerChunkIt->second.woCompare( lookupKey ) > 0 ) {
+                lookupKey = lowerChunkIt->second;
+                continue;
+            }
+
+            RangeMap::const_iterator lowerPendingIt = _pendingMap.end();
+            RangeMap::const_iterator upperPendingIt = _pendingMap.end();
+
+            if ( !_pendingMap.empty() ) {
+
+                upperPendingIt = _pendingMap.upper_bound( lookupKey );
+                lowerPendingIt = upperPendingIt;
+                if ( upperPendingIt != _pendingMap.begin() ) --lowerPendingIt;
+                else lowerPendingIt = _pendingMap.end();
+            }
+
+            // If we overlap, continue after the overlap
+            // TODO: Could optimize slightly by finding next non-contiguous chunk
+            if ( lowerPendingIt != _pendingMap.end()
+                && lowerPendingIt->second.woCompare( lookupKey ) > 0 ) {
+                lookupKey = lowerPendingIt->second;
+                continue;
+            }
+
+            //
+            // We know that the lookup key is not covered by a chunk or pending range, and where the
+            // previous chunk and pending chunks are.  Now we fill in the bounds as the closest
+            // bounds of the surrounding ranges in both maps.
+            //
+
+            range->minKey = getMinKey();
+            range->maxKey = maxKey;
+
+            if ( lowerChunkIt != _chunksMap.end()
+                && lowerChunkIt->second.woCompare( range->minKey ) > 0 ) {
+                range->minKey = lowerChunkIt->second;
+            }
+
+            if ( upperChunkIt != _chunksMap.end()
+                && upperChunkIt->first.woCompare( range->maxKey ) < 0 ) {
+                range->maxKey = upperChunkIt->first;
+            }
+
+            if ( lowerPendingIt != _pendingMap.end()
+                && lowerPendingIt->second.woCompare( range->minKey ) > 0 ) {
+                range->minKey = lowerPendingIt->second;
+            }
+
+            if ( upperPendingIt != _pendingMap.end()
+                && upperPendingIt->first.woCompare( range->maxKey ) < 0 ) {
+                range->maxKey = upperPendingIt->first;
+            }
+
+            return true;
         }
 
-        return true;
+        return false;
     }
 
     string CollectionMetadata::toString() const {
@@ -421,15 +641,35 @@ namespace mongo {
         return ss.str();
     }
 
+    BSONObj CollectionMetadata::getMinKey() const {
+        BSONObjIterator it( _keyPattern );
+        BSONObjBuilder minKeyB;
+        while ( it.more() ) minKeyB << it.next().fieldName() << MINKEY;
+        return minKeyB.obj();
+    }
+
+    BSONObj CollectionMetadata::getMaxKey() const {
+        BSONObjIterator it( _keyPattern );
+        BSONObjBuilder maxKeyB;
+        while ( it.more() ) maxKeyB << it.next().fieldName() << MAXKEY;
+        return maxKeyB.obj();
+    }
+
     bool CollectionMetadata::isValid() const {
-        if (_shardVersion > _collVersion) {
-            return false;
-        }
-
-        if (_collVersion.majorVersion() == 0)
-            return false;
-
+        if ( _shardVersion > _collVersion ) return false;
+        if ( _collVersion.majorVersion() == 0 ) return false;
+        if ( _collVersion.epoch() != _shardVersion.epoch() ) return false;
         return true;
+    }
+
+    bool CollectionMetadata::isValidKey( const BSONObj& key ) const {
+        BSONObjIterator it( _keyPattern );
+        BSONObjBuilder maxKeyB;
+        while ( it.more() ) {
+            BSONElement next = it.next();
+            if ( !key.hasField( next.fieldName() ) ) return false;
+        }
+        return key.nFields() == _keyPattern.nFields();
     }
 
     void CollectionMetadata::fillRanges() {
@@ -464,22 +704,6 @@ namespace mongo {
         dassert(!min.isEmpty());
 
         _rangesMap.insert(make_pair(min, max));
-    }
-
-    string CollectionMetadata::rangeToString( const BSONObj& inclusiveLower,
-                                              const BSONObj& exclusiveUpper ) const {
-        stringstream ss;
-        ss << "[" << inclusiveLower.toString() << ", " << exclusiveUpper.toString() << ")";
-        return ss.str();
-    }
-
-    string CollectionMetadata::overlapToString( RangeVector overlap ) const {
-        stringstream ss;
-        for ( RangeVector::const_iterator it = overlap.begin(); it != overlap.end(); ++it ) {
-            if ( it != overlap.begin() ) ss << ", ";
-            ss << rangeToString( it->first, it->second );
-        }
-        return ss.str();
     }
 
 } // namespace mongo

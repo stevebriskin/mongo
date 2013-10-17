@@ -1,3 +1,4 @@
+// DEPRECATED
 /*    Copyright 2009 10gen Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,9 +66,8 @@ namespace mongo {
         const BSONObj& getOrder() const { return _order; }
         const BSONObj& getHint() const { return _hint; }
         int getMaxScan() const { return _maxScan; }
-        
-        bool couldBeCommand() const;
-        
+        int getMaxTimeMS() const { return _maxTimeMS; }
+
         bool hasIndexSpecifier() const;
         
         /* if ntoreturn is zero, we return up to 101 objects.  on the subsequent getmore, there
@@ -109,6 +109,7 @@ namespace mongo {
         BSONObj _max;
         BSONObj _hint;
         int _maxScan;
+        int _maxTimeMS;
     };
 
 } // namespace mongo

@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/matcher/expression_parser.h"
@@ -55,10 +67,6 @@ namespace mongo {
 
         if ( mongoutils::str::equals( "$not", e.fieldName() ) ) {
             return _parseNot( name, e );
-        }
-
-        if ( mongoutils::str::equals( "$geoIntersects", e.fieldName() ) ) {
-            return expressionParserGeoCallback( name, context );
         }
 
         int x = e.getGtLtOp(-1);
@@ -208,8 +216,8 @@ namespace mongo {
             return _parseAll( name, e );
 
         case BSONObj::opWITHIN:
-            return expressionParserGeoCallback( name, context );
-
+        case BSONObj::opGEO_INTERSECTS:
+            return expressionParserGeoCallback( name, x, context );
         }
 
         return StatusWithMatchExpression( ErrorCodes::BadValue,
@@ -277,6 +285,17 @@ namespace mongo {
                         return s;
                     root->add( s.getValue() );
                 }
+                else if ( mongoutils::str::equals( "text", rest ) ) {
+                    if ( e.type() != Object ) {
+                        return StatusWithMatchExpression( ErrorCodes::BadValue,
+                                                          "$text expects an object" );
+                    }
+                    StatusWithMatchExpression s = expressionParserTextCallback( e.Obj() );
+                    if ( !s.isOK() ) {
+                        return s;
+                    }
+                    root->add( s.getValue() );
+                }
                 else if ( mongoutils::str::equals( "comment", rest ) ) {
                 }
                 else {
@@ -324,6 +343,36 @@ namespace mongo {
     Status MatchExpressionParser::_parseSub( const char* name,
                                              const BSONObj& sub,
                                              AndMatchExpression* root ) {
+        // The one exception to {field : {fully contained argument} } is, of course, geo.  Example:
+        // sub == { field : {$near[Sphere]: [0,0], $maxDistance: 1000, $minDistance: 10 } }
+        // We peek inside of 'sub' to see if it's possibly a $near.  If so, we can't iterate over
+        // its subfields and parse them one at a time (there is no $maxDistance without $near), so
+        // we hand the entire object over to the geo parsing routines.
+
+        BSONObjIterator geoIt(sub);
+        if (geoIt.more()) {
+            BSONElement firstElt = geoIt.next();
+            if (firstElt.isABSONObj()) {
+                const char* fieldName = firstElt.fieldName();
+                // TODO: Having these $fields here isn't ideal but we don't want to pull in anything
+                // from db/geo at this point, since it may not actually be linked in...
+                if (mongoutils::str::equals(fieldName, "$near")
+                    || mongoutils::str::equals(fieldName, "$nearSphere")
+                    || mongoutils::str::equals(fieldName, "$geoNear")
+                    || mongoutils::str::equals(fieldName, "$maxDistance")
+                    || mongoutils::str::equals(fieldName, "$minDistance")) {
+
+                    StatusWithMatchExpression s = expressionParserGeoCallback(name,
+                                                                              firstElt.getGtLtOp(),
+                                                                              sub);
+                    if (s.isOK()) {
+                        root->add(s.getValue());
+                        return Status::OK();
+                    }
+                }
+            }
+        }
+
         BSONObjIterator j( sub );
         while ( j.more() ) {
             BSONElement deep = j.next();
@@ -416,6 +465,7 @@ namespace mongo {
                 }
                 else if ( e.type() == RegEx ) {
                     regex = e.regex();
+                    regexOptions = e.regexFlags();
                 }
                 else {
                     return StatusWithMatchExpression( ErrorCodes::BadValue,
@@ -528,15 +578,15 @@ namespace mongo {
 
             BSONObjIterator i( arr );
             while ( i.more() ) {
-                BSONElement hopefullyElemMatchElemennt = i.next();
+                BSONElement hopefullyElemMatchElement = i.next();
 
-                if ( hopefullyElemMatchElemennt.type() != Object ) {
+                if ( hopefullyElemMatchElement.type() != Object ) {
                     // $all : [ { $elemMatch : ... }, 5 ]
                     return StatusWithMatchExpression( ErrorCodes::BadValue,
                                                  "$all/$elemMatch has to be consistent" );
                 }
 
-                BSONObj hopefullyElemMatchObj = hopefullyElemMatchElemennt.Obj();
+                BSONObj hopefullyElemMatchObj = hopefullyElemMatchElement.Obj();
                 if ( !mongoutils::str::equals( "$elemMatch",
                                                hopefullyElemMatchObj.firstElement().fieldName() ) ) {
                     // $all : [ { $elemMatch : ... }, { x : 5 } ]
@@ -584,18 +634,30 @@ namespace mongo {
         return StatusWithMatchExpression( myAnd.release() );
     }
 
+    // Geo
     StatusWithMatchExpression expressionParserGeoCallbackDefault( const char* name,
+                                                                  int type,
                                                                   const BSONObj& section ) {
         return StatusWithMatchExpression( ErrorCodes::BadValue, "geo not linked in" );
     }
 
-    MatchExpressionParserGeoCallback expressionParserGeoCallback = expressionParserGeoCallbackDefault;
+    MatchExpressionParserGeoCallback expressionParserGeoCallback =
+        expressionParserGeoCallbackDefault;
 
+    // Where
     StatusWithMatchExpression expressionParserWhereCallbackDefault(const BSONElement& where) {
         return StatusWithMatchExpression( ErrorCodes::BadValue, "$where not linked in" );
     }
 
-    MatchExpressionParserWhereCallback expressionParserWhereCallback = expressionParserWhereCallbackDefault;
+    MatchExpressionParserWhereCallback expressionParserWhereCallback =
+        expressionParserWhereCallbackDefault;
 
+    // Text
+    StatusWithMatchExpression expressionParserTextCallbackDefault( const BSONObj& queryObj ) {
+        return StatusWithMatchExpression( ErrorCodes::BadValue, "$text not linked in" );
+    }
+
+    MatchExpressionParserTextCallback expressionParserTextCallback =
+        expressionParserTextCallbackDefault;
 
 }

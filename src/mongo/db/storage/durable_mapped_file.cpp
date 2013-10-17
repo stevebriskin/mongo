@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 /* this module adds some of our layers atop memory mapped files - specifically our handling of private views & such
@@ -24,7 +36,6 @@
 
 #include "mongo/db/storage/durable_mapped_file.h"
 
-#include "mongo/db/cmdline.h"
 
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/dur.h"
@@ -37,7 +48,7 @@ using namespace mongoutils;
 namespace mongo {
 
     void DurableMappedFile::remapThePrivateView() {
-        verify( cmdLine.dur );
+        verify(storageGlobalParams.dur);
 
         // todo 1.9 : it turns out we require that we always remap to the same address.
         // so the remove / add isn't necessary and can be removed?
@@ -113,8 +124,6 @@ namespace mongo {
 
     PointerToDurableMappedFile privateViews;
 
-    extern string dbpath;
-
     // here so that it is precomputed...
     void DurableMappedFile::setPath(const std::string& f) {
         string suffix;
@@ -146,7 +155,7 @@ namespace mongo {
     bool DurableMappedFile::finishOpening() {
         LOG(3) << "mmf finishOpening " << (void*) _view_write << ' ' << filename() << " len:" << length() << endl;
         if( _view_write ) {
-            if( cmdLine.dur ) {
+            if (storageGlobalParams.dur) {
                 _view_private = createPrivateMap();
                 if( _view_private == 0 ) {
                     msgasserted(13636, str::stream() << "file " << filename() << " open/create failed in createPrivateMap (look in log for more information)");
@@ -180,7 +189,7 @@ namespace mongo {
         LOG(3) << "mmf close " << filename() << endl;
 
         if( view_write() /*actually was opened*/ ) {
-            if( cmdLine.dur ) {
+            if (storageGlobalParams.dur) {
                 dur::closingFileNotification();
             }
             /* todo: is it ok to close files if we are not globally locked exclusively?

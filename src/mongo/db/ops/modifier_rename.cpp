@@ -12,19 +12,33 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/modifier_rename.h"
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/mutable/document.h"
+#include "mongo/bson/mutable/algorithm.h"
 #include "mongo/db/ops/field_checker.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/db/ops/path_support.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    using mongoutils::str::stream;
+    namespace str = mongoutils::str;
 
     struct ModifierRename::PreparedState {
 
@@ -43,7 +57,7 @@ namespace mongo {
         mutablebson::Element fromElemFound;
 
         // Index in _fieldRef for which an Element exist in the document.
-        int32_t toIdxFound;
+        size_t toIdxFound;
 
         // Element to remove (in the destination position)
         mutablebson::Element toElemFound;
@@ -61,43 +75,42 @@ namespace mongo {
     ModifierRename::~ModifierRename() {
     }
 
-    Status ModifierRename::init(const BSONElement& modExpr) {
+    Status ModifierRename::init(const BSONElement& modExpr, const Options& opts) {
 
         if (modExpr.type() != String) {
-            return Status(ErrorCodes::BadValue, "rename 'to' field must be a string");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "The 'to' field for $rename must be a string: "
+                                        << modExpr);
         }
 
         // Extract the field names from the mod expression
+
         _fromFieldRef.parse(modExpr.fieldName());
+        // The 'from' field is checked with legacy so that we can rename away from malformed values.
+        Status status = fieldchecker::isUpdatableLegacy(_fromFieldRef);
+        if (!status.isOK())
+            return status;
+
         _toFieldRef.parse(modExpr.String());
-
-        for (int i = 0; i < 2; i++) {
-
-            // 0 - to field, 1 - from field
-            const FieldRef& field = i ? _fromFieldRef : _toFieldRef;
-
-            size_t numParts = field.numParts();
-            if (numParts == 0) {
-                return Status(ErrorCodes::BadValue, "empty field name");
-            }
-
-            // Not all well-formed fields can be updated. For instance, '_id' can't be touched.
-            Status status = fieldchecker::isUpdatable(field);
-            if (! status.isOK()) {
-                return status;
-            }
-        }
+        // The 'to' field is checked normally so we can't create new malformed values.
+        status = fieldchecker::isUpdatable(_toFieldRef);
+        if (!status.isOK())
+            return status;
 
         // TODO: Remove this restriction and make a noOp to lift restriction
         // Old restriction is that if the fields are the same then it is not allowed.
         if (_fromFieldRef == _toFieldRef)
-            return Status(ErrorCodes::BadValue, "$rename source must differ from target");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "The source and target field for $rename must differ: "
+                                        << modExpr);
 
         // TODO: Remove this restriction by allowing moving deeping from the 'from' path
         // Old restriction is that if the to/from is on the same path it fails
         if (_fromFieldRef.isPrefixOf(_toFieldRef) || _toFieldRef.isPrefixOf(_fromFieldRef)){
             return Status(ErrorCodes::BadValue,
-                          "$rename source/destination cannot be on the same path");
+                          str::stream() << "The source and target field for $rename must "
+                                           "not be on the same path: "
+                                        << modExpr);
         }
         // TODO: We can remove this restriction as long as there is only one,
         //       or it is the same array -- should think on this a bit.
@@ -105,9 +118,13 @@ namespace mongo {
         // If a $-positional operator was used it is an error
         size_t dummyPos;
         if (fieldchecker::isPositional(_fromFieldRef, &dummyPos))
-            return Status(ErrorCodes::BadValue, "$rename source may not be dynamic array");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "The source field for $rename may not be dynamic: "
+                                        << _fromFieldRef.dottedField());
         else if (fieldchecker::isPositional(_toFieldRef, &dummyPos))
-            return Status(ErrorCodes::BadValue, "$rename target may not be dynamic array");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "The destination field for $rename may not be dynamic: "
+                                        << _toFieldRef.dottedField());
 
         return Status::OK();
     }
@@ -121,7 +138,7 @@ namespace mongo {
         _preparedState.reset(new PreparedState(root));
 
         // Locate the to field name in 'root', which must exist.
-        int32_t fromIdxFound;
+        size_t fromIdxFound;
         Status status = pathsupport::findLongestPrefix(_fromFieldRef,
                                                        root,
                                                        &fromIdxFound,
@@ -129,7 +146,7 @@ namespace mongo {
 
         // If we can't find the full element in the from field then we can't do anything.
         if (!status.isOK()) {
-            execInfo->inPlace = execInfo->noOp = true;
+            execInfo->noOp = true;
             _preparedState->fromElemFound = root.getDocument().end();
 
             // TODO: remove this special case from existing behavior
@@ -144,7 +161,11 @@ namespace mongo {
         mutablebson::Element curr = _preparedState->fromElemFound.parent();
         while (curr.ok()) {
             if (curr.getType() == Array)
-                return Status(ErrorCodes::BadValue, "source field cannot come from an array");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The source field cannot be an array element, '"
+                              << _fromFieldRef.dottedField() << "' in doc with "
+                              << findElementNamed(root.leftChild(), "_id").toString()
+                              << " has an array field called '" << curr.getFieldName() << "'");
             curr = curr.parent();
         }
 
@@ -173,7 +194,10 @@ namespace mongo {
         while (curr.ok()) {
             if (curr.getType() == Array)
                 return Status(ErrorCodes::BadValue,
-                              "destination field cannot have an array ancestor");
+                              str::stream() << "The destination field cannot be an array element, '"
+                              << _fromFieldRef.dottedField() << "' in doc with "
+                              << findElementNamed(root.leftChild(), "_id").toString()
+                              << " has an array field called '" << curr.getFieldName() << "'");
             curr = curr.parent();
         }
 
@@ -182,7 +206,7 @@ namespace mongo {
         execInfo->fieldRef[0] = &_fromFieldRef;
         execInfo->fieldRef[1] = &_toFieldRef;
 
-        execInfo->inPlace = execInfo->noOp = false;
+        execInfo->noOp = false;
 
         return Status::OK();
     }
@@ -201,8 +225,7 @@ namespace mongo {
         // If there's no need to create any further field part, the op is simply a value
         // assignment.
         const bool destExists = _preparedState->toElemFound.ok() &&
-                                (_preparedState->toIdxFound ==
-                                        static_cast<int32_t>(_toFieldRef.numParts()-1));
+                                (_preparedState->toIdxFound == (_toFieldRef.numParts()-1));
 
         if (destExists) {
             removeStatus = _preparedState->toElemFound.remove();
@@ -224,7 +247,7 @@ namespace mongo {
         // Find the new place to put the "to" element:
         // createPathAt does not use existing prefix elements so we
         // need to get the prefix match position for createPathAt below
-        int32_t tempIdx = 0;
+        size_t tempIdx = 0;
         mutablebson::Element tempElem = doc.end();
         Status status = pathsupport::findLongestPrefix(_toFieldRef,
                                                        doc.root(),
@@ -238,7 +261,7 @@ namespace mongo {
                                          elemToSet);
     }
 
-    Status ModifierRename::log(mutablebson::Element logRoot) const {
+    Status ModifierRename::log(LogBuilder* logBuilder) const {
 
         // If there was no element found then it was a noop, so return immediately
         if (!_preparedState->fromElemFound.ok())
@@ -248,73 +271,45 @@ namespace mongo {
         dassert(_preparedState->applyCalled);
 
         const bool isPrefix = _fromFieldRef.isPrefixOf(_toFieldRef);
-        const string setPath = (isPrefix ? _fromFieldRef : _toFieldRef).dottedField();
-        const string unsetPath = isPrefix ? "" : _fromFieldRef.dottedField();
+        const StringData setPath =
+            (isPrefix ? _fromFieldRef : _toFieldRef).dottedField();
+        const StringData unsetPath =
+            isPrefix ? StringData() : _fromFieldRef.dottedField();
         const bool doUnset = !isPrefix;
 
         // We'd like to create an entry such as {$set: {<fieldname>: <value>}} under 'logRoot'.
         // We start by creating the {$set: ...} Element.
-        mutablebson::Document& doc = logRoot.getDocument();
+        mutablebson::Document& doc = logBuilder->getDocument();
 
-        // Create $set
-        mutablebson::Element setElement = doc.makeElementObject("$set");
-        if (!setElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot create log entry for $set mod");
-        }
-
-        // Then we create the {<fieldname>: <value>} Element. Note that we log the mod with a
+        // Create the {<fieldname>: <value>} Element. Note that we log the mod with a
         // dotted field, if it was applied over a dotted field. The rationale is that the
         // secondary may be in a different state than the primary and thus make different
         // decisions about creating the intermediate path in _fieldRef or not.
-        mutablebson::Element logElement
-             = doc.makeElementWithNewFieldName( setPath, _preparedState->fromElemFound.getValue());
+        mutablebson::Element logElement = doc.makeElementWithNewFieldName(
+            setPath, _preparedState->fromElemFound.getValue());
+
         if (!logElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot create details for $set mod");
+            return Status(ErrorCodes::InternalError, "cannot create details for $rename mod");
         }
 
-        // Now, we attach the {<fieldname>: <value>} Element under the {$set: ...} one.
-        Status status = setElement.pushBack(logElement);
-        if (!status.isOK()) {
-            return status;
-        }
+        // Now, we attach the {<fieldname>: <value>} Element under the {$set: ...} section.
+        Status status = logBuilder->addToSets(logElement);
 
-        mutablebson::Element unsetElement = doc.end();
-        if (doUnset) {
-            // Create $unset
-            unsetElement = doc.makeElementObject("$unset");
-            if (!setElement.ok()) {
-                return Status(ErrorCodes::InternalError, "cannot create log entry for $unset mod");
-            }
-
-            // Then we create the {<fieldname>: <value>} Element. Note that we log the mod with a
+        if (status.isOK() && doUnset) {
+            // Create the {<fieldname>: <value>} Element. Note that we log the mod with a
             // dotted field, if it was applied over a dotted field. The rationale is that the
             // secondary may be in a different state than the primary and thus make different
             // decisions about creating the intermediate path in _fieldRef or not.
             mutablebson::Element unsetEntry = doc.makeElementBool(unsetPath, true);
             if (!unsetEntry.ok()) {
-                return Status(ErrorCodes::InternalError, "cannot create details for $unset mod");
+                return Status(ErrorCodes::InternalError, "cannot create details for $rename mod");
             }
 
-            // Now, we attach the {<fieldname>: <value>} Element under the {$set: ...} one.
-            status = unsetElement.pushBack(unsetEntry);
-            if (!status.isOK()) {
-                return status;
-            }
-
+            // Now, we attach the Element under the {$unset: ...} section.
+            status = logBuilder->addToUnsets(unsetEntry);
         }
 
-        // And attach the result under the 'logRoot' Element provided.
-        status = logRoot.pushBack(setElement);
-        if (!status.isOK())
-            return status;
-
-        if (doUnset) {
-            status = logRoot.pushBack(unsetElement);
-            if (!status.isOK())
-                return status;
-        }
-
-        return Status::OK();
+        return status;
     }
 
 } // namespace mongo

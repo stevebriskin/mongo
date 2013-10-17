@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/index/s2_access_method.h"
@@ -20,16 +32,13 @@
 
 #include "mongo/base/status.h"
 #include "mongo/db/geo/geoparser.h"
+#include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/s2common.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index/s2_index_cursor.h"
 #include "mongo/db/jsobj.h"
 
 namespace mongo {
-
-    // Thanks, Wikipedia.
-    const double S2IndexingParams::kRadiusOfEarthInMeters = (6378.1 * 1000);
-
     static int configValueWithDefault(IndexDescriptor *desc, const string& name, int def) {
         BSONElement e = desc->getInfoElement(name);
         if (e.isNumber()) { return e.numberInt(); }
@@ -44,7 +53,7 @@ namespace mongo {
         // This is advisory.
         _params.maxCellsInCovering = 50;
         // Near distances are specified in meters...sometimes.
-        _params.radius = S2IndexingParams::kRadiusOfEarthInMeters;
+        _params.radius = kRadiusOfEarthInMeters;
         // These are not advisory.
         _params.finestIndexedLevel = configValueWithDefault(descriptor, "finestIndexedLevel",
             S2::kAvgEdge.GetClosestLevel(500.0 / _params.radius));
@@ -98,7 +107,7 @@ namespace mongo {
                 // We can't ever return documents that don't have geometry so don't bother indexing
                 // them.
                 if (fieldElements.empty()) { return; }
-                getGeoKeys(fieldElements, &keysForThisField);
+                getGeoKeys(obj, fieldElements, &keysForThisField);
             } else {
                 getLiteralKeys(fieldElements, &keysForThisField);
             }
@@ -139,19 +148,20 @@ namespace mongo {
     }
 
     // Get the index keys for elements that are GeoJSON.
-    void S2AccessMethod::getGeoKeys(const BSONElementSet& elements, BSONObjSet* out) const {
+    void S2AccessMethod::getGeoKeys(const BSONObj& document, const BSONElementSet& elements,
+                                    BSONObjSet* out) const {
         for (BSONElementSet::iterator i = elements.begin(); i != elements.end(); ++i) {
             uassert(16754, "Can't parse geometry from element: " + i->toString(),
                     i->isABSONObj());
-            const BSONObj &obj = i->Obj();
+            const BSONObj &geoObj = i->Obj();
 
             vector<string> cells;
-            bool succeeded = S2SearchUtil::getKeysForObject(obj, _params, &cells);
-            uassert(16755, "Can't extract geo keys from object, malformed geometry?:"
-                           + obj.toString(), succeeded);
+            bool succeeded = S2SearchUtil::getKeysForObject(geoObj, _params, &cells);
+            uassert(16755, "Can't extract geo keys from object, malformed geometry?: "
+                           + document.toString(), succeeded);
 
             uassert(16756, "Unable to generate keys for (likely malformed) geometry: "
-                    + obj.toString(),
+                    + document.toString(),
                     cells.size() > 0);
 
             for (vector<string>::const_iterator it = cells.begin(); it != cells.end(); ++it) {

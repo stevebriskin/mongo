@@ -12,20 +12,35 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
-#include <boost/algorithm/string.hpp>
-
 #include "pch.h"
+
 #include "db/pipeline/expression.h"
 
+#include <boost/algorithm/string.hpp>
+#include <boost/preprocessor/cat.hpp> // like the ## operator but works with __LINE__
 #include <cstdio>
-#include "db/jsobj.h"
-#include "db/pipeline/builder.h"
-#include "db/pipeline/document.h"
-#include "db/pipeline/expression_context.h"
-#include "db/pipeline/value.h"
-#include "util/mongoutils/str.h"
+
+#include "mongo/base/init.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/value.h"
+#include "mongo/util/string_map.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
     using namespace mongoutils;
@@ -95,10 +110,6 @@ namespace mongo {
 
     /* --------------------------- Expression ------------------------------ */
 
-    void Expression::toMatcherBson(BSONObjBuilder *pBuilder) const {
-        verify(false && "Expression::toMatcherBson()");
-    }
-
     Expression::ObjectCtx::ObjectCtx(int theOptions)
         : options(theOptions)
     {}
@@ -127,8 +138,7 @@ namespace mongo {
         return string(pPrefixedField + 1);
     }
 
-    intrusive_ptr<Expression> Expression::parseObject(
-        BSONElement *pBsonElement, ObjectCtx *pCtx) {
+    intrusive_ptr<Expression> Expression::parseObject(BSONObj obj, ObjectCtx *pCtx) {
         /*
           An object expression can take any of the following forms:
 
@@ -140,7 +150,6 @@ namespace mongo {
         intrusive_ptr<ExpressionObject> pExpressionObject; // alt result
         enum { UNKNOWN, NOTOPERATOR, OPERATOR } kind = UNKNOWN;
 
-        BSONObj obj(pBsonElement->Obj());
         if (obj.isEmpty())
             return ExpressionObject::create();
         BSONObjIterator iter(obj);
@@ -161,7 +170,7 @@ namespace mongo {
                 /* we've determined this "object" is an operator expression */
                 kind = OPERATOR;
 
-                pExpression = parseExpression(pFieldName, &fieldElement);
+                pExpression = parseExpression(fieldElement);
             }
             else {
                 uassert(15990, str::stream() << "this object is already an operator expression, and can't be used as a document expression (at '" <<
@@ -192,9 +201,9 @@ namespace mongo {
                         ObjectCtx oCtx(
                             (pCtx->documentOk() ? ObjectCtx::DOCUMENT_OK : 0)
                              | (pCtx->inclusionOk() ? ObjectCtx::INCLUSION_OK : 0));
-                        intrusive_ptr<Expression> pNested(
-                            parseObject(&fieldElement, &oCtx));
-                        pExpressionObject->addField(fieldName, pNested);
+                            
+                        pExpressionObject->addField(fieldName,
+                                                    parseObject(fieldElement.Obj(), &oCtx));
                         break;
                     }
                     case String: {
@@ -234,170 +243,70 @@ namespace mongo {
         return pExpression;
     }
 
+namespace {
+    typedef intrusive_ptr<Expression> (*ExpressionParser)(BSONElement);
+    StringMap<ExpressionParser> expressionParserMap;
+}
 
-    struct OpDesc {
-        const char *pName;
-        intrusive_ptr<ExpressionNary> (*pFactory)(void);
-
-        unsigned flag;
-        static const unsigned FIXED_COUNT = 0x0001;
-        static const unsigned OBJECT_ARG = 0x0002;
-
-        unsigned argCount;
-    };
-
-    static int OpDescCmp(const void *pL, const void *pR) {
-        return strcmp(((const OpDesc *)pL)->pName, ((const OpDesc *)pR)->pName);
+/** Registers an ExpressionParser so it can be called from parseExpression and friends.
+ *
+ *  As an example, if your expression looks like {"$foo": [1,2,3]} you would add this line:
+ *  REGISTER_EXPRESSION("$foo", ExpressionFoo::parse);
+ */
+#define REGISTER_EXPRESSION(key, parserFunc) \
+    MONGO_INITIALIZER(BOOST_PP_CAT(addToExpressionParserMap, __LINE__))(InitializerContext*) { \
+        /* prevent duplicate expressions */ \
+        StringMap<ExpressionParser>::const_iterator op = expressionParserMap.find(key); \
+        massert(17064, str::stream() << "Duplicate expression (" << key << ") detected at " \
+                                     << __FILE__ << ":" << __LINE__, \
+                op == expressionParserMap.end()); \
+        /* register expression */ \
+        expressionParserMap[key] = parserFunc; \
+        return Status::OK(); \
     }
 
-    /*
-      Keep these sorted alphabetically so we can bsearch() them using
-      OpDescCmp() above.
-    */
-    static const OpDesc OpTable[] = {
-        {"$add", ExpressionAdd::create, 0},
-        {"$and", ExpressionAnd::create, 0},
-        {"$cmp", ExpressionCompare::createCmp, OpDesc::FIXED_COUNT, 2},
-        {"$concat", ExpressionConcat::create, 0},
-        {"$cond", ExpressionCond::create, OpDesc::FIXED_COUNT, 3},
-        // $const handled specially in parseExpression
-        {"$dayOfMonth", ExpressionDayOfMonth::create, OpDesc::FIXED_COUNT, 1},
-        {"$dayOfWeek", ExpressionDayOfWeek::create, OpDesc::FIXED_COUNT, 1},
-        {"$dayOfYear", ExpressionDayOfYear::create, OpDesc::FIXED_COUNT, 1},
-        {"$divide", ExpressionDivide::create, OpDesc::FIXED_COUNT, 2},
-        {"$eq", ExpressionCompare::createEq, OpDesc::FIXED_COUNT, 2},
-        {"$gt", ExpressionCompare::createGt, OpDesc::FIXED_COUNT, 2},
-        {"$gte", ExpressionCompare::createGte, OpDesc::FIXED_COUNT, 2},
-        {"$hour", ExpressionHour::create, OpDesc::FIXED_COUNT, 1},
-        {"$ifNull", ExpressionIfNull::create, OpDesc::FIXED_COUNT, 2},
-        // $let handled specially in parseExpression
-        // $map handled specially in parseExpression
-        {"$lt", ExpressionCompare::createLt, OpDesc::FIXED_COUNT, 2},
-        {"$lte", ExpressionCompare::createLte, OpDesc::FIXED_COUNT, 2},
-        {"$millisecond", ExpressionMillisecond::create, OpDesc::FIXED_COUNT, 1},
-        {"$minute", ExpressionMinute::create, OpDesc::FIXED_COUNT, 1},
-        {"$mod", ExpressionMod::create, OpDesc::FIXED_COUNT, 2},
-        {"$month", ExpressionMonth::create, OpDesc::FIXED_COUNT, 1},
-        {"$multiply", ExpressionMultiply::create, 0},
-        {"$ne", ExpressionCompare::createNe, OpDesc::FIXED_COUNT, 2},
-        {"$not", ExpressionNot::create, OpDesc::FIXED_COUNT, 1},
-        {"$or", ExpressionOr::create, 0},
-        {"$second", ExpressionSecond::create, OpDesc::FIXED_COUNT, 1},
-        {"$strcasecmp", ExpressionStrcasecmp::create, OpDesc::FIXED_COUNT, 2},
-        {"$substr", ExpressionSubstr::create, OpDesc::FIXED_COUNT, 3},
-        {"$subtract", ExpressionSubtract::create, OpDesc::FIXED_COUNT, 2},
-        {"$toLower", ExpressionToLower::create, OpDesc::FIXED_COUNT, 1},
-        {"$toUpper", ExpressionToUpper::create, OpDesc::FIXED_COUNT, 1},
-        {"$week", ExpressionWeek::create, OpDesc::FIXED_COUNT, 1},
-        {"$year", ExpressionYear::create, OpDesc::FIXED_COUNT, 1},
-    };
-
-    static const size_t NOp = sizeof(OpTable)/sizeof(OpTable[0]);
-
-    intrusive_ptr<Expression> Expression::parseExpression(
-        const char *pOpName, BSONElement *pBsonElement) {
+    intrusive_ptr<Expression> Expression::parseExpression(BSONElement exprElement) {
         /* look for the specified operator */
-
-        if (str::equals(pOpName, "$const")) {
-            return ExpressionConstant::createFromBsonElement(pBsonElement);
-        }
-        else if (str::equals(pOpName, "$let")) {
-            return ExpressionLet::parse(*pBsonElement);
-        }
-        else if (str::equals(pOpName, "$map")) {
-            return ExpressionMap::parse(*pBsonElement);
-        }
-
-        OpDesc key;
-        key.pName = pOpName;
-        const OpDesc *pOp = (const OpDesc *)bsearch(
-                                &key, OpTable, NOp, sizeof(OpDesc), OpDescCmp);
-
-        uassert(15999, str::stream() << "invalid operator '" <<
-                pOpName << "'", pOp);
+        const char* opName = exprElement.fieldName();
+        StringMap<ExpressionParser>::const_iterator op = expressionParserMap.find(opName);
+        uassert(15999, str::stream() << "invalid operator '" << opName << "'",
+                op != expressionParserMap.end());
 
         /* make the expression node */
-        intrusive_ptr<ExpressionNary> pExpression((*pOp->pFactory)());
-
-        /* add the operands to the expression node */
-        BSONType elementType = pBsonElement->type();
-
-        if (pOp->flag & OpDesc::FIXED_COUNT) {
-            if (pOp->argCount > 1)
-                uassert(16019, str::stream() << "the " << pOp->pName <<
-                        " operator requires an array of " << pOp->argCount <<
-                        " operands", elementType == Array);
-        }
-
-        if (elementType == Object) {
-            /* the operator must be unary and accept an object argument */
-            uassert(16021, str::stream() << "the " << pOp->pName <<
-                    " operator does not accept an object as an operand",
-                    pOp->flag & OpDesc::OBJECT_ARG);
-
-            BSONObj objOperand(pBsonElement->Obj());
-            ObjectCtx oCtx(ObjectCtx::DOCUMENT_OK);
-            intrusive_ptr<Expression> pOperand(
-                Expression::parseObject(pBsonElement, &oCtx));
-            pExpression->addOperand(pOperand);
-        }
-        else if (elementType == Array) {
-            /* multiple operands - an n-ary operator */
-            vector<BSONElement> bsonArray(pBsonElement->Array());
-            const size_t n = bsonArray.size();
-
-            if (pOp->flag & OpDesc::FIXED_COUNT)
-                uassert(16020, str::stream() << "the " << pOp->pName <<
-                        " operator requires " << pOp->argCount <<
-                        " operand(s)", pOp->argCount == n);
-
-            for(size_t i = 0; i < n; ++i) {
-                BSONElement *pBsonOperand = &bsonArray[i];
-                intrusive_ptr<Expression> pOperand(
-                    Expression::parseOperand(pBsonOperand));
-                pExpression->addOperand(pOperand);
-            }
-        }
-        else {
-            /* assume it's an atomic operand */
-            if (pOp->flag & OpDesc::FIXED_COUNT)
-                uassert(16022, str::stream() << "the " << pOp->pName <<
-                        " operator requires an array of " << pOp->argCount <<
-                        " operands", pOp->argCount == 1);
-
-            intrusive_ptr<Expression> pOperand(
-                Expression::parseOperand(pBsonElement));
-            pExpression->addOperand(pOperand);
-        }
-
-        return pExpression;
+        return op->second(exprElement);
     }
 
-    intrusive_ptr<Expression> Expression::parseOperand(BSONElement *pBsonElement) {
-        BSONType type = pBsonElement->type();
+    Expression::ExpressionVector ExpressionNary::parseArguments(BSONElement exprElement) {
+        ExpressionVector out;
+        if (exprElement.type() == Array) {
+            BSONForEach(elem, exprElement.Obj()) {
+                out.push_back(Expression::parseOperand(elem));
+            }
+        }
+        else { // assume it's an atomic operand
+            out.push_back(Expression::parseOperand(exprElement));
+        }
 
-        if (type == String && pBsonElement->valuestr()[0] == '$') {
+        return out;
+    }
+
+    intrusive_ptr<Expression> Expression::parseOperand(BSONElement exprElement) {
+        BSONType type = exprElement.type();
+
+        if (type == String && exprElement.valuestr()[0] == '$') {
             /* if we got here, this is a field path expression */
-            return ExpressionFieldPath::parse(pBsonElement->str());
+            return ExpressionFieldPath::parse(exprElement.str());
         }
         else if (type == Object) {
             ObjectCtx oCtx(ObjectCtx::DOCUMENT_OK);
-            return Expression::parseObject(pBsonElement, &oCtx);
+            return Expression::parseObject(exprElement.Obj(), &oCtx);
         }
         else {
-            return ExpressionConstant::createFromBsonElement(pBsonElement);
+            return ExpressionConstant::parse(exprElement);
         }
     }
 
     /* ------------------------- ExpressionAdd ----------------------------- */
-
-    ExpressionAdd::~ExpressionAdd() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionAdd::create() {
-        intrusive_ptr<ExpressionAdd> pExpression(new ExpressionAdd());
-        return pExpression;
-    }
 
     Value ExpressionAdd::evaluateInternal(const Variables& vars) const {
 
@@ -460,27 +369,33 @@ namespace mongo {
         }
     }
 
+    REGISTER_EXPRESSION("$add", ExpressionAdd::parse);
     const char *ExpressionAdd::getOpName() const {
         return "$add";
     }
 
-    intrusive_ptr<ExpressionNary> (*ExpressionAdd::getFactory() const)() {
-        return ExpressionAdd::create;
+    /* ------------------------- ExpressionAllElementsTrue -------------------------- */
+
+    Value ExpressionAllElementsTrue::evaluateInternal(const Variables& vars) const {
+        const Value arr = vpOperand[0]->evaluateInternal(vars);
+        uassert(17040, str::stream() << getOpName() << "'s argument must be an array, but is "
+                                     << typeName(arr.getType()),
+                arr.getType() == Array);
+        const vector<Value>& array = arr.getArray();
+        for (vector<Value>::const_iterator it = array.begin(); it != array.end(); ++it) {
+            if (!it->coerceToBool()) {
+                return Value(false);
+            }
+        }
+        return Value(true);
+    }
+
+    REGISTER_EXPRESSION("$allElementsTrue", ExpressionAllElementsTrue::parse);
+    const char *ExpressionAllElementsTrue::getOpName() const {
+        return "$allElementsTrue";
     }
 
     /* ------------------------- ExpressionAnd ----------------------------- */
-
-    ExpressionAnd::~ExpressionAnd() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionAnd::create() {
-        intrusive_ptr<ExpressionNary> pExpression(new ExpressionAnd());
-        return pExpression;
-    }
-
-    ExpressionAnd::ExpressionAnd():
-        ExpressionNary() {
-    }
 
     intrusive_ptr<Expression> ExpressionAnd::optimize() {
         /* optimize the conjunction as much as possible */
@@ -550,30 +465,33 @@ namespace mongo {
         return Value(true);
     }
 
+    REGISTER_EXPRESSION("$and", ExpressionAnd::parse);
     const char *ExpressionAnd::getOpName() const {
         return "$and";
     }
 
-    void ExpressionAnd::toMatcherBson(BSONObjBuilder *pBuilder) const {
-        /*
-          There are two patterns we can handle:
-          (1) one or two comparisons on the same field: { a:{$gte:3, $lt:7} }
-          (2) multiple field comparisons: {a:7, b:{$lte:6}, c:2}
-            This can be recognized as a conjunction of a set of  range
-            expressions.  Direct equality is a degenerate range expression;
-            range expressions can be open-ended.
-        */
-        verify(false && "unimplemented");
+    /* ------------------------- ExpressionAnyElementTrue -------------------------- */
+
+    Value ExpressionAnyElementTrue::evaluateInternal(const Variables& vars) const {
+        const Value arr = vpOperand[0]->evaluateInternal(vars);
+        uassert(17041, str::stream() << getOpName() << "'s argument must be an array, but is "
+                                     << typeName(arr.getType()),
+                arr.getType() == Array);
+        const vector<Value>& array = arr.getArray();
+        for (vector<Value>::const_iterator it = array.begin(); it != array.end(); ++it) {
+            if (it->coerceToBool()) {
+                return Value(true);
+            }
+        }
+        return Value(false);
     }
 
-    intrusive_ptr<ExpressionNary> (*ExpressionAnd::getFactory() const)() {
-        return ExpressionAnd::create;
+    REGISTER_EXPRESSION("$anyElementTrue", ExpressionAnyElementTrue::parse);
+    const char *ExpressionAnyElementTrue::getOpName() const {
+        return "$anyElementTrue";
     }
 
     /* -------------------- ExpressionCoerceToBool ------------------------- */
-
-    ExpressionCoerceToBool::~ExpressionCoerceToBool() {
-    }
 
     intrusive_ptr<ExpressionCoerceToBool> ExpressionCoerceToBool::create(
         const intrusive_ptr<Expression> &pExpression) {
@@ -623,61 +541,45 @@ namespace mongo {
 
     /* ----------------------- ExpressionCompare --------------------------- */
 
-    ExpressionCompare::~ExpressionCompare() {
+    REGISTER_EXPRESSION("$cmp", ExpressionCompare::parse);
+    REGISTER_EXPRESSION("$eq", ExpressionCompare::parse);
+    REGISTER_EXPRESSION("$gt", ExpressionCompare::parse);
+    REGISTER_EXPRESSION("$gte", ExpressionCompare::parse);
+    REGISTER_EXPRESSION("$lt", ExpressionCompare::parse);
+    REGISTER_EXPRESSION("$lte", ExpressionCompare::parse);
+    REGISTER_EXPRESSION("$ne", ExpressionCompare::parse);
+    intrusive_ptr<Expression> ExpressionCompare::parse(BSONElement bsonExpr) {
+        const char* compTypeStr = bsonExpr.fieldName();
+        CmpOp op;
+        if (str::equals(compTypeStr, "$cmp")) {
+            op = CMP;
+        } else if (str::equals(compTypeStr, "$eq")) {
+            op = EQ;
+        } else if (str::equals(compTypeStr, "$gt")) {
+            op = GT;
+        } else if (str::equals(compTypeStr, "$gte")) {
+            op = GTE;
+        } else if (str::equals(compTypeStr, "$lt")) {
+            op = LT;
+        } else if (str::equals(compTypeStr, "$lte")) {
+            op = LTE;
+        } else if (str::equals(compTypeStr, "$ne")) {
+            op = NE;
+        } else {
+            msgasserted(17063,
+                        str::stream() << "ExpressionCompare got unexpected op: " << compTypeStr);
+        }
+
+        intrusive_ptr<ExpressionCompare> expr = new ExpressionCompare(op);
+        ExpressionVector args = parseArguments(bsonExpr);
+        expr->validateArguments(args);
+        expr->vpOperand = args;
+        return expr;
     }
 
-    intrusive_ptr<ExpressionNary> ExpressionCompare::createEq() {
-        intrusive_ptr<ExpressionCompare> pExpression(
-            new ExpressionCompare(EQ));
-        return pExpression;
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionCompare::createNe() {
-        intrusive_ptr<ExpressionCompare> pExpression(
-            new ExpressionCompare(NE));
-        return pExpression;
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionCompare::createGt() {
-        intrusive_ptr<ExpressionCompare> pExpression(
-            new ExpressionCompare(GT));
-        return pExpression;
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionCompare::createGte() {
-        intrusive_ptr<ExpressionCompare> pExpression(
-            new ExpressionCompare(GTE));
-        return pExpression;
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionCompare::createLt() {
-        intrusive_ptr<ExpressionCompare> pExpression(
-            new ExpressionCompare(LT));
-        return pExpression;
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionCompare::createLte() {
-        intrusive_ptr<ExpressionCompare> pExpression(
-            new ExpressionCompare(LTE));
-        return pExpression;
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionCompare::createCmp() {
-        intrusive_ptr<ExpressionCompare> pExpression(
-            new ExpressionCompare(CMP));
-        return pExpression;
-    }
-
-    ExpressionCompare::ExpressionCompare(CmpOp theCmpOp):
-        ExpressionNary(),
-        cmpOp(theCmpOp) {
-    }
-
-    void ExpressionCompare::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(2);
-        ExpressionNary::addOperand(pExpression);
-    }
+    ExpressionCompare::ExpressionCompare(CmpOp theCmpOp)
+        : cmpOp(theCmpOp)
+    {}
 
     /*
       Lookup table for truth value returns
@@ -698,64 +600,7 @@ namespace mongo {
         /* CMP */ { { false, false, false }, Expression::CMP, "$cmp" },
     };
 
-    intrusive_ptr<Expression> ExpressionCompare::optimize() {
-        /* first optimize the comparison operands */
-        intrusive_ptr<Expression> pE(ExpressionNary::optimize());
-
-        /*
-          If the result of optimization is no longer a comparison, there's
-          nothing more we can do.
-        */
-        ExpressionCompare *pCmp = dynamic_cast<ExpressionCompare *>(pE.get());
-        if (!pCmp)
-            return pE;
-
-        /* check to see if optimizing comparison operator is supported */
-        CmpOp newOp = pCmp->cmpOp;
-        // CMP and NE cannot use ExpressionFieldRange which is what this optimization uses
-        if (newOp == CMP || newOp == NE)
-            return pE;
-
-        /*
-          There's one localized optimization we recognize:  a comparison
-          between a field and a constant.  If we recognize that pattern,
-          replace it with an ExpressionFieldRange.
-
-          When looking for this pattern, note that the operands could appear
-          in any order.  If we need to reverse the sense of the comparison to
-          put it into the required canonical form, do so.
-         */
-        intrusive_ptr<Expression> pLeft(pCmp->vpOperand[0]);
-        intrusive_ptr<Expression> pRight(pCmp->vpOperand[1]);
-        intrusive_ptr<ExpressionFieldPath> pFieldPath(
-            dynamic_pointer_cast<ExpressionFieldPath>(pLeft));
-        intrusive_ptr<ExpressionConstant> pConstant;
-        if (pFieldPath.get()) {
-            pConstant = dynamic_pointer_cast<ExpressionConstant>(pRight);
-            if (!pConstant.get())
-                return pE; // there's nothing more we can do
-        }
-        else {
-            /* if the first operand wasn't a path, see if it's a constant */
-            pConstant = dynamic_pointer_cast<ExpressionConstant>(pLeft);
-            if (!pConstant.get())
-                return pE; // there's nothing more we can do
-
-            /* the left operand was a constant; see if the right is a path */
-            pFieldPath = dynamic_pointer_cast<ExpressionFieldPath>(pRight);
-            if (!pFieldPath.get())
-                return pE; // there's nothing more we can do
-
-            /* these were not in canonical order, so reverse the sense */
-            newOp = cmpLookup[newOp].reverse;
-        }
-
-        return ExpressionFieldRange::create(
-            pFieldPath, newOp, pConstant->getValue());
-    }
-
     Value ExpressionCompare::evaluateInternal(const Variables& vars) const {
-        checkArgCount(2);
         Value pLeft(vpOperand[0]->evaluateInternal(vars));
         Value pRight(vpOperand[1]->evaluateInternal(vars));
 
@@ -783,13 +628,6 @@ namespace mongo {
 
     /* ------------------------- ExpressionConcat ----------------------------- */
 
-    ExpressionConcat::~ExpressionConcat() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionConcat::create() {
-        return new ExpressionConcat();
-    }
-
     Value ExpressionConcat::evaluateInternal(const Variables& vars) const {
         const size_t n = vpOperand.size();
 
@@ -809,56 +647,63 @@ namespace mongo {
         return Value(result.str());
     }
 
+    REGISTER_EXPRESSION("$concat", ExpressionConcat::parse);
     const char *ExpressionConcat::getOpName() const {
         return "$concat";
     }
 
     /* ----------------------- ExpressionCond ------------------------------ */
 
-    ExpressionCond::~ExpressionCond() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionCond::create() {
-        intrusive_ptr<ExpressionCond> pExpression(new ExpressionCond());
-        return pExpression;
-    }
-
-    ExpressionCond::ExpressionCond():
-        ExpressionNary() {
-    }
-
-    void ExpressionCond::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(3);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionCond::evaluateInternal(const Variables& vars) const {
-        checkArgCount(3);
         Value pCond(vpOperand[0]->evaluateInternal(vars));
         int idx = pCond.coerceToBool() ? 1 : 2;
         return vpOperand[idx]->evaluateInternal(vars);
     }
 
+    intrusive_ptr<Expression> ExpressionCond::parse(BSONElement expr) {
+        if (expr.type() != Object) {
+            return Base::parse(expr);
+        }
+        verify(str::equals(expr.fieldName(), "$cond"));
+
+        intrusive_ptr<ExpressionCond> ret = new ExpressionCond();
+        ret->vpOperand.resize(3);
+
+        const BSONObj args = expr.embeddedObject();
+        BSONForEach(arg, args) {
+            if (str::equals(arg.fieldName(), "if")) {
+                ret->vpOperand[0] = parseOperand(arg);
+            } else if (str::equals(arg.fieldName(), "then")) {
+                ret->vpOperand[1] = parseOperand(arg);
+            } else if (str::equals(arg.fieldName(), "else")) {
+                ret->vpOperand[2] = parseOperand(arg);
+            } else {
+                uasserted(17083, str::stream()
+                        << "Unrecognized parameter to $cond: " << arg.fieldName());
+            }
+        }
+
+        uassert(17080, "Missing 'if' parameter to $cond",
+                ret->vpOperand[0]);
+        uassert(17081, "Missing 'then' parameter to $cond",
+                ret->vpOperand[1]);
+        uassert(17082, "Missing 'else' parameter to $cond",
+                ret->vpOperand[2]);
+
+        return ret;
+    }
+
+    REGISTER_EXPRESSION("$cond", ExpressionCond::parse);
     const char *ExpressionCond::getOpName() const {
         return "$cond";
     }
 
     /* ---------------------- ExpressionConstant --------------------------- */
 
-    ExpressionConstant::~ExpressionConstant() {
+    intrusive_ptr<Expression> ExpressionConstant::parse(BSONElement exprElement) {
+        return new ExpressionConstant(Value(exprElement));
     }
 
-    intrusive_ptr<ExpressionConstant> ExpressionConstant::createFromBsonElement(
-        BSONElement *pBsonElement) {
-        intrusive_ptr<ExpressionConstant> pEC(
-            new ExpressionConstant(pBsonElement));
-        return pEC;
-    }
-
-    ExpressionConstant::ExpressionConstant(BSONElement *pBsonElement):
-        pValue(Value(*pBsonElement)) {
-    }
 
     intrusive_ptr<ExpressionConstant> ExpressionConstant::create(const Value& pValue) {
         intrusive_ptr<ExpressionConstant> pEC(new ExpressionConstant(pValue));
@@ -885,123 +730,54 @@ namespace mongo {
         return serializeConstant(pValue);
     }
 
+    REGISTER_EXPRESSION("$const", ExpressionConstant::parse);
+    REGISTER_EXPRESSION("$literal", ExpressionConstant::parse); // alias
     const char *ExpressionConstant::getOpName() const {
         return "$const";
     }
 
     /* ---------------------- ExpressionDayOfMonth ------------------------- */
 
-    ExpressionDayOfMonth::~ExpressionDayOfMonth() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionDayOfMonth::create() {
-        intrusive_ptr<ExpressionDayOfMonth> pExpression(new ExpressionDayOfMonth());
-        return pExpression;
-    }
-
-    ExpressionDayOfMonth::ExpressionDayOfMonth():
-        ExpressionNary() {
-    }
-
-    void ExpressionDayOfMonth::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionDayOfMonth::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         return Value(date.tm_mday);
     }
 
+    REGISTER_EXPRESSION("$dayOfMonth", ExpressionDayOfMonth::parse);
     const char *ExpressionDayOfMonth::getOpName() const {
         return "$dayOfMonth";
     }
 
     /* ------------------------- ExpressionDayOfWeek ----------------------------- */
 
-    ExpressionDayOfWeek::~ExpressionDayOfWeek() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionDayOfWeek::create() {
-        intrusive_ptr<ExpressionDayOfWeek> pExpression(new ExpressionDayOfWeek());
-        return pExpression;
-    }
-
-    ExpressionDayOfWeek::ExpressionDayOfWeek():
-        ExpressionNary() {
-    }
-
-    void ExpressionDayOfWeek::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionDayOfWeek::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         return Value(date.tm_wday+1); // MySQL uses 1-7 tm uses 0-6
     }
 
+    REGISTER_EXPRESSION("$dayOfWeek", ExpressionDayOfWeek::parse);
     const char *ExpressionDayOfWeek::getOpName() const {
         return "$dayOfWeek";
     }
 
     /* ------------------------- ExpressionDayOfYear ----------------------------- */
 
-    ExpressionDayOfYear::~ExpressionDayOfYear() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionDayOfYear::create() {
-        intrusive_ptr<ExpressionDayOfYear> pExpression(new ExpressionDayOfYear());
-        return pExpression;
-    }
-
-    ExpressionDayOfYear::ExpressionDayOfYear():
-        ExpressionNary() {
-    }
-
-    void ExpressionDayOfYear::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionDayOfYear::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         return Value(date.tm_yday+1); // MySQL uses 1-366 tm uses 0-365
     }
 
+    REGISTER_EXPRESSION("$dayOfYear", ExpressionDayOfYear::parse);
     const char *ExpressionDayOfYear::getOpName() const {
         return "$dayOfYear";
     }
 
     /* ----------------------- ExpressionDivide ---------------------------- */
 
-    ExpressionDivide::~ExpressionDivide() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionDivide::create() {
-        intrusive_ptr<ExpressionDivide> pExpression(new ExpressionDivide());
-        return pExpression;
-    }
-
-    ExpressionDivide::ExpressionDivide():
-        ExpressionNary() {
-    }
-
-    void ExpressionDivide::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(2);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionDivide::evaluateInternal(const Variables& vars) const {
-        checkArgCount(2);
         Value lhs = vpOperand[0]->evaluateInternal(vars);
         Value rhs = vpOperand[1]->evaluateInternal(vars);
 
@@ -1024,14 +800,12 @@ namespace mongo {
         }
     }
 
+    REGISTER_EXPRESSION("$divide", ExpressionDivide::parse);
     const char *ExpressionDivide::getOpName() const {
         return "$divide";
     }
 
     /* ---------------------- ExpressionObject --------------------------- */
-
-    ExpressionObject::~ExpressionObject() {
-    }
 
     intrusive_ptr<ExpressionObject> ExpressionObject::create() {
         return new ExpressionObject(false);
@@ -1145,7 +919,7 @@ namespace mongo {
                 Value pValue(expr->evaluateInternal(vars));
 
                 // don't add field if nothing was found in the subobject
-                if (exprObj && pValue.getDocument()->getFieldCount() == 0)
+                if (exprObj && pValue.getDocument().empty())
                     continue;
 
                 /*
@@ -1222,7 +996,7 @@ namespace mongo {
 
             // don't add field if nothing was found in the subobject
             if (dynamic_cast<ExpressionObject*>(it->second.get())
-                    && pValue.getDocument()->getFieldCount() == 0)
+                    && pValue.getDocument().empty())
                 continue;
 
 
@@ -1330,9 +1104,6 @@ namespace mongo {
 
     /* --------------------- ExpressionFieldPath --------------------------- */
 
-    ExpressionFieldPath::~ExpressionFieldPath() {
-    }
-
     // this is the old deprecated version
     intrusive_ptr<ExpressionFieldPath> ExpressionFieldPath::create(const string& fieldPath) {
         return new ExpressionFieldPath("CURRENT." + fieldPath);
@@ -1374,7 +1145,11 @@ namespace mongo {
     void ExpressionFieldPath::addDependencies(set<string>& deps, vector<string>* path) const {
         // TODO consider state of variables
         if (_baseVar == ROOT || _baseVar == CURRENT) {
-            deps.insert(_fieldPath.tail().getPath(false));
+            if (_fieldPath.getPathLength() == 1) {
+                deps.insert(""); // need full doc if just "$$ROOT" or "$$CURRENT"
+            } else {
+                deps.insert(_fieldPath.tail().getPath(false));
+            }
         }
     }
 
@@ -1445,298 +1220,10 @@ namespace mongo {
         }
     }
 
-    /* --------------------- ExpressionFieldRange -------------------------- */
-
-    ExpressionFieldRange::~ExpressionFieldRange() {
-    }
-
-    intrusive_ptr<Expression> ExpressionFieldRange::optimize() {
-        /* if there is no range to match, this will never evaluate true */
-        if (!pRange.get())
-            return ExpressionConstant::create(Value(false));
-
-        /*
-          If we ended up with a double un-ended range, anything matches.  I
-          don't know how that can happen, given intersect()'s interface, but
-          here it is, just in case.
-        */
-        if (pRange->pBottom.missing() && pRange->pTop.missing())
-            return ExpressionConstant::create(Value(true));
-
-        /*
-          In all other cases, we have to test candidate values.  The
-          intersect() method has already optimized those tests, so there
-          aren't any more optimizations to look for here.
-        */
-        return intrusive_ptr<Expression>(this);
-    }
-
-    void ExpressionFieldRange::addDependencies(set<string>& deps, vector<string>* path) const {
-        pFieldPath->addDependencies(deps);
-    }
-
-    Value ExpressionFieldRange::evaluateInternal(const Variables& vars) const {
-        /* if there's no range, there can't be a match */
-        if (!pRange.get())
-            return Value(false);
-
-        /* get the value of the specified field */
-        Value pValue(pFieldPath->evaluateInternal(vars));
-
-        /* see if it fits within any of the ranges */
-        if (pRange->contains(pValue))
-            return Value(true);
-
-        return Value(false);
-    }
-
-    Value ExpressionFieldRange::serialize() const {
-        // serializing results in an unoptimized form that will be reoptimized at parse time
-
-        if (!pRange.get()) {
-            /* nothing will satisfy this predicate */
-            return serializeConstant(Value(false));
-        }
-
-        if (pRange->pTop.missing() && pRange->pBottom.missing()) {
-            /* any value will satisfy this predicate */
-            return serializeConstant(Value(true));
-        }
-
-        // FIXME Append constant values using the $const operator.  SERVER-6769
-
-        // FIXME This checks pointer equality not value equality.
-        if (pRange->pTop == pRange->pBottom) {
-            return Value(DOC("$eq" << DOC_ARRAY(pFieldPath->serialize()
-                                             << serializeConstant(pRange->pTop)
-                                             )));
-        }
-
-        Document gtDoc;
-        if (!pRange->pBottom.missing()) {
-            const StringData& op = (pRange->bottomOpen ? "$gt" : "$gte");
-            gtDoc = DOC(op << DOC_ARRAY(pFieldPath->serialize()
-                                     << serializeConstant(pRange->pBottom)
-                                     ));
-
-            if (pRange->pTop.missing()) {
-                return Value(gtDoc);
-            }
-        }
-
-        Document ltDoc;
-        if (!pRange->pTop.missing()) {
-            const StringData& op = (pRange->topOpen ? "$lt" : "$lte");
-            ltDoc = DOC(op << DOC_ARRAY(pFieldPath->serialize()
-                                     << serializeConstant(pRange->pTop)
-                                     ));
-
-            if (pRange->pBottom.missing()) {
-                return Value(ltDoc);
-            }
-        }
-
-        return Value(DOC("$and" << DOC_ARRAY(gtDoc << ltDoc)));
-    }
-
-    void ExpressionFieldRange::toMatcherBson(
-        BSONObjBuilder *pBuilder) const {
-        verify(pRange.get()); // otherwise, we can't do anything
-
-        /* if there are no endpoints, then every value is accepted */
-        if (pRange->pBottom.missing() && pRange->pTop.missing())
-            return; // nothing to add to the predicate
-
-        /* we're going to need the field path */
-        //TODO Fix for $$vars. This method isn't currently used so low-priority
-        string fieldPath(pFieldPath->getFieldPath().getPath(false));
-
-        BSONObjBuilder range;
-        if (!pRange->pBottom.missing()) {
-            /* the test for equality doesn't generate a subobject */
-            if (pRange->pBottom == pRange->pTop) {
-                pRange->pBottom.addToBsonObj(pBuilder, fieldPath);
-                return;
-            }
-
-            pRange->pBottom.addToBsonObj(
-                pBuilder, (pRange->bottomOpen ? "$gt" : "$gte"));
-        }
-
-        if (!pRange->pTop.missing()) {
-            pRange->pTop.addToBsonObj(
-                pBuilder, (pRange->topOpen ? "$lt" : "$lte"));
-        }
-
-        pBuilder->append(fieldPath, range.done());
-    }
-
-    intrusive_ptr<ExpressionFieldRange> ExpressionFieldRange::create(
-        const intrusive_ptr<ExpressionFieldPath> &pFieldPath, CmpOp cmpOp,
-        const Value& pValue) {
-        intrusive_ptr<ExpressionFieldRange> pE(
-            new ExpressionFieldRange(pFieldPath, cmpOp, pValue));
-        return pE;
-    }
-
-    ExpressionFieldRange::ExpressionFieldRange(
-        const intrusive_ptr<ExpressionFieldPath> &pTheFieldPath, CmpOp cmpOp,
-        const Value& pValue):
-        pFieldPath(pTheFieldPath),
-        pRange(new Range(cmpOp, pValue)) {
-    }
-
-    void ExpressionFieldRange::intersect(CmpOp cmpOp, const Value& pValue) {
-
-        /* create the new range */
-        scoped_ptr<Range> pNew(new Range(cmpOp, pValue));
-
-        /*
-          Go through the range list.  For every range, either add the
-          intersection of that to the range list, or if there is none, the
-          original range.  This has the effect of restricting overlapping
-          ranges, but leaving non-overlapping ones as-is.
-        */
-        pRange.reset(pRange->intersect(pNew.get()));
-    }
-
-    ExpressionFieldRange::Range::Range(CmpOp cmpOp, const Value& pValue):
-        bottomOpen(false),
-        topOpen(false),
-        pBottom(),
-        pTop() {
-        switch(cmpOp) {
-
-        case EQ:
-            pBottom = pTop = pValue;
-            break;
-
-        case GT:
-            bottomOpen = true;
-            /* FALLTHROUGH */
-        case GTE:
-            topOpen = true;
-            pBottom = pValue;
-            break;
-
-        case LT:
-            topOpen = true;
-            /* FALLTHROUGH */
-        case LTE:
-            bottomOpen = true;
-            pTop = pValue;
-            break;
-
-        case NE:
-        case CMP:
-            verify(false); // not allowed
-            break;
-        }
-    }
-
-    ExpressionFieldRange::Range::Range(const Range &rRange):
-        bottomOpen(rRange.bottomOpen),
-        topOpen(rRange.topOpen),
-        pBottom(rRange.pBottom),
-        pTop(rRange.pTop) {
-    }
-
-    ExpressionFieldRange::Range::Range(
-        const Value& pTheBottom, bool theBottomOpen,
-        const Value& pTheTop, bool theTopOpen):
-        bottomOpen(theBottomOpen),
-        topOpen(theTopOpen),
-        pBottom(pTheBottom),
-        pTop(pTheTop) {
-    }
-
-    ExpressionFieldRange::Range *ExpressionFieldRange::Range::intersect(
-        const Range *pRange) const {
-        /*
-          Find the max of the bottom end of the ranges.
-
-          Start by assuming the maximum is from pRange.  Then, if we have
-          values of our own, see if they're greater.
-        */
-        Value pMaxBottom(pRange->pBottom);
-        bool maxBottomOpen = pRange->bottomOpen;
-        if (!pBottom.missing()) {
-            if (pRange->pBottom.missing()) {
-                pMaxBottom = pBottom;
-                maxBottomOpen = bottomOpen;
-            }
-            else {
-                const int cmp = Value::compare(pBottom, pRange->pBottom);
-                if (cmp == 0)
-                    maxBottomOpen = bottomOpen || pRange->bottomOpen;
-                else if (cmp > 0) {
-                    pMaxBottom = pBottom;
-                    maxBottomOpen = bottomOpen;
-                }
-            }
-        }
-
-        /*
-          Find the minimum of the tops of the ranges.
-
-          Start by assuming the minimum is from pRange.  Then, if we have
-          values of our own, see if they are less.
-        */
-        Value pMinTop(pRange->pTop);
-        bool minTopOpen = pRange->topOpen;
-        if (!pTop.missing()) {
-            if (pRange->pTop.missing()) {
-                pMinTop = pTop;
-                minTopOpen = topOpen;
-            }
-            else {
-                const int cmp = Value::compare(pTop, pRange->pTop);
-                if (cmp == 0)
-                    minTopOpen = topOpen || pRange->topOpen;
-                else if (cmp < 0) {
-                    pMinTop = pTop;
-                    minTopOpen = topOpen;
-                }
-            }
-        }
-
-        /*
-          If the intersections didn't create a disjoint set, create the
-          new range.
-        */
-        if (Value::compare(pMaxBottom, pMinTop) <= 0)
-            return new Range(pMaxBottom, maxBottomOpen, pMinTop, minTopOpen);
-
-        /* if we got here, the intersection is empty */
-        return NULL;
-    }
-
-    bool ExpressionFieldRange::Range::contains(const Value& pValue) const {
-        if (!pBottom.missing()) {
-            const int cmp = Value::compare(pValue, pBottom);
-            if (cmp < 0)
-                return false;
-            if (bottomOpen && (cmp == 0))
-                return false;
-        }
-
-        if (!pTop.missing()) {
-            const int cmp = Value::compare(pValue, pTop);
-            if (cmp > 0)
-                return false;
-            if (topOpen && (cmp == 0))
-                return false;
-        }
-
-        return true;
-    }
-
-
     /* ------------------------- ExpressionLet ----------------------------- */
 
-    ExpressionLet::~ExpressionLet() {}
-
-    intrusive_ptr<ExpressionLet> ExpressionLet::parse(BSONElement expr) {
+    REGISTER_EXPRESSION("$let", ExpressionLet::parse);
+    intrusive_ptr<Expression> ExpressionLet::parse(BSONElement expr) {
         verify(str::equals(expr.fieldName(), "$let"));
 
         uassert(16874, "$let only supports an object as it's argument",
@@ -1754,11 +1241,11 @@ namespace mongo {
                 haveVars = true;
                 BSONForEach(variable, arg.embeddedObjectUserCheck()) {
                     Variables::uassertValidNameForUserWrite(variable.fieldName());
-                    vars[variable.fieldName()] = parseOperand(&variable);
+                    vars[variable.fieldName()] = parseOperand(variable);
                 }
             } else if (str::equals(arg.fieldName(), "in")) {
                 haveIn = true;
-                subExpression = parseOperand(&arg);
+                subExpression = parseOperand(arg);
             } else {
                 uasserted(16875, str::stream()
                         << "Unrecognized parameter to $let: " << arg.fieldName());
@@ -1839,9 +1326,8 @@ namespace mongo {
 
     /* ------------------------- ExpressionMap ----------------------------- */
 
-    ExpressionMap::~ExpressionMap() {}
-
-    intrusive_ptr<ExpressionMap> ExpressionMap::parse(BSONElement expr) {
+    REGISTER_EXPRESSION("$map", ExpressionMap::parse);
+    intrusive_ptr<Expression> ExpressionMap::parse(BSONElement expr) {
         verify(str::equals(expr.fieldName(), "$map"));
 
         uassert(16878, "$map only supports an object as it's argument",
@@ -1860,14 +1346,14 @@ namespace mongo {
         BSONForEach(arg, args) {
             if (str::equals(arg.fieldName(), "input")) {
                 haveInput = true;
-                input = parseOperand(&arg);
+                input = parseOperand(arg);
             } else if (str::equals(arg.fieldName(), "as")) {
                 haveAs = true;
                 varName = arg.str();
                 Variables::uassertValidNameForUserWrite(varName);
             } else if (str::equals(arg.fieldName(), "in")) {
                 haveIn = true;
-                in = parseOperand(&arg);
+                in = parseOperand(arg);
             } else {
                 uasserted(16879, str::stream()
                         << "Unrecognized parameter to $map: " << arg.fieldName());
@@ -1949,88 +1435,32 @@ namespace mongo {
 
     /* ------------------------- ExpressionMillisecond ----------------------------- */
 
-    ExpressionMillisecond::~ExpressionMillisecond() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionMillisecond::create() {
-        intrusive_ptr<ExpressionMillisecond> pExpression(new ExpressionMillisecond());
-        return pExpression;
-    }
-
-    ExpressionMillisecond::ExpressionMillisecond():
-        ExpressionNary() {
-    }
-
-    void ExpressionMillisecond::addOperand(const intrusive_ptr<Expression>& pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionMillisecond::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value date(vpOperand[0]->evaluateInternal(vars));
-        const int ms = date.coerceToDate() % 1000LL;
-        // adding 1000 since dates before 1970 would have negative ms
-        return Value(ms >= 0 ? ms : 1000 + ms);
+        return Value(extractMillisPortion(date.coerceToDate()));
     }
 
+    REGISTER_EXPRESSION("$millisecond", ExpressionMillisecond::parse);
     const char *ExpressionMillisecond::getOpName() const {
         return "$millisecond";
     }
 
     /* ------------------------- ExpressionMinute -------------------------- */
 
-    ExpressionMinute::~ExpressionMinute() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionMinute::create() {
-        intrusive_ptr<ExpressionMinute> pExpression(new ExpressionMinute());
-        return pExpression;
-    }
-
-    ExpressionMinute::ExpressionMinute():
-        ExpressionNary() {
-    }
-
-    void ExpressionMinute::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionMinute::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         return Value(date.tm_min);
     }
 
+    REGISTER_EXPRESSION("$minute", ExpressionMinute::parse);
     const char *ExpressionMinute::getOpName() const {
         return "$minute";
     }
 
     /* ----------------------- ExpressionMod ---------------------------- */
 
-    ExpressionMod::~ExpressionMod() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionMod::create() {
-        intrusive_ptr<ExpressionMod> pExpression(new ExpressionMod());
-        return pExpression;
-    }
-
-    ExpressionMod::ExpressionMod():
-        ExpressionNary() {
-    }
-
-    void ExpressionMod::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(2);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionMod::evaluateInternal(const Variables& vars) const {
-        checkArgCount(2);
         Value lhs = vpOperand[0]->evaluateInternal(vars);
         Value rhs = vpOperand[1]->evaluateInternal(vars);
 
@@ -2076,53 +1506,25 @@ namespace mongo {
         }
     }
 
+    REGISTER_EXPRESSION("$mod", ExpressionMod::parse);
     const char *ExpressionMod::getOpName() const {
         return "$mod";
     }
 
     /* ------------------------ ExpressionMonth ----------------------------- */
 
-    ExpressionMonth::~ExpressionMonth() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionMonth::create() {
-        intrusive_ptr<ExpressionMonth> pExpression(new ExpressionMonth());
-        return pExpression;
-    }
-
-    ExpressionMonth::ExpressionMonth():
-        ExpressionNary() {
-    }
-
-    void ExpressionMonth::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionMonth::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         return Value(date.tm_mon + 1); // MySQL uses 1-12 tm uses 0-11
     }
 
+    REGISTER_EXPRESSION("$month", ExpressionMonth::parse);
     const char *ExpressionMonth::getOpName() const {
         return "$month";
     }
 
     /* ------------------------- ExpressionMultiply ----------------------------- */
-
-    ExpressionMultiply::~ExpressionMultiply() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionMultiply::create() {
-        intrusive_ptr<ExpressionMultiply> pExpression(new ExpressionMultiply());
-        return pExpression;
-    }
-
-    ExpressionMultiply::ExpressionMultiply():
-        ExpressionNary() {
-    }
 
     Value ExpressionMultiply::evaluateInternal(const Variables& vars) const {
         /*
@@ -2164,67 +1566,27 @@ namespace mongo {
             massert(16418, "$multiply resulted in a non-numeric type", false);
     }
 
+    REGISTER_EXPRESSION("$multiply", ExpressionMultiply::parse);
     const char *ExpressionMultiply::getOpName() const {
-    return "$multiply";
-    }
-
-    intrusive_ptr<ExpressionNary> (*ExpressionMultiply::getFactory() const)() {
-    return ExpressionMultiply::create;
+        return "$multiply";
     }
 
     /* ------------------------- ExpressionHour ----------------------------- */
 
-    ExpressionHour::~ExpressionHour() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionHour::create() {
-        intrusive_ptr<ExpressionHour> pExpression(new ExpressionHour());
-        return pExpression;
-    }
-
-    ExpressionHour::ExpressionHour():
-        ExpressionNary() {
-    }
-
-    void ExpressionHour::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionHour::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         return Value(date.tm_hour);
     }
 
+    REGISTER_EXPRESSION("$hour", ExpressionHour::parse);
     const char *ExpressionHour::getOpName() const {
         return "$hour";
     }
 
     /* ----------------------- ExpressionIfNull ---------------------------- */
 
-    ExpressionIfNull::~ExpressionIfNull() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionIfNull::create() {
-        intrusive_ptr<ExpressionIfNull> pExpression(new ExpressionIfNull());
-        return pExpression;
-    }
-
-    ExpressionIfNull::ExpressionIfNull():
-        ExpressionNary() {
-    }
-
-    void ExpressionIfNull::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(2);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionIfNull::evaluateInternal(const Variables& vars) const {
-        checkArgCount(2);
-
         Value pLeft(vpOperand[0]->evaluateInternal(vars));
         if (!pLeft.nullish())
             return pLeft;
@@ -2233,42 +1595,32 @@ namespace mongo {
         return pRight;
     }
 
+    REGISTER_EXPRESSION("$ifNull", ExpressionIfNull::parse);
     const char *ExpressionIfNull::getOpName() const {
         return "$ifNull";
     }
 
     /* ------------------------ ExpressionNary ----------------------------- */
 
-    ExpressionNary::ExpressionNary():
-        vpOperand() {
-    }
-
     intrusive_ptr<Expression> ExpressionNary::optimize() {
-        unsigned constCount = 0; // count of constant operands
-        unsigned stringCount = 0; // count of constant string operands
         const size_t n = vpOperand.size();
+
+        // optimize sub-expressions and count constants
+        unsigned constCount = 0;
         for(size_t i = 0; i < n; ++i) {
-            intrusive_ptr<Expression> pNew(vpOperand[i]->optimize());
+            intrusive_ptr<Expression> optimized = vpOperand[i]->optimize();
 
-            /* subsitute the optimized expression */
-            vpOperand[i] = pNew;
+            // substitute the optimized expression
+            vpOperand[i] = optimized;
 
-            /* check to see if the result was a constant */
-            const ExpressionConstant *pConst =
-                dynamic_cast<ExpressionConstant *>(pNew.get());
-            if (pConst) {
-                ++constCount;
-                if (pConst->getValue().getType() == String)
-                    ++stringCount;
+            // check to see if the result was a constant
+            if (dynamic_cast<ExpressionConstant*>(optimized.get())) {
+                constCount++;
             }
         }
 
-        /*
-          If all the operands are constant, we can replace this expression
-          with a constant.  We can find the value by evaluating this
-          expression over a NULL Document because evaluating the
-          ExpressionConstant never refers to the argument Document.
-        */
+        // If all the operands are constant, we can replace this expression with a constant. Using
+        // an empty Variables since it will never be accessed.  
         if (constCount == n) {
             Value pResult(evaluateInternal(Variables()));
             intrusive_ptr<Expression> pReplacement(
@@ -2276,101 +1628,52 @@ namespace mongo {
             return pReplacement;
         }
 
-        /*
-          If there are any strings, we can't re-arrange anything, so stop
-          now.
+        // Remaining optimizations are only for associative and commutative expressions.
+        if (!isAssociativeAndCommutative())
+            return this;
 
-          LATER:  we could concatenate adjacent strings as a special case.
-         */
-        if (stringCount)
-            return intrusive_ptr<Expression>(this);
-
-        /*
-          If there's no more than one constant, then we can't do any
-          constant folding, so don't bother going any further.
-         */
-        if (constCount <= 1)
-            return intrusive_ptr<Expression>(this);
-            
-        /*
-          If the operator isn't commutative or associative, there's nothing
-          more we can do.  We test that by seeing if we can get a factory;
-          if we can, we can use it to construct a temporary expression which
-          we'll evaluate to collapse as many constants as we can down to
-          a single one.
-         */
-        intrusive_ptr<ExpressionNary> (*const pFactory)() = getFactory();
-        if (!pFactory)
-            return intrusive_ptr<Expression>(this);
-
-        /*
-          Create a new Expression that will be the replacement for this one.
-          We actually create two:  one to hold constant expressions, and
-          one to hold non-constants.  Once we've got these, we evaluate
-          the constant expression to produce a single value, as above.
-          We then add this operand to the end of the non-constant expression,
-          and return that.
-         */
-        intrusive_ptr<ExpressionNary> pNew((*pFactory)());
-        intrusive_ptr<ExpressionNary> pConst((*pFactory)());
-        for(size_t i = 0; i < n; ++i) {
-            intrusive_ptr<Expression> pE(vpOperand[i]);
-            if (dynamic_cast<ExpressionConstant *>(pE.get()))
-                pConst->addOperand(pE);
+        // Process vpOperand to split it into constant and nonconstant vectors.
+        // This can leave vpOperand in an invalid state that is cleaned up after the loop.
+        ExpressionVector constExprs;
+        ExpressionVector nonConstExprs;
+        for(size_t i = 0; i < vpOperand.size(); ++i) { // NOTE: vpOperand grows in loop
+            intrusive_ptr<Expression> expr = vpOperand[i];
+            if (dynamic_cast<ExpressionConstant*>(expr.get())) {
+                constExprs.push_back(expr);
+            }
             else {
-                /*
-                  If the child operand is the same type as this, then we can
-                  extract its operands and inline them here because we already
-                  know this is commutative and associative because it has a
-                  factory.  We can detect sameness of the child operator by
-                  checking for equality of the factory
-
-                  Note we don't have to do this recursively, because we
-                  called optimize() on all the children first thing in
-                  this call to optimize().
-                */
-                ExpressionNary *pNary =
-                    dynamic_cast<ExpressionNary *>(pE.get());
-                if (!pNary)
-                    pNew->addOperand(pE);
+                // If the child operand is the same type as this, then we can
+                // extract its operands and inline them here because we know
+                // this is commutative and associative.  We detect sameness of
+                // the child operator by checking for equality of the opNames
+                ExpressionNary* nary = dynamic_cast<ExpressionNary*>(expr.get());
+                if (!nary || !str::equals(nary->getOpName(), getOpName())) {
+                    nonConstExprs.push_back(expr);
+                }
                 else {
-                    intrusive_ptr<ExpressionNary> (*const pChildFactory)() =
-                        pNary->getFactory();
-                    if (pChildFactory != pFactory)
-                        pNew->addOperand(pE);
-                    else {
-                        /* same factory, so flatten */
-                        size_t nChild = pNary->vpOperand.size();
-                        for(size_t iChild = 0; iChild < nChild; ++iChild) {
-                            intrusive_ptr<Expression> pCE(
-                                pNary->vpOperand[iChild]);
-                            if (dynamic_cast<ExpressionConstant *>(pCE.get()))
-                                pConst->addOperand(pCE);
-                            else
-                                pNew->addOperand(pCE);
-                        }
-                    }
+                    // same expression, so flatten by adding to vpOperand which
+                    // will be processed later in this loop.
+                    vpOperand.insert(vpOperand.end(),
+                                     nary->vpOperand.begin(),
+                                     nary->vpOperand.end());
                 }
             }
         }
 
-        /*
-          If there was only one constant, add it to the end of the expression
-          operand vector.
-        */
-        if (pConst->vpOperand.size() == 1)
-            pNew->addOperand(pConst->vpOperand[0]);
-        else if (pConst->vpOperand.size() > 1) {
-            /*
-              If there was more than one constant, collapse all the constants
-              together before adding the result to the end of the expression
-              operand vector.
-            */
-            Value pResult(pConst->evaluateInternal(Variables()));
-            pNew->addOperand(ExpressionConstant::create(pResult));
+        // collapse all constant expressions (if any)
+        Value constValue;
+        if (!constExprs.empty()) {
+            vpOperand = constExprs;
+            constValue = evaluateInternal(Variables());
         }
 
-        return pNew;
+        // now set the final expression list with constant (if any) at the end
+        vpOperand = nonConstExprs;
+        if (!constExprs.empty()) {
+            vpOperand.push_back(ExpressionConstant::create(constValue));
+        }
+
+        return this;
     }
 
     void ExpressionNary::addDependencies(set<string>& deps, vector<string>* path) const {
@@ -2380,13 +1683,8 @@ namespace mongo {
         }
     }
 
-    void ExpressionNary::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
+    void ExpressionNary::addOperand(const intrusive_ptr<Expression>& pExpression) {
         vpOperand.push_back(pExpression);
-    }
-
-    intrusive_ptr<ExpressionNary> (*ExpressionNary::getFactory() const)() {
-        return NULL;
     }
 
     Value ExpressionNary::serialize() const {
@@ -2399,64 +1697,21 @@ namespace mongo {
         return Value(DOC(getOpName() << array));
     }
 
-    void ExpressionNary::checkArgLimit(unsigned maxArgs) const {
-        uassert(15993, str::stream() << getOpName() <<
-                " only takes " << maxArgs <<
-                " operand" << (maxArgs == 1 ? "" : "s"),
-                vpOperand.size() < maxArgs);
-    }
-
-    void ExpressionNary::checkArgCount(unsigned reqArgs) const {
-        uassert(15997, str::stream() << getOpName() <<
-                ":  insufficient operands; " << reqArgs <<
-                " required, only got " << vpOperand.size(),
-                vpOperand.size() == reqArgs);
-    }
-
     /* ------------------------- ExpressionNot ----------------------------- */
 
-    ExpressionNot::~ExpressionNot() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionNot::create() {
-        intrusive_ptr<ExpressionNot> pExpression(new ExpressionNot());
-        return pExpression;
-    }
-
-    ExpressionNot::ExpressionNot():
-        ExpressionNary() {
-    }
-
-    void ExpressionNot::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionNot::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pOp(vpOperand[0]->evaluateInternal(vars));
 
         bool b = pOp.coerceToBool();
         return Value(!b);
     }
 
+    REGISTER_EXPRESSION("$not", ExpressionNot::parse);
     const char *ExpressionNot::getOpName() const {
         return "$not";
     }
 
     /* -------------------------- ExpressionOr ----------------------------- */
-
-    ExpressionOr::~ExpressionOr() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionOr::create() {
-        intrusive_ptr<ExpressionNary> pExpression(new ExpressionOr());
-        return pExpression;
-    }
-
-    ExpressionOr::ExpressionOr():
-        ExpressionNary() {
-    }
 
     Value ExpressionOr::evaluateInternal(const Variables& vars) const {
         const size_t n = vpOperand.size();
@@ -2467,20 +1722,6 @@ namespace mongo {
         }
 
         return Value(false);
-    }
-
-    void ExpressionOr::toMatcherBson(
-        BSONObjBuilder *pBuilder) const {
-        BSONObjBuilder opArray;
-        const size_t n = vpOperand.size();
-        for(size_t i = 0; i < n; ++i)
-            vpOperand[i]->toMatcherBson(&opArray);
-
-        pBuilder->append("$or", opArray.done());
-    }
-
-    intrusive_ptr<ExpressionNary> (*ExpressionOr::getFactory() const)() {
-        return ExpressionOr::create;
     }
 
     intrusive_ptr<Expression> ExpressionOr::optimize() {
@@ -2536,62 +1777,233 @@ namespace mongo {
         return pE;
     }
 
+    REGISTER_EXPRESSION("$or", ExpressionOr::parse);
     const char *ExpressionOr::getOpName() const {
         return "$or";
     }
 
     /* ------------------------- ExpressionSecond ----------------------------- */
 
-    ExpressionSecond::~ExpressionSecond() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionSecond::create() {
-        intrusive_ptr<ExpressionSecond> pExpression(new ExpressionSecond());
-        return pExpression;
-    }
-
-    ExpressionSecond::ExpressionSecond():
-        ExpressionNary() {
-    }
-
-    void ExpressionSecond::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionSecond::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         return Value(date.tm_sec);
     }
 
+    REGISTER_EXPRESSION("$second", ExpressionSecond::parse);
     const char *ExpressionSecond::getOpName() const {
         return "$second";
     }
 
+
+
+    namespace {
+        ValueSet arrayToSet(const Value& val) {
+            const vector<Value>& array = val.getArray();
+            return ValueSet(array.begin(), array.end());
+        }
+    }
+
+    /* ----------------------- ExpressionSetDifference ---------------------------- */
+
+    Value ExpressionSetDifference::evaluateInternal(const Variables& vars) const {
+        const Value lhs = vpOperand[0]->evaluateInternal(vars);
+        const Value rhs = vpOperand[1]->evaluateInternal(vars);
+
+        if (lhs.nullish() || rhs.nullish()) {
+            return Value(BSONNULL);
+        }
+
+        uassert(17048, str::stream() << "both operands of $setDifference must be arrays. First "
+                                     << "argument is of type: " << typeName(lhs.getType()),
+                lhs.getType() == Array);
+        uassert(17049, str::stream() << "both operands of $setDifference must be arrays. Second "
+                                     << "argument is of type: " << typeName(rhs.getType()),
+                rhs.getType() == Array);
+
+        ValueSet rhsSet = arrayToSet(rhs);
+        const vector<Value>& lhsArray = lhs.getArray();
+        vector<Value> returnVec;
+
+        for (vector<Value>::const_iterator it = lhsArray.begin(); it != lhsArray.end(); ++it) {
+            // rhsSet serves the dual role of filtering out elements that were originally present
+            // in RHS and of eleminating duplicates from LHS
+            if (rhsSet.insert(*it).second) {
+                returnVec.push_back(*it);
+            }
+        }
+        return Value::consume(returnVec);
+    }
+
+    REGISTER_EXPRESSION("$setDifference", ExpressionSetDifference::parse);
+    const char *ExpressionSetDifference::getOpName() const {
+        return "$setDifference";
+    }
+
+    /* ----------------------- ExpressionSetEquals ---------------------------- */
+
+    void ExpressionSetEquals::validateArguments(const ExpressionVector& args) const {
+        uassert(17045, str::stream() << "$setEquals needs at least two arguments had: "
+                                     << args.size(),
+                args.size() >= 2);
+    }
+
+    Value ExpressionSetEquals::evaluateInternal(const Variables& vars) const {
+        const size_t n = vpOperand.size();
+        std::set<Value> lhs;
+
+        for (size_t i = 0; i < n; i++) {
+            const Value nextEntry = vpOperand[i]->evaluateInternal(vars);
+            uassert(17044, str::stream() << "All operands of $setEquals must be arrays. One "
+                                         << "argument is of type: "
+                                         << typeName(nextEntry.getType()),
+                    nextEntry.getType() == Array);
+
+            if (i == 0) {
+                lhs.insert(nextEntry.getArray().begin(), nextEntry.getArray().end());
+            }
+            else {
+                const std::set<Value> rhs(nextEntry.getArray().begin(), nextEntry.getArray().end());
+                if (lhs != rhs) {
+                    return Value(false);
+                }
+            }
+        }
+        return Value(true);
+    }
+
+    REGISTER_EXPRESSION("$setEquals", ExpressionSetEquals::parse);
+    const char *ExpressionSetEquals::getOpName() const {
+        return "$setEquals";
+    }
+
+    /* ----------------------- ExpressionSetIntersection ---------------------------- */
+
+    Value ExpressionSetIntersection::evaluateInternal(const Variables& vars) const {
+        const size_t n = vpOperand.size();
+        ValueSet currentIntersection;
+        for (size_t i = 0; i < n; i++) {
+            const Value nextEntry = vpOperand[i]->evaluateInternal(vars);
+            if (nextEntry.nullish()) {
+                return Value(BSONNULL);
+            }
+            uassert(17047, str::stream() << "All operands of $setIntersection must be arrays. One "
+                                         << "argument is of type: "
+                                         << typeName(nextEntry.getType()),
+                    nextEntry.getType() == Array);
+
+            if (i == 0) {
+                currentIntersection.insert(nextEntry.getArray().begin(),
+                                           nextEntry.getArray().end());
+            }
+            else {
+                ValueSet nextSet = arrayToSet(nextEntry);
+                if (currentIntersection.size() > nextSet.size()) {
+                    // to iterate over whichever is the smaller set
+                    nextSet.swap(currentIntersection);
+                }
+                ValueSet::iterator it = currentIntersection.begin();
+                while (it != currentIntersection.end()) {
+                    if (!nextSet.count(*it)) {
+                        ValueSet::iterator del = it;
+                        ++it;
+                        currentIntersection.erase(del);
+                    }
+                    else {
+                        ++it;
+                    }
+                }
+            }
+            if (currentIntersection.empty()) {
+                break;
+            }
+        }
+        vector<Value> result = vector<Value>(currentIntersection.begin(),
+                                             currentIntersection.end());
+        return Value::consume(result);
+    }
+
+    REGISTER_EXPRESSION("$setIntersection", ExpressionSetIntersection::parse);
+    const char *ExpressionSetIntersection::getOpName() const {
+        return "$setIntersection";
+    }
+
+    /* ----------------------- ExpressionSetIsSubset ---------------------------- */
+
+    Value ExpressionSetIsSubset::evaluateInternal(const Variables& vars) const {
+        const Value lhs = vpOperand[0]->evaluateInternal(vars);
+        const Value rhs = vpOperand[1]->evaluateInternal(vars);
+
+        uassert(17046, str::stream() << "both operands of $setIsSubset must be arrays. First "
+                                     << "argument is of type: " << typeName(lhs.getType()),
+                lhs.getType() == Array);
+        uassert(17042, str::stream() << "both operands of $setIsSubset must be arrays. Second "
+                                     << "argument is of type: " << typeName(rhs.getType()),
+                rhs.getType() == Array);
+
+        const vector<Value>& potentialSubset = lhs.getArray();
+        const ValueSet& fullSet = arrayToSet(rhs);
+
+        // do not shortcircuit when potentialSubset.size() > fullSet.size()
+        // because potentialSubset can have redundant entries
+        for (vector<Value>::const_iterator it = potentialSubset.begin();
+                it != potentialSubset.end(); ++it) {
+            if (!fullSet.count(*it)) {
+                return Value(false);
+            }
+        }
+        return Value(true);
+    }
+
+    REGISTER_EXPRESSION("$setIsSubset", ExpressionSetIsSubset::parse);
+    const char *ExpressionSetIsSubset::getOpName() const {
+        return "$setIsSubset";
+    }
+
+    /* ----------------------- ExpressionSetUnion ---------------------------- */
+
+    Value ExpressionSetUnion::evaluateInternal(const Variables& vars) const {
+        ValueSet unionedSet;
+        const size_t n = vpOperand.size();
+        for (size_t i = 0; i < n; i++) {
+            const Value newEntries = vpOperand[i]->evaluateInternal(vars);
+            if (newEntries.nullish()) {
+                return Value(BSONNULL);
+            }
+            uassert(17043, str::stream() << "All operands of $setUnion must be arrays. One argument"
+                                         << " is of type: " << typeName(newEntries.getType()),
+                    newEntries.getType() == Array);
+
+            unionedSet.insert(newEntries.getArray().begin(), newEntries.getArray().end());
+        }
+        vector<Value> result = vector<Value>(unionedSet.begin(), unionedSet.end());
+        return Value::consume(result);
+    }
+
+    REGISTER_EXPRESSION("$setUnion", ExpressionSetUnion::parse);
+    const char *ExpressionSetUnion::getOpName() const {
+        return "$setUnion";
+    }
+
+    /* ----------------------- ExpressionSize ---------------------------- */
+
+    Value ExpressionSize::evaluateInternal(const Variables& vars) const {
+        Value array = vpOperand[0]->evaluateInternal(vars);
+
+        uassert(17124, str::stream() << "The argument to $size must be an Array, but was of type: "
+                                     << typeName(array.getType()),
+                array.getType() == Array);
+        return Value::createIntOrLong(array.getArray().size());
+    }
+
+    REGISTER_EXPRESSION("$size", ExpressionSize::parse);
+    const char *ExpressionSize::getOpName() const {
+        return "$size";
+    }
+
     /* ----------------------- ExpressionStrcasecmp ---------------------------- */
 
-    ExpressionStrcasecmp::~ExpressionStrcasecmp() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionStrcasecmp::create() {
-        intrusive_ptr<ExpressionStrcasecmp> pExpression(new ExpressionStrcasecmp());
-        return pExpression;
-    }
-
-    ExpressionStrcasecmp::ExpressionStrcasecmp():
-        ExpressionNary() {
-    }
-
-    void ExpressionStrcasecmp::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(2);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionStrcasecmp::evaluateInternal(const Variables& vars) const {
-        checkArgCount(2);
         Value pString1(vpOperand[0]->evaluateInternal(vars));
         Value pString2(vpOperand[1]->evaluateInternal(vars));
 
@@ -2608,32 +2020,14 @@ namespace mongo {
             return Value(-1);
     }
 
+    REGISTER_EXPRESSION("$strcasecmp", ExpressionStrcasecmp::parse);
     const char *ExpressionStrcasecmp::getOpName() const {
         return "$strcasecmp";
     }
 
     /* ----------------------- ExpressionSubstr ---------------------------- */
 
-    ExpressionSubstr::~ExpressionSubstr() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionSubstr::create() {
-        intrusive_ptr<ExpressionSubstr> pExpression(new ExpressionSubstr());
-        return pExpression;
-    }
-
-    ExpressionSubstr::ExpressionSubstr():
-        ExpressionNary() {
-    }
-
-    void ExpressionSubstr::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(3);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionSubstr::evaluateInternal(const Variables& vars) const {
-        checkArgCount(3);
         Value pString(vpOperand[0]->evaluateInternal(vars));
         Value pLower(vpOperand[1]->evaluateInternal(vars));
         Value pLength(vpOperand[2]->evaluateInternal(vars));
@@ -2661,32 +2055,14 @@ namespace mongo {
         return Value(str.substr(lower, length));
     }
 
+    REGISTER_EXPRESSION("$substr", ExpressionSubstr::parse);
     const char *ExpressionSubstr::getOpName() const {
         return "$substr";
     }
 
     /* ----------------------- ExpressionSubtract ---------------------------- */
 
-    ExpressionSubtract::~ExpressionSubtract() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionSubtract::create() {
-        intrusive_ptr<ExpressionSubtract> pExpression(new ExpressionSubtract());
-        return pExpression;
-    }
-
-    ExpressionSubtract::ExpressionSubtract():
-        ExpressionNary() {
-    }
-
-    void ExpressionSubtract::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(2);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionSubtract::evaluateInternal(const Variables& vars) const {
-        checkArgCount(2);
         Value lhs = vpOperand[0]->evaluateInternal(vars);
         Value rhs = vpOperand[1]->evaluateInternal(vars);
             
@@ -2733,94 +2109,42 @@ namespace mongo {
         }
     }
 
+    REGISTER_EXPRESSION("$subtract", ExpressionSubtract::parse);
     const char *ExpressionSubtract::getOpName() const {
         return "$subtract";
     }
 
     /* ------------------------- ExpressionToLower ----------------------------- */
 
-    ExpressionToLower::~ExpressionToLower() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionToLower::create() {
-        intrusive_ptr<ExpressionToLower> pExpression(new ExpressionToLower());
-        return pExpression;
-    }
-
-    ExpressionToLower::ExpressionToLower():
-        ExpressionNary() {
-    }
-
-    void ExpressionToLower::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionToLower::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pString(vpOperand[0]->evaluateInternal(vars));
         string str = pString.coerceToString();
         boost::to_lower(str);
         return Value(str);
     }
 
+    REGISTER_EXPRESSION("$toLower", ExpressionToLower::parse);
     const char *ExpressionToLower::getOpName() const {
         return "$toLower";
     }
 
     /* ------------------------- ExpressionToUpper -------------------------- */
 
-    ExpressionToUpper::~ExpressionToUpper() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionToUpper::create() {
-        intrusive_ptr<ExpressionToUpper> pExpression(new ExpressionToUpper());
-        return pExpression;
-    }
-
-    ExpressionToUpper::ExpressionToUpper():
-        ExpressionNary() {
-    }
-
-    void ExpressionToUpper::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionToUpper::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pString(vpOperand[0]->evaluateInternal(vars));
         string str(pString.coerceToString());
         boost::to_upper(str);
         return Value(str);
     }
 
+    REGISTER_EXPRESSION("$toUpper", ExpressionToUpper::parse);
     const char *ExpressionToUpper::getOpName() const {
         return "$toUpper";
     }
 
     /* ------------------------- ExpressionWeek ----------------------------- */
 
-    ExpressionWeek::~ExpressionWeek() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionWeek::create() {
-        intrusive_ptr<ExpressionWeek> pExpression(new ExpressionWeek());
-        return pExpression;
-    }
-
-    ExpressionWeek::ExpressionWeek():
-        ExpressionNary() {
-    }
-
-    void ExpressionWeek::addOperand(const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionWeek::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         int dayOfWeek = date.tm_wday;
@@ -2842,37 +2166,20 @@ namespace mongo {
         return Value(nextSundayWeek);
     }
 
+    REGISTER_EXPRESSION("$week", ExpressionWeek::parse);
     const char *ExpressionWeek::getOpName() const {
         return "$week";
     }
 
     /* ------------------------- ExpressionYear ----------------------------- */
 
-    ExpressionYear::~ExpressionYear() {
-    }
-
-    intrusive_ptr<ExpressionNary> ExpressionYear::create() {
-        intrusive_ptr<ExpressionYear> pExpression(new ExpressionYear());
-        return pExpression;
-    }
-
-    ExpressionYear::ExpressionYear():
-        ExpressionNary() {
-    }
-
-    void ExpressionYear::addOperand(
-        const intrusive_ptr<Expression> &pExpression) {
-        checkArgLimit(1);
-        ExpressionNary::addOperand(pExpression);
-    }
-
     Value ExpressionYear::evaluateInternal(const Variables& vars) const {
-        checkArgCount(1);
         Value pDate(vpOperand[0]->evaluateInternal(vars));
         tm date = pDate.coerceToTm();
         return Value(date.tm_year + 1900); // tm_year is years since 1900
     }
 
+    REGISTER_EXPRESSION("$year", ExpressionYear::parse);
     const char *ExpressionYear::getOpName() const {
         return "$year";
     }

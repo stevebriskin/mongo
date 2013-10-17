@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
@@ -22,12 +34,14 @@
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/unittest/unittest.h"
 
 namespace {
 
     using mongo::BSONObj;
+    using mongo::LogBuilder;
     using mongo::ModifierPull;
     using mongo::ModifierInterface;
     using mongo::Status;
@@ -44,7 +58,8 @@ namespace {
         explicit Mod(BSONObj modObj)
             : _modObj(modObj)
             , _mod() {
-            ASSERT_OK(_mod.init(_modObj["$pull"].embeddedObject().firstElement()));
+            ASSERT_OK(_mod.init(_modObj["$pull"].embeddedObject().firstElement(),
+                                ModifierInterface::Options::normal()));
         }
 
         Status prepare(Element root,
@@ -57,8 +72,8 @@ namespace {
             return _mod.apply();
         }
 
-        Status log(Element logRoot) const {
-            return _mod.log(logRoot);
+        Status log(LogBuilder* logBuilder) const {
+            return _mod.log(logBuilder);
         }
 
         ModifierPull& mod() {
@@ -77,11 +92,11 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $unset : { a : 1 } }"), logDoc);
     }
 
@@ -92,7 +107,6 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
     }
 
@@ -119,11 +133,11 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $unset : { a : 1 } }"), logDoc);
     }
 
@@ -134,11 +148,11 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.b.c.d");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $unset : { 'a.b.c.d' : 1 } }"), logDoc);
     }
 
@@ -149,11 +163,11 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [] } }"), logDoc);
     }
 
@@ -164,11 +178,11 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [2, 3, 4, 5] } }"), logDoc);
     }
 
@@ -179,14 +193,15 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : [ 1, 2, 3, 4, 5 ] }"), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [1, 2, 3, 4, 5] } }"), logDoc);
     }
 
@@ -197,14 +212,15 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : [ 1, 2, 3, 4, 5 ] }"), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [1, 2, 3, 4, 5] } }"), logDoc);
     }
 
@@ -215,23 +231,20 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{ a : [] }"), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{ $set : { a : [] } }"), logDoc);
     }
 
-
-// The following two tests are currently not passing.
-#if 0
     TEST(ComplexMod, ApplyAndLogComplexDocAndMatching1) {
 
-        // Fails with 'unknown operator $or'
         const char* const strings[] = {
             // Document:
             "{ a : { b : [ { x : 1 }, { y : 'y' }, { x : 2 }, { z : 'z' } ] } }",
@@ -255,20 +268,20 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.b");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson(strings[2]), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson(strings[3]), logDoc);
     }
 
     TEST(ComplexMod, ApplyAndLogComplexDocAndMatching2) {
 
-        // Fails, doesn't see value as matching
         const char* const strings[] = {
             // Document:
             "{ a : { b : [ { x : 1 }, { y : 'y' }, { x : 2 }, { z : 'z' } ] } }",
@@ -289,17 +302,17 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.b");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson(strings[2]), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson(strings[3]), logDoc);
     }
-#endif
 
     TEST(ComplexMod, ApplyAndLogComplexDocAndMatching3) {
 
@@ -323,14 +336,15 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.b");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson(strings[2]), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson(strings[3]), logDoc);
     }
 
@@ -356,14 +370,15 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson(strings[2]), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson(strings[3]), logDoc);
     }
 
@@ -389,14 +404,172 @@ namespace {
         ModifierInterface::ExecInfo execInfo;
         ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson(strings[2]), doc);
 
         Document logDoc;
-        ASSERT_OK(mod.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
+        ASSERT_EQUALS(fromjson(strings[3]), logDoc);
+    }
+
+    TEST(DocumentationTests, Example1) {
+        const char* const strings[] = {
+            // Document:
+            "{ flags: ['vme', 'de', 'pse', 'tsc', 'msr', 'pae', 'mce' ] }",
+
+            // Modifier:
+            "{ $pull: { flags: 'msr' } }",
+
+            // Document result:
+            "{ flags: ['vme', 'de', 'pse', 'tsc', 'pae', 'mce' ] }",
+
+            // Log result:
+            "{ $set : { flags: ['vme', 'de', 'pse', 'tsc', 'pae', 'mce' ] } }"
+        };
+
+        Document doc(fromjson(strings[0]));
+        Mod mod(fromjson(strings[1]));
+
+        ModifierInterface::ExecInfo execInfo;
+        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "flags");
+        ASSERT_FALSE(execInfo.noOp);
+
+        ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+        ASSERT_EQUALS(fromjson(strings[2]), doc);
+
+        Document logDoc;
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
+        ASSERT_EQUALS(fromjson(strings[3]), logDoc);
+    }
+
+    TEST(DocumentationTests, Example2a) {
+        const char* const strings[] = {
+            // Document:
+            "{ votes: [ 3, 5, 6, 7, 7, 8 ] }",
+
+            // Modifier:
+            "{ $pull: { votes: 7 } }",
+
+            // Document result:
+            "{ votes: [ 3, 5, 6, 8 ] }",
+
+            // Log result:
+            "{ $set : { votes: [ 3, 5, 6, 8 ] } }"
+        };
+
+        Document doc(fromjson(strings[0]));
+        Mod mod(fromjson(strings[1]));
+
+        ModifierInterface::ExecInfo execInfo;
+        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "votes");
+        ASSERT_FALSE(execInfo.noOp);
+
+        ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+        ASSERT_EQUALS(fromjson(strings[2]), doc);
+
+        Document logDoc;
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
+        ASSERT_EQUALS(fromjson(strings[3]), logDoc);
+    }
+
+    TEST(DocumentationTests, Example2b) {
+        const char* const strings[] = {
+            // Document:
+            "{ votes: [ 3, 5, 6, 7, 7, 8 ] }",
+
+            // Modifier:
+            "{ $pull: { votes: { $gt: 6 } } }",
+
+            // Document result:
+            "{ votes: [ 3, 5, 6 ] }",
+
+            // Log result:
+            "{ $set : { votes: [ 3, 5, 6 ] } }"
+        };
+
+        Document doc(fromjson(strings[0]));
+        Mod mod(fromjson(strings[1]));
+
+        ModifierInterface::ExecInfo execInfo;
+        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "votes");
+        ASSERT_FALSE(execInfo.noOp);
+
+        ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+        ASSERT_EQUALS(fromjson(strings[2]), doc);
+
+        Document logDoc;
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
+        ASSERT_EQUALS(fromjson(strings[3]), logDoc);
+    }
+
+    TEST(MatchingEdgeCases, NonObjectShortCircuit) {
+        const char* const strings[] = {
+            "{ a: [ { x: 1 }, 2 ] }",
+
+            "{ $pull: { a: { x: 1 } } }",
+
+            "{ a: [ 2 ] }",
+
+            "{ $set : { a: [ 2 ] } }",
+        };
+
+        Document doc(fromjson(strings[0]));
+        Mod mod(fromjson(strings[1]));
+
+        ModifierInterface::ExecInfo execInfo;
+        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
+        ASSERT_FALSE(execInfo.noOp);
+
+        ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+        ASSERT_EQUALS(fromjson(strings[2]), doc);
+
+        Document logDoc;
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
+        ASSERT_EQUALS(fromjson(strings[3]), logDoc);
+    }
+
+    TEST(MatchingRegressions, SERVER_3988) {
+        const char* const strings[] = {
+            "{ x: 1, y: [ 2, 3, 4, 'abc', 'xyz' ] }",
+
+            "{ $pull: { y: /yz/ } }",
+
+            "{ x: 1, y: [ 2, 3, 4, 'abc' ] }",
+
+            "{ $set : { y: [ 2, 3, 4, 'abc' ] } }",
+        };
+
+        Document doc(fromjson(strings[0]));
+        Mod mod(fromjson(strings[1]));
+
+        ModifierInterface::ExecInfo execInfo;
+        ASSERT_OK(mod.prepare(doc.root(), "", &execInfo));
+        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "y");
+        ASSERT_FALSE(execInfo.noOp);
+
+        ASSERT_OK(mod.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+        ASSERT_EQUALS(fromjson(strings[2]), doc);
+
+        Document logDoc;
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(mod.log(&logBuilder));
         ASSERT_EQUALS(fromjson(strings[3]), logDoc);
     }
 

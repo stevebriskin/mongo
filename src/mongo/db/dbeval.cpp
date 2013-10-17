@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -24,8 +36,6 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/privilege_set.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
@@ -61,7 +71,9 @@ namespace mongo {
             return false;
         }
 
-        auto_ptr<Scope> s = globalScriptEngine->getPooledScope( dbName, "dbeval" );
+        const string userToken = ClientBasic::getCurrent()->getAuthorizationSession()
+                                                          ->getAuthenticatedUserNamesToken();
+        auto_ptr<Scope> s = globalScriptEngine->getPooledScope( dbName, "dbeval" + userToken );
         ScriptingFunction f = s->createFunction(code);
         if ( f == 0 ) {
             errmsg = (string)"compile failed: " + s->getError();
@@ -87,9 +99,9 @@ namespace mongo {
         int res;
         {
             Timer t;
-            res = s->invoke(f, &args, 0, cmdLine.quota ? 10 * 60 * 1000 : 0 );
+            res = s->invoke(f, &args, 0, storageGlobalParams.quota ? 10 * 60 * 1000 : 0);
             int m = t.millis();
-            if ( m > cmdLine.slowMS ) {
+            if (m > serverGlobalParams.slowMS) {
                 out() << "dbeval slow, time: " << dec << m << "ms " << dbName << endl;
                 if ( m >= 1000 ) log() << code << endl;
                 else OCCASIONALLY log() << code << endl;
@@ -123,9 +135,8 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
-            // $eval can do pretty much anything, so require all privileges.
-            out->push_back(Privilege(PrivilegeSet::WILDCARD_RESOURCE,
-                                     getGlobalAuthorizationManager()->getAllUserActions()));
+
+            RoleGraph::generateUniversalPrivileges(out);
         }
         CmdEval() : Command("eval", false, "$eval") { }
         bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {

@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -30,9 +42,10 @@
 #include "mongo/base/init.h"
 #include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/security_key.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/logger/logger.h"
+#include "mongo/logger/console_appender.h"
 #include "mongo/logger/message_event.h"
 #include "mongo/logger/message_event_utf8_encoder.h"
 #include "mongo/logger/ramlog.h"
@@ -56,7 +69,7 @@ namespace mongo {
         if ( sig == SIGUSR2 ) {
             ProcessId cur = ProcessId::getCurrent();
             
-            if ( cur == cmdLine.parentProc || cur == cmdLine.leaderProc ) {
+            if (cur == serverGlobalParams.parentProc || cur == serverGlobalParams.leaderProc) {
                 // signal indicates successful start allowing us to exit
                 _exit(0);
             } 
@@ -67,10 +80,10 @@ namespace mongo {
         verify( signal(SIGUSR2 , launchSignal ) != SIG_ERR );
     }
 
-    void CmdLine::launchOk() {
-        if ( cmdLine.doFork ) {
+    void signalForkSuccess() {
+        if (serverGlobalParams.doFork) {
             // killing leader will propagate to parent
-            verify( kill( cmdLine.leaderProc.toNative(), SIGUSR2 ) == 0 );
+            verify(kill(serverGlobalParams.leaderProc.toNative(), SIGUSR2) == 0);
         }
     }
 #endif
@@ -78,13 +91,14 @@ namespace mongo {
 
     static bool forkServer() {
 #ifndef _WIN32
-        if (cmdLine.doFork) {
-            fassert(16447, !cmdLine.logpath.empty() || cmdLine.logWithSyslog);
+        if (serverGlobalParams.doFork) {
+            fassert(16447, !serverGlobalParams.logpath.empty() ||
+                           serverGlobalParams.logWithSyslog);
 
             cout.flush();
             cerr.flush();
 
-            cmdLine.parentProc = ProcessId::getCurrent();
+            serverGlobalParams.parentProc = ProcessId::getCurrent();
 
             // facilitate clean exit when child starts successfully
             setupLaunchSignals();
@@ -123,7 +137,7 @@ namespace mongo {
             }
             setsid();
 
-            cmdLine.leaderProc = ProcessId::getCurrent();
+            serverGlobalParams.leaderProc = ProcessId::getCurrent();
 
             pid_t child2 = fork();
             if (child2 == -1) {
@@ -173,7 +187,7 @@ namespace mongo {
     }
 
     MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
-                              ("GlobalLogManager", "globalVariablesConfigured"),
+                              ("GlobalLogManager", "EndStartupOptionHandling", "ForkServer"),
                               ("default"))(
             InitializerContext*) {
 
@@ -185,13 +199,18 @@ namespace mongo {
         using logger::RotatableFileAppender;
         using logger::StatusWithRotatableFileWriter;
 
-#ifndef _WIN32
-        using logger::SyslogAppender;
+        if (serverGlobalParams.logWithSyslog) {
+#ifdef _WIN32
+            return Status(ErrorCodes::InternalError,
+                          "Syslog requested in Windows build; command line processor logic error");
+#else
+            using logger::SyslogAppender;
 
-        if (cmdLine.logWithSyslog) {
             StringBuilder sb;
-            sb << cmdLine.binaryName << "." << cmdLine.port;
-            openlog(strdup(sb.str().c_str()), LOG_PID | LOG_CONS, LOG_USER);
+            sb << serverGlobalParams.binaryName << "." << serverGlobalParams.port;
+            openlog(strdup(sb.str().c_str()),
+                    LOG_PID | LOG_CONS,
+                    serverGlobalParams.syslogFacility);
             LogManager* manager = logger::globalLogManager();
             manager->getGlobalDomain()->clearAppenders();
             manager->getGlobalDomain()->attachAppender(
@@ -202,15 +221,22 @@ namespace mongo {
                     MessageLogDomain::AppenderAutoPtr(
                             new SyslogAppender<MessageEventEphemeral>(
                                     new logger::MessageEventWithContextEncoder)));
-        }
 #endif // defined(_WIN32)
-
-        if (!cmdLine.logpath.empty()) {
-            fassert(16448, !cmdLine.logWithSyslog);
+        }
+        else if (!serverGlobalParams.logpath.empty()) {
+            fassert(16448, !serverGlobalParams.logWithSyslog);
             std::string absoluteLogpath = boost::filesystem::absolute(
-                    cmdLine.logpath, cmdLine.cwd).string();
+                    serverGlobalParams.logpath, serverGlobalParams.cwd).string();
 
-            const bool exists = boost::filesystem::exists(absoluteLogpath);
+            bool exists;
+
+            try{
+                exists = boost::filesystem::exists(absoluteLogpath);
+            } catch(boost::filesystem::filesystem_error& e) {
+                return Status(ErrorCodes::FileNotOpen, mongoutils::str::stream() <<
+                        "Failed probe for \"" << absoluteLogpath << "\": " <<
+                        e.code().message());
+            }
 
             if (exists) {
                 if (boost::filesystem::is_directory(absoluteLogpath)) {
@@ -219,7 +245,8 @@ namespace mongo {
                                   "\" should name a file, not a directory.");
                 }
 
-                if (!cmdLine.logAppend && boost::filesystem::is_regular(absoluteLogpath)) {
+                if (!serverGlobalParams.logAppend &&
+                    boost::filesystem::is_regular(absoluteLogpath)) {
                     std::string renameTarget = absoluteLogpath + "." + terseCurrentTime(false);
                     if (0 == rename(absoluteLogpath.c_str(), renameTarget.c_str())) {
                         log() << "log file \"" << absoluteLogpath
@@ -236,7 +263,8 @@ namespace mongo {
             }
 
             StatusWithRotatableFileWriter writer =
-                logger::globalRotatableFileManager()->openFile(absoluteLogpath, cmdLine.logAppend);
+                logger::globalRotatableFileManager()->openFile(absoluteLogpath,
+                                                               serverGlobalParams.logAppend);
             if (!writer.isOK()) {
                 return writer.getStatus();
             }
@@ -252,17 +280,19 @@ namespace mongo {
                             new RotatableFileAppender<MessageEventEphemeral>(
                                     new MessageEventDetailsEncoder, writer.getValue())));
 
-            if (cmdLine.logAppend && exists) {
-                log() << std::endl;
-                log() << std::endl;
-                log() << "***** SERVER RESTARTED *****";
-                log() << std::endl;
-                log() << std::endl;
+            if (serverGlobalParams.logAppend && exists) {
+                log() << "***** SERVER RESTARTED *****" << endl;
                 Status status =
                     logger::RotatableFileWriter::Use(writer.getValue()).status();
                 if (!status.isOK())
                     return status;
             }
+        }
+        else {
+            logger::globalLogManager()->getNamedDomain("javascriptOutput")->attachAppender(
+                    MessageLogDomain::AppenderAutoPtr(
+                            new logger::ConsoleAppender<MessageEventEphemeral>(
+                                    new MessageEventDetailsEncoder)));
         }
 
         logger::globalLogDomain()->attachAppender(
@@ -274,30 +304,38 @@ namespace mongo {
 
     bool initializeServerGlobalState() {
 
-        Listener::globalTicketHolder.resize( cmdLine.maxConns );
+        Listener::globalTicketHolder.resize(serverGlobalParams.maxConns);
 
 #ifndef _WIN32
-        if (!fs::is_directory(cmdLine.socket)) {
-            cout << cmdLine.socket << " must be a directory" << endl;
+        if (!fs::is_directory(serverGlobalParams.socket)) {
+            cout << serverGlobalParams.socket << " must be a directory" << endl;
             return false;
         }
 #endif
 
-        if (!cmdLine.pidFile.empty()) {
-            writePidFile(cmdLine.pidFile);
+        if (!serverGlobalParams.pidFile.empty()) {
+            if (!writePidFile(serverGlobalParams.pidFile)) {
+                // error message logged in writePidFile
+                return false;
+            }
         }
 
-        if (!cmdLine.keyFile.empty() && cmdLine.clusterAuthMode != "x509") {
-            if (!setUpSecurityKey(cmdLine.keyFile)) {
+        if (!serverGlobalParams.keyFile.empty() && serverGlobalParams.clusterAuthMode != "x509") {
+            if (!setUpSecurityKey(serverGlobalParams.keyFile)) {
                 // error message printed in setUpPrivateKey
                 return false;
             }
-
-            AuthorizationManager::setAuthEnabled(true);
         }
- 
+
+        // Auto-enable auth except if clusterAuthMode is not set.
+        // clusterAuthMode is automatically set if a --keyfile parameter is provided.
+        if (!serverGlobalParams.clusterAuthMode.empty()) {
+            getGlobalAuthorizationManager()->setAuthEnabled(true);
+        }
+
 #ifdef MONGO_SSL
-        if (cmdLine.clusterAuthMode == "x509" || cmdLine.clusterAuthMode == "sendX509") {
+        if (serverGlobalParams.clusterAuthMode == "x509" ||
+            serverGlobalParams.clusterAuthMode == "sendX509") {
             setInternalUserAuthParams(BSON(saslCommandMechanismFieldName << "MONGODB-X509" <<
                                            saslCommandUserSourceFieldName << "$external" <<
                                            saslCommandUserFieldName << 

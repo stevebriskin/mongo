@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -38,6 +50,8 @@ namespace mongo {
      * all helpers assume locking is handled above them
      */
     struct Helpers {
+
+        class RemoveSaver;
 
         /* ensure the specified index exists.
 
@@ -121,12 +135,6 @@ namespace mongo {
          */
         static BSONObj inferKeyPattern( const BSONObj& o );
 
-        class RemoveCallback {
-        public:
-            virtual ~RemoveCallback() {}
-            virtual void goingToDelete( const BSONObj& o ) = 0;
-        };
-
         /**
          * Takes a namespace range, specified by a min and max and qualified by an index pattern,
          * and removes all the documents in that range found by iterating
@@ -145,7 +153,7 @@ namespace mongo {
         static long long removeRange( const KeyRange& range,
                                       bool maxInclusive = false,
                                       bool secondaryThrottle = false,
-                                      RemoveCallback * callback = 0,
+                                      RemoveSaver* callback = NULL,
                                       bool fromMigrate = false,
                                       bool onlyRemoveOrphanedDocs = false );
 
@@ -182,22 +190,21 @@ namespace mongo {
          */
         static void emptyCollection(const char *ns);
 
-    };
+        /**
+         * for saving deleted bson objects to a flat file
+         */
+        class RemoveSaver : public boost::noncopyable {
+        public:
+            RemoveSaver(const string& type, const string& ns, const string& why);
+            ~RemoveSaver();
 
-    /**
-     * user for saving deleted bson objects to a flat file
-     */
-    class RemoveSaver : public Helpers::RemoveCallback , boost::noncopyable {
-    public:
-        RemoveSaver( const string& type , const string& ns , const string& why);
-        ~RemoveSaver();
+            void goingToDelete( const BSONObj& o );
 
-        void goingToDelete( const BSONObj& o );
-
-    private:
-        boost::filesystem::path _root;
-        boost::filesystem::path _file;
-        ofstream* _out;
+        private:
+            boost::filesystem::path _root;
+            boost::filesystem::path _file;
+            ofstream* _out;
+        };
 
     };
 

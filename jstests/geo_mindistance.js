@@ -47,7 +47,7 @@ for (var x = 0; x <= 10; x += 1) {
 t.ensureIndex({loc: "2dsphere"});
 
 var n_docs = t.count(),
-    geoJSONPoint = {$geometry: {type: 'Point', coordinates: [0, 0]}},
+    geoJSONPoint = {type: 'Point', coordinates: [0, 0]},
     legacyPoint = [0, 0];
 
 //
@@ -56,8 +56,8 @@ var n_docs = t.count(),
 //
 
 var n_min1400_count = t.find({loc: {
-    $near: geoJSONPoint, $minDistance: 1400 * km
-}}).count();
+    $near: {$geometry: geoJSONPoint, $minDistance: 1400 * km
+}}}).count();
 
 assert.eq(
     n_docs - n_docs_within(1400),
@@ -68,10 +68,10 @@ assert.eq(
 );
 
 var n_bw500_and_1000_count = t.find({loc: {
-    $near: geoJSONPoint,
-    $minDistance: 500 * km,
-    $maxDistance: 1000 * km
-}}).count();
+    $near: {$geometry: geoJSONPoint,
+            $minDistance: 500 * km,
+            $maxDistance: 1000 * km
+}}}).count();
 
 assert.eq(
     n_docs_within(1000) - n_docs_within(500),
@@ -212,81 +212,6 @@ assert.eq(
         + " points geoNear (0, 0) with $minDistance 500 km and $maxDistance 1000 km, got "
         + cmdResult.results.length
 );
-
-//
-// Test $minDistance input validation for $near and $nearSphere queries,
-// and for geoNear command.
-//
-
-/** Some bad inputs for $near and $nearSphere. */
-var badMinDistance, badMinDistances = [-1, undefined, 'foo'];
-for (var i = 0; i < badMinDistances.length; i++) {
-    badMinDistance = badMinDistances[i];
-
-    assert.throws(
-        function(minDistance) {
-            t.find({loc: {$nearSphere: geoJSONPoint, $minDistance: minDistance}}).next();
-        },
-        [badMinDistance],
-        "$nearSphere with GeoJSON point should've failed with $minDistance = " + badMinDistance);
-
-    assert.throws(
-        function(minDistance) {
-            t.find({loc: {$nearSphere: legacyPoint, $minDistance: minDistance}}).next();
-        },
-        [badMinDistance],
-        "$nearSphere with legacy coordinates should've failed with $minDistance = " + badMinDistance);
-
-    assert.throws(
-        function(minDistance) {
-            t.find({loc: {$near: geoJSONPoint, $minDistance: minDistance}}).next();
-        },
-        [badMinDistance],
-        "$near with GeoJSON point should've failed with $minDistance = " + badMinDistance);
-
-    assert.commandFailed(
-        db.runCommand({
-            geoNear: t.getName(),
-            near: legacyPoint,
-            minDistance: badMinDistance,
-            spherical: true
-        }),
-        "geoNear with legacy coordinates should've failed with $minDistance = " + badMinDistance);
-
-    assert.commandFailed(
-        db.runCommand({
-            geoNear: t.getName(),
-            near: {type: 'Point', coordinates: [0, 0]},
-            minDistance: badMinDistance,
-            spherical: true
-        }),
-        "geoNear with GeoJSON point should've failed with $minDistance = " + badMinDistance);
-}
-
-/* Can't be more than half earth radius in meters. */
-badMinDistance = Math.PI * earthRadiusMeters + 10;
-assert.throws(
-    function(minDistance) {
-        t.find({loc: {$near: geoJSONPoint, $minDistance: minDistance}}).next();
-    },
-    [badMinDistance],
-    "$near should've failed with $minDistance = " + badMinDistance);
-
-assert.throws(
-    function(minDistance) {
-        t.find({loc: {$nearSphere: geoJSONPoint, $minDistance: minDistance}}).next();
-    },
-    [badMinDistance],
-    "$nearSphere should've failed with $minDistance = " + badMinDistance);
-
-/* Can't be more than pi. */
-badMinDistance = Math.PI + 0.1;
-assert.throws(
-    function(minDistance) {
-        t.find({loc: {$nearSphere: legacyPoint, $minDistance: minDistance}}).next();
-    },
-    [badMinDistance],
-    "$near should've failed with $minDistance = " + badMinDistance);
 
 //
 // Verify that we throw errors using 2d index with $minDistance.

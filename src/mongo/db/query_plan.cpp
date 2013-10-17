@@ -12,12 +12,23 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/query_plan.h"
 
 #include "mongo/db/btreecursor.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/index_selection.h"
 #include "mongo/db/index/catalog_hack.h"
 #include "mongo/db/index/emulated_cursor.h"
@@ -28,6 +39,7 @@
 #include "mongo/db/parsed_query.h"
 #include "mongo/db/query_plan_summary.h"
 #include "mongo/db/queryutil.h"
+#include "mongo/db/structure/collection.h"
 #include "mongo/server.h"
 
 namespace mongo {
@@ -350,15 +362,16 @@ doneCheckOrder:
             return;
         }
 
-        SimpleMutex::scoped_lock lk( NamespaceDetailsTransient::_qcMutex );
         QueryPattern queryPattern = _frs.pattern( _order );
         CachedQueryPlan queryPlanToCache( indexKey(), nScanned, candidatePlans );
-        NamespaceDetailsTransient &nsdt = NamespaceDetailsTransient::get_inlock( ns() );
-        nsdt.registerCachedQueryPlanForPattern( queryPattern, queryPlanToCache );
+
+        Collection* collection = cc().database()->getCollection( ns() );
+        verify( collection );
+        collection->infoCache()->registerCachedQueryPlanForPattern( queryPattern, queryPlanToCache );
     }
-    
+
     void QueryPlan::checkTableScanAllowed() const {
-        if ( likely( !cmdLine.noTableScan ) )
+        if (likely(!storageGlobalParams.noTableScan))
             return;
 
         // TODO - is this desirable?  See SERVER-2222.
@@ -374,7 +387,8 @@ doneCheckOrder:
         if ( !nsdetails( ns() ) )
             return;
 
-        uassert( 10111, (string)"table scans not allowed:" + ns(), !cmdLine.noTableScan );
+        uassert(10111, (string)"table scans not allowed:" + ns(),
+                !storageGlobalParams.noTableScan);
     }
 
     int QueryPlan::independentRangesSingleIntervalLimit() const {

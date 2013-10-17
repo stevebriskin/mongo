@@ -1,3 +1,4 @@
+// DEPRECATED
 /**
 *    Copyright (C) 2013 10gen Inc.
 *
@@ -12,6 +13,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/index/s2_index_cursor.h"
@@ -52,12 +65,22 @@ namespace mongo {
             if (!e.isABSONObj()) { continue; }
             BSONObj obj = e.Obj();
 
-            if (nearQuery.parseFrom(obj, _params.radius)) {
+            if (nearQuery.parseFrom(obj)) {
+                if (nearQuery.centroid.crs == FLAT && !nearQuery.isNearSphere) {
+                    return Status(ErrorCodes::BadValue, "flat near query on spherical index");
+                }
                 if (isNearQuery) {
                     return Status(ErrorCodes::BadValue, "Only one $near clause allowed: " +
                                   position.toString(), 16685);
                 }
                 isNearQuery = true;
+
+                // FLAT implies the distances are in radians.  Convert to meters.
+                if (FLAT == nearQuery.centroid.crs) {
+                    nearQuery.minDistance *= _params.radius;
+                    nearQuery.maxDistance *= _params.radius;
+                }
+
                 nearQuery.field = keyElt.fieldName();
                 continue;
             }
@@ -72,6 +95,10 @@ namespace mongo {
                               16684);
             }
             regions.push_back(geoQueryField);
+        }
+
+        if (!isNearQuery && regions.size() == 0) {
+            return Status(ErrorCodes::BadValue, "None of index's fields present in seek " + position.toString());
         }
 
         // Remove all the indexed geo regions from the query.  The s2*cursor will

@@ -46,6 +46,38 @@ def findSettingsSetup():
     sys.path.append( ".." )
     sys.path.append( "../../" )
 
+# --- platform identification ---
+#
+# This needs to precede the options section so that we can only offer some options on certain
+# platforms.
+
+platform = os.sys.platform
+nix = False
+linux = False
+darwin = False
+windows = False
+freebsd = False
+openbsd = False
+solaris = False
+
+if "darwin" == platform:
+    darwin = True
+    platform = "osx" # prettier than darwin
+elif platform.startswith("linux"):
+    linux = True
+    platform = "linux"
+elif "sunos5" == platform:
+    solaris = True
+elif platform.startswith( "freebsd" ):
+    freebsd = True
+elif platform.startswith( "openbsd" ):
+    openbsd = True
+elif "win32" == platform:
+    windows = True
+else:
+    print( "No special config for [" + platform + "] which probably means it won't work" )
+
+nix = not windows
 
 # --- options ----
 
@@ -127,21 +159,26 @@ def get_variant_dir():
             x = substitute( get_option( name ) )
             a.append( name + "_" + x )
 
-    s = "#build/${PYSYSPLATFORM}/"
-
     extras = []
     if has_option("extra-variant-dirs"):
         extras = [substitute(x) for x in get_option( 'extra-variant-dirs' ).split( ',' )]
 
     if has_option("add-branch-to-variant-dir"):
         extras += ["branch_" + substitute( utils.getGitBranch() )]
-    a += extras
 
-    if len(a) > 0:
-        a.sort()
-        s += "/".join( a ) + "/"
+    if has_option('cache'):
+        s = "#build/cached/"
+        s += "/".join(extras) + "/"
     else:
-        s += "normal/"
+        s = "#build/${PYSYSPLATFORM}/"
+        a += extras
+
+        if len(a) > 0:
+            a.sort()
+            s += "/".join( a ) + "/"
+        else:
+            s += "normal/"
+
     return s
 
 # build output
@@ -163,6 +200,7 @@ add_option( "release" , "release build" , 0 , True )
 add_option( "static" , "fully static build" , 0 , False )
 add_option( "static-libstdc++" , "statically link libstdc++" , 0 , False )
 add_option( "lto", "enable link time optimizations (experimental, except with MSVC)" , 0 , True )
+add_option( "dynamic-windows", "dynamically link on Windows", 0, True)
 
 # base compile flags
 add_option( "64" , "whether to force 64 bit" , 0 , True , "force64" )
@@ -206,6 +244,13 @@ add_option( "win2008plus",
 # dev options
 add_option( "d", "debug build no optimization, etc..." , 0 , True , "debugBuild" )
 add_option( "dd", "debug build no optimization, additional debug logging, etc..." , 0 , True , "debugBuildAndLogging" )
+
+# new style debug and optimize flags
+add_option( "dbg", "Enable runtime debugging checks", 1, True, "dbg",
+            type="choice", choices=["on", "off"] )
+
+add_option( "opt", "Enable compile-time optimization", 1, True, "opt",
+            type="choice", choices=["on", "off"] )
 
 sanitizer_choices = ["address", "memory", "thread", "undefined"]
 add_option( "sanitize", "enable selected sanitizer", 1, True,
@@ -256,14 +301,38 @@ add_option( "use-cpu-profiler",
 add_option("mongod-concurrency-level", "Concurrency level, \"global\" or \"db\"", 1, True,
            type="choice", choices=["global", "db"])
 
-add_option('client-dist-basename', "Name of the client source archive.", 1, False,
-           default='mongo-cxx-driver')
-
 add_option('build-fast-and-loose', "NEVER for production builds", 0, False)
 
 add_option('propagate-shell-environment',
            "Pass shell environment to sub-processes (NEVER for production builds)",
            0, False)
+
+if darwin:
+    osx_version_choices = ['10.6', '10.7', '10.8']
+    add_option("osx-version-min", "minimum OS X version to support", 1, True,
+               type = 'choice', default = osx_version_choices[0], choices = osx_version_choices)
+
+elif windows:
+    win_version_min_choices = {
+        'xpsp3'   : ('0501', '0300'),
+        'ws03sp2' : ('0502', '0200'),
+        'vista'   : ('0600', '0000'),
+        'ws08r2'  : ('0601', '0000'),
+        'win7'    : ('0601', '0000'),
+        'win8'    : ('0602', '0000'),
+    }
+
+    add_option("win-version-min", "minimum Windows version to support", 1, True,
+               type = 'choice', default = None,
+               choices = win_version_min_choices.keys())
+
+add_option('cache',
+           "Use an object cache rather than a per-build variant directory (experimental)",
+           0, False)
+
+add_option('cache-dir',
+           "Specify the directory to use for caching objects if --cache is in use",
+           1, False, default="#build/cached/.cache")
 
 # don't run configure if user calls --help
 if GetOption('help'):
@@ -283,14 +352,8 @@ printLocalInfo()
 boostLibs = [ "thread" , "filesystem" , "program_options", "system" ]
 
 onlyServer = len( COMMAND_LINE_TARGETS ) == 0 or ( len( COMMAND_LINE_TARGETS ) == 1 and str( COMMAND_LINE_TARGETS[0] ) in [ "mongod" , "mongos" , "test" ] )
-nix = False
-linux = False
+
 linux64  = False
-darwin = False
-windows = False
-freebsd = False
-openbsd = False
-solaris = False
 force32 = has_option( "force32" ) 
 force64 = has_option( "force64" )
 if not force64 and not force32 and os.getcwd().endswith( "mongo-64" ):
@@ -302,11 +365,85 @@ if force32:
 elif force64:
     msarch = "amd64"
 
-release = has_option( "release" )
+releaseBuild = has_option("release")
+
+# validate debug and optimization options
+usingOldOptDbgOptions = has_option("debugBuild") or has_option("debugBuildAndLogging")
+usingNewOptDbgOptions = has_option('dbg') or has_option('opt')
+
+if usingOldOptDbgOptions and usingNewOptDbgOptions:
+    print("Error: Cannot mix old style --d or --dd options with new --dbg and --opt options")
+    Exit(1)
+
+# By default, if no options are specified, we assume the new style options and defaults.
+if not usingOldOptDbgOptions:
+
+    dbg_opt_mapping = {
+        # --dbg, --opt   :   dbg    opt
+        ( None,  None  ) : ( False, True ),
+        ( None,  "on"  ) : ( False, True ),
+        ( None,  "off" ) : ( False, False ),
+        ( "on",  None  ) : ( True,  False ),  # special case interaction
+        ( "on",  "on"  ) : ( True,  True ),
+        ( "on",  "off" ) : ( True,  False ),
+        ( "off", None  ) : ( False, True ),
+        ( "off", "on"  ) : ( False, True ),
+        ( "off", "off" ) : ( False, False ),
+    }
+    debugBuild, optBuild = dbg_opt_mapping[(get_option('dbg'), get_option('opt'))]
+
+    if releaseBuild and (debugBuild or not optBuild):
+        print("Error: A --release build may not have debugging, and must have optimization")
+        Exit(1)
+
+else:
+    # TODO: Once all buildbots and variants have switched to the new flags,
+    # remove support for --d and --dd
+
+    d_provided = has_option( "debugBuild" )
+    dd_provided = has_option( "debugBuildAndLogging" )
+
+    dbg_opt_mapping = {
+        # win    --d    --dd   --release :   dbg    opt   release
+        ( False, False, False, False )   : ( False, True, False ),
+        ( False, False, False, True  )   : ( False, True, True ),
+
+        ( False, False, True,  False )   : ( True, False, False ),
+        ( False, False, True,  True  )   : None,
+
+
+        ( False, True, False, False )    : ( False, False, False ),
+        ( False, True, False, True  )    : None,
+
+        ( False, True, True,  False )    : ( True, False, False ),
+        ( False, True, True,  True  )    : None,
+
+
+
+
+        ( True, False, False, False )    : ( False, False, False ),
+        ( True, False, False, True  )    : ( False, True, True ),
+
+        ( True, False, True,  False )    : ( True, False, False ),
+        ( True, False, True,  True  )    : ( False, True, True ),  # --release dominates on windows
+
+
+        ( True, True, False, False )     : ( True, False, False ),
+        ( True, True, False, True  )     : ( False, True, True ),  # --release dominates on windows
+
+        ( True, True, True,  False )     : ( True, False, False ),
+        ( True, True, True,  True  )     : ( False, True, True ),  # --release dominates on windows
+    }
+
+    values = dbg_opt_mapping.get((windows, d_provided, dd_provided, releaseBuild))
+    if not values:
+        print("Error: An invalid combination of --d, --dd, and --release was specified")
+        Exit(1)
+
+    debugBuild, optBuild, releaseBuild = values
+
 static = has_option( "static" )
 
-debugBuild = has_option( "debugBuild" ) or has_option( "debugBuildAndLogging" ) 
-debugLogging = has_option( "debugBuildAndLogging" )
 noshell = has_option( "noshell" ) 
 
 usev8 = has_option( "usev8" ) 
@@ -318,10 +455,6 @@ usePCH = has_option( "usePCH" )
 justClientLib = (COMMAND_LINE_TARGETS == ['mongoclient'])
 
 env = Environment( BUILD_DIR=variantDir,
-                   CLIENT_ARCHIVE='${CLIENT_DIST_BASENAME}${DIST_ARCHIVE_SUFFIX}',
-                   CLIENT_DIST_BASENAME=get_option('client-dist-basename'),
-                   CLIENT_LICENSE='#distsrc/client/LICENSE.txt',
-                   CLIENT_SCONSTRUCT='#distsrc/client/SConstruct',
                    DIST_ARCHIVE_SUFFIX='.tgz',
                    EXTRAPATH=get_option("extrapath"),
                    MODULE_BANNERS=[],
@@ -341,6 +474,16 @@ env = Environment( BUILD_DIR=variantDir,
                    CONFIGURELOG = '#' + scons_data_dir + '/config.log'
                    )
 
+if has_option("cache"):
+    EnsureSConsVersion( 2, 3, 0 )
+    if has_option("release"):
+        print("Using the experimental --cache option is not permitted for --release builds")
+        Exit(1)
+    if has_option("gcov"):
+        print("Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084")
+        Exit(1)
+    env.CacheDir(str(env.Dir(get_option('cache-dir'))))
+
 # This could be 'if solaris', but unfortuantely that variable hasn't been set yet.
 if "sunos5" == os.sys.platform:
     # SERVER-9890: On Solaris, SCons preferentially loads the sun linker tool 'sunlink' when
@@ -355,6 +498,8 @@ if "sunos5" == os.sys.platform:
     #  http://four.pairlist.net/pipermail/scons-users/2013-June/001486.html
     env.Tool('gnulink')
 
+if optBuild:
+    env.Append( CPPDEFINES=["MONGO_OPTIMIZED_BUILD"] )
 
 if has_option("propagate-shell-environment"):
     env['ENV'] = dict(os.environ);
@@ -489,7 +634,6 @@ def addExtraLibs( s ):
 
 if has_option( "extrapath" ):
     addExtraLibs( GetOption( "extrapath" ) )
-    release = True # this is so we force using .a
 
 if has_option( "extrapathdyn" ):
     addExtraLibs( GetOption( "extrapathdyn" ) )
@@ -519,7 +663,6 @@ if has_option( "full" ):
 
 # ---- other build setup -----
 
-platform = os.sys.platform
 if "uname" in dir(os):
     processor = os.uname()[4]
 else:
@@ -544,21 +687,11 @@ if has_option( "prefix" ):
 def filterExists(paths):
     return filter(os.path.exists, paths)
 
-if "darwin" == os.sys.platform:
-    darwin = True
-    platform = "osx" # prettier than darwin
-
-    # Unfortunately, we are too late here to affect the variant dir. We could maybe make this
-    # flag available on all platforms and complain if it is used on non-darwin targets.
-    osx_version_choices = ['10.6', '10.7', '10.8']
-    add_option("osx-version-min", "minimum OS X version to support", 1, False,
-               type = 'choice', default = osx_version_choices[0], choices = osx_version_choices)
+if darwin:
 
     if env["CXX"] is None:
         if os.path.exists( "/usr/bin/g++-4.2" ):
             env["CXX"] = "g++-4.2"
-
-    nix = True
 
     if force64:
        env.Append( EXTRACPPPATH=["/usr/64/include"] )
@@ -569,9 +702,7 @@ if "darwin" == os.sys.platform:
        env.Append( EXTRACPPPATH=filterExists(["/sw/include" , "/opt/local/include"]) )
        env.Append( EXTRALIBPATH=filterExists(["/sw/lib/", "/opt/local/lib"]) )
 
-elif os.sys.platform.startswith("linux"):
-    linux = True
-    platform = "linux"
+elif linux:
 
     env.Append( LIBS=['m'] )
 
@@ -587,52 +718,31 @@ elif os.sys.platform.startswith("linux"):
         env.Append( EXTRALIBPATH=["/usr/lib32"] )
         env.Append( CCFLAGS=["-mmmx"] )
 
-    nix = True
-
     if static:
         env.Append( LINKFLAGS=" -static " )
     if has_option( "static-libstdc++" ):
         env.Append( LINKFLAGS=" -static-libstdc++ " )
 
-elif "sunos5" == os.sys.platform:
-     nix = True
-     solaris = True
+elif solaris:
      env.Append( CPPDEFINES=[ "__sunos__" ] )
      env.Append( LIBS=["socket","resolv"] )
 
-elif os.sys.platform.startswith( "freebsd" ):
-    nix = True
-    freebsd = True
+elif freebsd:
     env.Append( LIBS=[ "kvm" ] )
     env.Append( EXTRACPPPATH=[ "/usr/local/include" ] )
     env.Append( EXTRALIBPATH=[ "/usr/local/lib" ] )
     env.Append( CPPDEFINES=[ "__freebsd__" ] )
     env.Append( CCFLAGS=[ "-fno-omit-frame-pointer" ] )
 
-elif os.sys.platform.startswith( "openbsd" ):
-    nix = True
-    openbsd = True
+elif openbsd:
     env.Append( EXTRACPPPATH=[ "/usr/local/include" ] )
     env.Append( EXTRALIBPATH=[ "/usr/local/lib" ] )
     env.Append( CPPDEFINES=[ "__openbsd__" ] )
 
-elif "win32" == os.sys.platform:
-    windows = True
+elif windows:
+    dynamicCRT = has_option("dynamic-windows")
 
     env['DIST_ARCHIVE_SUFFIX'] = '.zip'
-
-    win_version_min_choices = {
-        'xpsp3'   : ('0501', '0300'),
-        'ws03sp2' : ('0502', '0200'),
-        'vista'   : ('0600', '0000'),
-        'ws08r2'  : ('0601', '0000'),
-        'win7'    : ('0601', '0000'),
-        'win8'    : ('0602', '0000'),
-    }
-
-    add_option("win-version-min", "minimum Windows version to support", 1, False,
-               type = 'choice', default = None,
-               choices = win_version_min_choices.keys())
 
     if has_option('win-version-min') and has_option('win2008plus'):
         print("Can't specify both 'win-version-min' and 'win2008plus'")
@@ -679,34 +789,45 @@ elif "win32" == os.sys.platform:
     # /Gy function level linking (implicit when using /Z7)
     # /Z7 debug info goes into each individual .obj file -- no .pdb created 
     env.Append( CCFLAGS= ["/Z7", "/errorReport:none"] )
-    if release:
+
+    # /DEBUG will tell the linker to create a .pdb file
+    # which WinDbg and Visual Studio will use to resolve
+    # symbols if you want to debug a release-mode image.
+    # Note that this means we can't do parallel links in the build.
+    #
+    # Please also note that this has nothing to do with _DEBUG or optimization.
+    env.Append( LINKFLAGS=["/DEBUG"] )
+
+    # /MD:  use the multithreaded, DLL version of the run-time library (MSVCRT.lib/MSVCR###.DLL)
+    # /MT:  use the multithreaded, static version of the run-time library (LIBCMT.lib)
+    # /MDd: Defines _DEBUG, _MT, _DLL, and uses MSVCRTD.lib/MSVCRD###.DLL
+    # /MTd: Defines _DEBUG, _MT, and causes your application to use the
+    #       debug multithread version of the run-time library (LIBCMTD.lib)
+
+    winRuntimeLibMap = {
+          #dyn   #dbg
+        ( False, False ) : "/MT",
+        ( False, True  ) : "/MTd",
+        ( True,  False ) : "/MD",
+        ( True,  True  ) : "/MDd",
+    }
+
+    env.Append(CCFLAGS=[winRuntimeLibMap[(dynamicCRT, debugBuild)]])
+
+    if optBuild:
         # /O2:  optimize for speed (as opposed to size)
         # /Oy-: disable frame pointer optimization (overrides /O2, only affects 32-bit)
-        # /MT:  use the multithreaded, static version of the run-time library (LIBCMT.lib)
-        env.Append( CCFLAGS= ["/O2", "/Oy-", "/MT"] )
-
-        # /DEBUG will tell the linker to create a .pdb file
-        # which WinDbg and Visual Studio will use to resolve
-        # symbols if you want to debug a release-mode image.
-        # Note that this means we can't do parallel links in the build.
-        env.Append( LINKFLAGS=" /DEBUG " )
+        env.Append( CCFLAGS=["/O2", "/Oy-"] )
     else:
-        # /RTC1: - Enable Stack Frame Run-Time Error Checking; Reports when a variable is used without having been initialized
-        #        (implies /Od: no optimizations)
-        # /MTd: Defines _DEBUG, _MT, and causes your application to use the
-        #       debug multithread version of the run-time library (LIBCMTD.lib)
-        env.Append( CCFLAGS=["/RTC1", "/Od", "/MTd"] )
-        if debugBuild:
-            # If you build without --d, no debug PDB will be generated, and 
-            # linking will be faster. However, you won't be able to debug your code with the debugger.
-            env.Append( LINKFLAGS=" /debug " )
-        #if debugLogging:
-            # This is already implicit from /MDd...
-            #env.Append( CPPDEFINES=[ "_DEBUG" ] )
-            # This means --dd is always on unless you say --release
+        env.Append( CCFLAGS=["/Od"] )
+
+    if debugBuild and not optBuild:
+        # /RTC1: - Enable Stack Frame Run-Time Error Checking; Reports when a variable is used
+        # without having been initialized (implies /Od: no optimizations)
+        env.Append( CCFLAGS=["/RTC1"] )
 
     # This gives 32-bit programs 4 GB of user address space in WOW64, ignored in 64-bit builds
-    env.Append( LINKFLAGS=" /LARGEADDRESSAWARE " )
+    env.Append( LINKFLAGS=["/LARGEADDRESSAWARE"] )
 
     env.Append(LIBS=['ws2_32.lib', 'kernel32.lib', 'advapi32.lib', 'Psapi.lib', 'DbgHelp.lib', 'shell32.lib'])
 
@@ -716,9 +837,6 @@ elif "win32" == os.sys.platform:
 
     env.Append( EXTRACPPPATH=["#/../winpcap/Include"] )
     env.Append( EXTRALIBPATH=["#/../winpcap/Lib"] )
-
-else:
-    print( "No special config for [" + os.sys.platform + "] which probably means it won't work" )
 
 env['STATIC_AND_SHARED_OBJECTS_ARE_THE_SAME'] = 1
 if nix:
@@ -769,15 +887,18 @@ if nix:
 
     if linux and has_option( "gcov" ):
         env.Append( CXXFLAGS=" -fprofile-arcs -ftest-coverage " )
+        env.Append( CPPDEFINES=["MONGO_GCOV"] )
         env.Append( LINKFLAGS=" -fprofile-arcs -ftest-coverage " )
 
-    if debugBuild:
-        env.Append( CCFLAGS=["-O0", "-fstack-protector"] )
-        env['ENV']['GLIBCXX_FORCE_NEW'] = 1; # play nice with valgrind
-    else:
+    if optBuild:
         env.Append( CCFLAGS=["-O3"] )
+    else:
+        env.Append( CCFLAGS=["-O0"] )
 
-    if debugLogging:
+    if debugBuild:
+        if not optBuild:
+            env.Append( CCFLAGS=["-fstack-protector"] )
+        env['ENV']['GLIBCXX_FORCE_NEW'] = 1; # play nice with valgrind
         env.Append( CPPDEFINES=["_DEBUG"] );
 
     if force64:
@@ -1073,6 +1194,13 @@ def doConfigure(myenv):
         # including at least g++-4.6.
         AddToCCFLAGSIfSupported(myenv, "-Wno-deprecated-declarations")
 
+        # As of clang-3.4, this warning appears in v8, and gets escalated to an error.
+        AddToCCFLAGSIfSupported(myenv, "-Wno-tautological-constant-out-of-range-compare")
+
+        # New in clang-3.4, trips up things mostly in third_party, but in a few places in the
+        # primary mongo sources as well.
+        AddToCCFLAGSIfSupported(myenv, "-Wno-unused-const-variable")
+
     if has_option('c++11'):
         # The Microsoft compiler does not need a switch to enable C++11. Again we should be
         # checking for MSVC, not windows. In theory, we might be using clang or icc on windows.
@@ -1157,6 +1285,7 @@ def doConfigure(myenv):
         sanitizer_option = '-fsanitize=' + GetOption('sanitize')
         if AddToCCFLAGSIfSupported(myenv, sanitizer_option):
             myenv.Append(LINKFLAGS=[sanitizer_option])
+            myenv.Append(CCFLAGS=['-fno-omit-frame-pointer'])
         else:
             print( 'Failed to enable sanitizer with flag: ' + sanitizer_option )
             Exit(1)
@@ -1191,35 +1320,29 @@ def doConfigure(myenv):
         AddToCCFLAGSIfSupported(myenv, "-fno-builtin-memcmp")
 
     conf = Configure(myenv)
+    libdeps.setup_conftests(conf)
 
     if use_system_version_of_library("pcre"):
-        if not conf.CheckLib("pcre"):
-            print( "Can't find pcre library" )
-            Exit(1)
-        if not conf.CheckLib("pcrecpp"):
-            print( "Can't find prcecpp library" )
-            Exit(1)
+        conf.FindSysLibDep("pcre", ["pcre"])
+        conf.FindSysLibDep("pcrecpp", ["pcrecpp"])
 
     if use_system_version_of_library("snappy"):
-        if not conf.CheckLib("snappy"):
-            print( "Can't find snappy library" )
-            Exit(1)
+        conf.FindSysLibDep("snappy", ["snappy"])
 
     if use_system_version_of_library("stemmer"):
-        if not conf.CheckLib("stemmer"):
-            print( "Can't find stemmer library" )
-            Exit(1)
+        conf.FindSysLibDep("stemmer", ["stemmer"])
 
     if use_system_version_of_library("boost"):
         if not conf.CheckCXXHeader( "boost/filesystem/operations.hpp" ):
             print( "can't find boost headers" )
             Exit(1)
 
+        conf.env.Append(CPPDEFINES=[("BOOST_THREAD_VERSION", "2")])
         for b in boostLibs:
             l = "boost_" + b
-            if not conf.CheckLib([ l + boostCompiler + "-mt" + boostVersion,
-                                   l + boostCompiler + boostVersion ], language='C++' ):
-                Exit(1)
+            conf.FindSysLibDep(l,
+                [ l + boostCompiler + "-mt" + boostVersion,
+                  l + boostCompiler + boostVersion ], language='C++' )
 
     if conf.CheckHeader('unistd.h'):
         conf.env.Append(CPPDEFINES=['MONGO_HAVE_HEADER_UNISTD_H'])
@@ -1244,13 +1367,11 @@ def doConfigure(myenv):
             v8_lib_choices = ["v8_g", "v8"]
         else:
             v8_lib_choices = ["v8"]
-        if not conf.CheckLib( v8_lib_choices ):
-            Exit(1)
+        conf.FindSysLibDep( "v8", v8_lib_choices )
 
     conf.env['MONGO_BUILD_SASL_CLIENT'] = bool(has_option("use-sasl-client"))
     if conf.env['MONGO_BUILD_SASL_CLIENT'] and not conf.CheckLibWithHeader(
-        "sasl2", "sasl/sasl.h", "C", "sasl_version_info(0, 0, 0, 0, 0, 0);", autoadd=False):
-
+        "sasl2", "sasl/sasl.h", "C", "sasl_version_info(0, 0, 0, 0, 0, 0);", autoadd=False ):
         Exit(1)
 
     # requires ports devel/libexecinfo to be installed
@@ -1262,8 +1383,7 @@ def doConfigure(myenv):
     # point.
     if get_option('allocator') == 'tcmalloc':
         if use_system_version_of_library('tcmalloc'):
-            if not conf.CheckLib("tcmalloc"):
-                Exit(1)
+            conf.FindSysLibDep("tcmalloc", ["tcmalloc"])
         elif has_option("heapcheck"):
             print ("--heapcheck does not work with the tcmalloc embedded in the mongodb source "
                    "tree.  Use --use-system-tcmalloc.")
@@ -1275,7 +1395,7 @@ def doConfigure(myenv):
         Exit(1)
 
     if has_option("heapcheck"):
-        if ( not debugBuild ) and ( not debugLogging ):
+        if not debugBuild:
             print( "--heapcheck needs --d or --dd" )
             Exit( 1 )
 
@@ -1304,13 +1424,10 @@ if noshell:
 elif not onlyServer:
     shellEnv = env.Clone();
 
-    if release and ( ( darwin and force64 ) or linux64 ):
-        shellEnv["SLIBS"] = []
-
     if windows:
         shellEnv.Append( LIBS=["winmm.lib"] )
 
-enforce_glibc = linux and has_option("release") and not has_option("no-glibc-check")
+enforce_glibc = linux and releaseBuild and not has_option("no-glibc-check")
 
 def checkErrorCodes():
     import buildscripts.errorcodes as x
@@ -1494,13 +1611,8 @@ env.AlwaysBuild( "s3shell" )
 def s3dist( env , target , source ):
     s3push( str(source[0]) , "mongodb" )
 
-def s3distclient(env, target, source):
-    s3push(str(source[0]), "cxx-driver/mongodb", platformDir=False)
-
 env.Alias( "dist" , '$SERVER_ARCHIVE' )
-env.Alias( "distclient", "$CLIENT_ARCHIVE")
 env.AlwaysBuild(env.Alias( "s3dist" , [ '$SERVER_ARCHIVE' ] , [ s3dist ] ))
-env.AlwaysBuild(env.Alias( "s3distclient" , [ '$CLIENT_ARCHIVE' ] , [ s3distclient ] ))
 
 # --- an uninstall target ---
 if len(COMMAND_LINE_TARGETS) > 0 and 'uninstall' in COMMAND_LINE_TARGETS:
@@ -1524,12 +1636,13 @@ Export("env")
 Export("shellEnv")
 Export("testEnv")
 Export("has_option use_system_version_of_library")
-Export("installSetup")
+Export("installSetup mongoCodeVersion")
 Export("usev8")
 Export("darwin windows solaris linux freebsd nix")
 Export('module_sconscripts')
-Export("debugBuild")
+Export("debugBuild optBuild")
 Export("enforce_glibc")
+Export("s3push")
 
 env.SConscript('src/SConscript', variant_dir='$BUILD_DIR', duplicate=False)
 env.SConscript('src/SConscript.client', variant_dir='$BUILD_DIR/client_build', duplicate=False)

@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/modifier_pull_all.h"
@@ -20,9 +32,14 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/ops/field_checker.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/db/ops/path_support.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
+
+    namespace mb = mutablebson;
+    namespace str = mongoutils::str;
 
     struct ModifierPullAll::PreparedState {
 
@@ -39,7 +56,7 @@ namespace mongo {
         mutablebson::Document& doc;
 
         // Index in _fieldRef for which an Element exist in the document.
-        int32_t pathFoundIndex;
+        size_t pathFoundIndex;
 
         // Element corresponding to _fieldRef[0.._idxFound].
         mutablebson::Element pathFoundElement;
@@ -74,7 +91,7 @@ namespace mongo {
     ModifierPullAll::~ModifierPullAll() {
     }
 
-    Status ModifierPullAll::init(const BSONElement& modExpr) {
+    Status ModifierPullAll::init(const BSONElement& modExpr, const Options& opts) {
 
         //
         // field name analysis
@@ -95,7 +112,9 @@ namespace mongo {
                                                       &_positionalPathIndex,
                                                       &foundCount);
         if (foundDollar && foundCount > 1) {
-            return Status(ErrorCodes::BadValue, "too many positional($) elements found.");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "Too many positional (i.e. '$') elements found in path '"
+                                        << _fieldRef.dottedField() << "'");
         }
 
         //
@@ -103,7 +122,9 @@ namespace mongo {
         //
 
         if (modExpr.type() != Array) {
-            return Status(ErrorCodes::BadValue, "$pullAll requires an array argument");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "$pullAll requires an array argument but was given a "
+                                        << typeName(modExpr.type()));
         }
 
         // store the stuff to remove later
@@ -121,7 +142,10 @@ namespace mongo {
         // If we have a $-positional field, it is time to bind it to an actual field part.
         if (_positionalPathIndex) {
             if (matchedField.empty()) {
-                return Status(ErrorCodes::BadValue, "matched field not provided");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The positional operator did not find the match "
+                                                "needed from the query. Unexpanded update: "
+                                            << _fieldRef.dottedField());
             }
             _preparedState->pathPositionalPart = matchedField.toString();
             _fieldRef.setPart(_positionalPathIndex, _preparedState->pathPositionalPart);
@@ -138,12 +162,20 @@ namespace mongo {
             // If the path exists, we require the target field to be already an
             // array.
             if (_preparedState->pathFoundElement.getType() != Array) {
-                return Status(ErrorCodes::BadValue, "can only $pull* from arrays");
+                mb::Element idElem = mb::findElementNamed(root.leftChild(), "_id");
+                return Status(
+                    ErrorCodes::BadValue,
+                    str::stream() << "Can only apply $pullAll to an array. "
+                                  << idElem.toString()
+                                  << " has the field "
+                                  <<  _preparedState->pathFoundElement.getFieldName()
+                                  << " of non-array type "
+                                  << typeName(_preparedState->pathFoundElement.getType()));
             }
 
             // No children, nothing to do -- not an error state
             if (!_preparedState->pathFoundElement.hasChildren()) {
-                execInfo->inPlace = execInfo->noOp = true;
+                execInfo->noOp = true;
             } else {
                 mutablebson::Element elem = _preparedState->pathFoundElement.leftChild();
                 while (elem.ok()) {
@@ -158,13 +190,12 @@ namespace mongo {
 
                 // Nothing to remove so it is a noOp.
                 if (_preparedState->elementsToRemove.empty())
-                    execInfo->inPlace = execInfo->noOp = true;
+                    execInfo->noOp = true;
             }
 
         } else {
             // Let the caller know we can't do anything given the mod, _fieldRef, and doc.
             execInfo->noOp = true;
-            execInfo->inPlace = true;
 
 
             //okay if path not found
@@ -191,41 +222,28 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status ModifierPullAll::log(mutablebson::Element logRoot) const {
+    Status ModifierPullAll::log(LogBuilder* logBuilder) const {
         // log document
-        mutablebson::Document& doc = logRoot.getDocument();
+        mutablebson::Document& doc = logBuilder->getDocument();
 
         const bool pathExists = _preparedState->pathFoundElement.ok() &&
-                                (_preparedState->pathFoundIndex ==
-                                    static_cast<int32_t>(_fieldRef.numParts() - 1));
-
-        // element to log, like $set/$unset
-        mutablebson::Element opElement = pathExists ?
-                                            doc.makeElementObject("$set") :
-                                            doc.makeElementObject("$unset");
-        if (!opElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot create log entry");
-        }
+            (_preparedState->pathFoundIndex == (_fieldRef.numParts() - 1));
 
         // value for the logElement ("field.path.name": <value>)
         mutablebson::Element logElement = pathExists ?
-                                            logRoot.getDocument().makeElementWithNewFieldName(
-                                                    _fieldRef.dottedField(),
-                                                    _preparedState->pathFoundElement
-                                                    ):
-                                            doc.makeElementBool(_fieldRef.dottedField(), true);
+            doc.makeElementWithNewFieldName(
+                _fieldRef.dottedField(),
+                _preparedState->pathFoundElement):
+            doc.makeElementBool(_fieldRef.dottedField(), true);
+
         if (!logElement.ok()) {
             return Status(ErrorCodes::InternalError, "cannot create details");
         }
 
         // Now, we attach the {<fieldname>: <value>} Element under the {$op: ...} one.
-        Status status = opElement.pushBack(logElement);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        // And attach the result under the 'logRoot' Element provided.
-        return logRoot.pushBack(opElement);
+        return pathExists ?
+            logBuilder->addToSets(logElement) :
+            logBuilder->addToUnsets(logElement);
     }
 
 } // namespace mongo

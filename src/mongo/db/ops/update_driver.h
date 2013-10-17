@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -20,6 +32,9 @@
 #include <vector>
 
 #include "mongo/base/status.h"
+#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/bson/mutable/document.h"
+#include "mongo/db/field_ref_set.h"
 #include "mongo/db/index_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/ops/modifier_interface.h"
@@ -35,19 +50,29 @@ namespace mongo {
         ~UpdateDriver();
 
         /**
-         * Returns OK and fills in '_mods' if 'updateExpr' is correct. In that case, take note
-         * that the collection that 'updateExpr' is built against have indices that encompass
-         * all fields present in 'indexedFields'. Otherwise returns an error status with a
-         * corresponding description.
+         * Returns OK and fills in '_mods' if 'updateExpr' is correct. Otherwise returns an
+         * error status with a corresponding description.
          */
-        Status parse(const IndexPathSet& indexedFields, const BSONObj& updateExpr);
+        Status parse(const BSONObj& updateExpr);
 
         /**
-         * Returns true and derives a BSONObj, 'newObj', from 'query'.
+         * Fills in document with any fields in the query which are valid.
          *
-         * TODO: Elaborate on the logic used here.
+         * Valid fields include equality matches like "a":1, or "a.b":false
+         *
+         * Each valid field will be expanded (from dot notation) and conflicts will be
+         * checked for all fields added to the underlying document.
+         *
+         * Returns Status::OK() if the document can be used. If there are any error or
+         * conflicts along the way then those errors will be returned.
          */
-        bool createFromQuery(const BSONObj query, BSONObj* newObj) const;
+        static Status createFromQuery(const BSONObj& query, mutablebson::Document& doc);
+
+        /**
+         * return a BSONObj with the _id field of the doc passed in, or the doc itself.
+         * If no _id and multi, error.
+         */
+        BSONObj makeOplogEntryQuery(const BSONObj doc, bool multi) const;
 
         /**
          * Returns OK and executes '_mods' over 'doc', generating 'newObj'. If any mod is
@@ -69,9 +94,34 @@ namespace mongo {
 
         size_t numMods() const;
 
-        bool dollarModMode() const;
+        bool isDocReplacement() const;
 
         bool modsAffectIndices() const;
+        void refreshIndexKeys(const IndexPathSet& indexedFields);
+
+        /** Inform the update driver of which fields are shard keys so that attempts to modify
+         *  those fields can be rejected by the driver. Pass an empty object to indicate that
+         *  no shard keys are in play.
+         */
+        void refreshShardKeyPattern(const BSONObj& shardKeyPattern);
+
+        /** After calling 'update' above, this will return true if it appears that the modifier
+         *  updates may have altered any shard keys. If this returns 'true',
+         *  'verifyShardKeysUnaltered' should be called with the original unmutated object so
+         *  field comparisons can be made and illegal mutations detected.
+         */
+        bool modsAffectShardKeys() const;
+
+        /** If the mods were detected to have potentially affected shard keys during a
+         *  non-upsert udpate, call this method, providing the original unaltered document so
+         *  that the apparently altered fields can be verified to have not actually changed. A
+         *  non-OK status indicates that at least one mutation to a shard key was detected, and
+         *  the update should be rejected rather than applied. You may pass an empty original
+         *  object on an upsert, since there is not an original object against which to
+         *  compare. In that case, only the existence of shard keys in 'updated' is verified.
+         */
+        Status checkShardKeysUnaltered(const BSONObj& original,
+                                       const mutablebson::Document& updated) const;
 
         bool multi() const;
         void setMulti(bool multi);
@@ -81,6 +131,9 @@ namespace mongo {
 
         bool logOp() const;
         void setLogOp(bool logOp);
+
+        ModifierInterface::Options modOptions() const;
+        void setModOptions(ModifierInterface::Options modOpts);
 
         ModifierInterface::ExecInfo::UpdateContext context() const;
         void setContext(ModifierInterface::ExecInfo::UpdateContext context);
@@ -94,14 +147,16 @@ namespace mongo {
         // immutable properties after parsing
         //
 
-        // Is there a list of $mod's on '_mods' or is it just full object replacment?
-        bool _dollarModMode;
+        // Is there a list of $mod's on '_mods' or is it just full object replacement?
+        bool _replacementMode;
 
         // Collection of update mod instances. Owned here.
         vector<ModifierInterface*> _mods;
 
         // What are the list of fields in the collection over which the update is going to be
         // applied that participate in indices?
+        //
+        // TODO: Do we actually need to keep a copy of this?
         IndexPathSet _indexedFields;
 
         //
@@ -117,20 +172,45 @@ namespace mongo {
         // Should this driver generate an oplog record when it applies the update?
         bool _logOp;
 
+        // The options to initiate the mods with
+        ModifierInterface::Options _modOptions;
+
         // Are any of the fields mentioned in the mods participating in any index? Is set anew
         // at each call to update.
         bool _affectIndices;
 
+        // Holds the fields relevant to any optional shard key state.
+        struct ShardKeyState {
+            // The current shard key pattern
+            BSONObj pattern;
+
+            // A vector owning the FieldRefs parsed from the pattern field names.
+            OwnedPointerVector<FieldRef> keys;
+
+            // A FieldRefSet containing pointers to the FieldRefs in 'keys'.
+            FieldRefSet keySet;
+
+            // The current set of keys known to be affected by the current update. This is
+            // reset on each call to 'update'.
+            FieldRefSet affectedKeySet;
+        };
+
+        // If shard keys have been set, holds the relevant state.
+        boost::scoped_ptr<ShardKeyState> _shardKeyState;
+
         // Is this update going to be an upsert?
         ModifierInterface::ExecInfo::UpdateContext _context;
+
+        mutablebson::Document _logDoc;
     };
 
     struct UpdateDriver::Options {
         bool multi;
         bool upsert;
         bool logOp;
+        ModifierInterface::Options modOptions;
 
-        Options() : multi(false), upsert(false), logOp(false) {}
+        Options() : multi(false), upsert(false), logOp(false), modOptions() {}
     };
 
 } // namespace mongo

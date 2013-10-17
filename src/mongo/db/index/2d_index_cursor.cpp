@@ -12,9 +12,28 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/index/2d_index_cursor.h"
+
+#ifdef _WIN32
+#include <float.h>
+#define nextafter _nextafter
+#else
+#include <cmath> // nextafter
+#endif
 
 #include "mongo/db/btreecursor.h"
 #include "mongo/db/index/2d_access_method.h"
@@ -1782,8 +1801,13 @@ namespace mongo {
                 cmdObj["minDistance"].eoo());
 
         double maxDistance = numeric_limits<double>::max();
-        if (cmdObj["maxDistance"].isNumber())
+        BSONElement eMaxDistance = cmdObj["maxDistance"];
+
+        if (!eMaxDistance.eoo()) {
+            uassert(17085, "maxDistance must be a number", eMaxDistance.isNumber());
             maxDistance = cmdObj["maxDistance"].number();
+            uassert(17086, "maxDistance must be non-negative", maxDistance >= 0);
+        }
 
         GeoDistType type = parsedArgs.isSpherical ? GEO_SPHERE : GEO_PLANE;
 
@@ -1875,7 +1899,6 @@ namespace mongo {
                 case BSONObj::opNEAR: {
                     BSONObj n = e.embeddedObject();
                     e = n.firstElement();
-
                     twod_internal::GeoDistType type;
                     if (strcmp(e.fieldName(), "$nearSphere") == 0) {
                         type = twod_internal::GEO_SPHERE;
@@ -1901,8 +1924,15 @@ namespace mongo {
                     }
                     {
                         BSONElement e = n["$maxDistance"];
-                        if (e.isNumber())
+                        if (!e.eoo()) {
+                            uassert(17087, "$maxDistance must be a number", e.isNumber());
                             maxDistance = e.numberDouble();
+                            uassert(16989, "$maxDistance must be non-negative", maxDistance >= 0);
+                            if (twod_internal::GEO_SPHERE == type) {
+                                uassert(17088, "$maxDistance too large",
+                                        maxDistance <= nextafter(M_PI, DBL_MAX));
+                            }
+                        }
                     }
 
                     bool uniqueDocs = false;

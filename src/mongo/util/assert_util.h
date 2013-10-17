@@ -32,7 +32,10 @@ namespace mongo {
         DatabaseDifferCaseCode = 13297 ,  // uassert( 13297 )
         SendStaleConfigCode = 13388 ,     // uassert( 13388 )
         RecvStaleConfigCode = 9996,       // uassert( 9996 )
-        PrepareConfigsFailedCode = 13104  // uassert( 13104 )
+        PrepareConfigsFailedCode = 13104, // uassert( 13104 )
+        NotMasterOrSecondaryCode = 13436, // uassert( 13436 )
+        NotMasterNoSlaveOkCode = 13435,   // uassert( 13435 )
+        NotMaster = 10107                 // uassert( 10107 )
     };
 
     class AssertionCount {
@@ -142,7 +145,8 @@ namespace mongo {
 
         /* true if an interrupted exception - see KillCurrentOp */
         bool interrupted() {
-            return _ei.code == 11600 || _ei.code == 11601;
+            return _ei.code == 11600 || _ei.code == 11601 ||
+                   _ei.code == ErrorCodes::ExceededTimeLimit;
         }
     };
 
@@ -167,6 +171,7 @@ namespace mongo {
     void wasserted(const char *msg, const char *file, unsigned line);
     MONGO_COMPILER_NORETURN void fassertFailed( int msgid );
     MONGO_COMPILER_NORETURN void fassertFailedNoTrace( int msgid );
+    MONGO_COMPILER_NORETURN void fassertFailedWithStatus(int msgid, const Status& status);
     
     /** a "user assertion".  throws UserAssertion.  logs.  typically used for errors that a user
         could cause, such as duplicate key, disk full, etc.
@@ -196,10 +201,15 @@ namespace mongo {
 
     /** aborts on condition failure */
     inline void fassert(int msgid, bool testOK) {if (MONGO_unlikely(!testOK)) fassertFailed(msgid);}
+    inline void fassert(int msgid, const Status& status) {
+        if (MONGO_unlikely(!status.isOK())) {
+            fassertFailedWithStatus(msgid, status);
+        }
+    }
 
 
     /* "user assert".  if asserts, user did something wrong, not our code */
-#define MONGO_uassert(msgid, msg, expr) (void)( MONGO_likely(!!(expr)) || (mongo::uasserted(msgid, msg), 0) )
+#define MONGO_uassert(msgid, msg, expr) (void)( MONGO_likely(!!(expr)) || (::mongo::uasserted(msgid, msg), 0) )
 
     inline void uassertStatusOK(const Status& status) {
         if (MONGO_unlikely(!status.isOK())) {
@@ -209,16 +219,16 @@ namespace mongo {
     }
 
     /* warning only - keeps going */
-#define MONGO_wassert(_Expression) (void)( MONGO_likely(!!(_Expression)) || (mongo::wasserted(#_Expression, __FILE__, __LINE__), 0) )
+#define MONGO_wassert(_Expression) (void)( MONGO_likely(!!(_Expression)) || (::mongo::wasserted(#_Expression, __FILE__, __LINE__), 0) )
 
     /* display a message, no context, and throw assertionexception
 
        easy way to throw an exception and log something without our stack trace
        display happening.
     */
-#define MONGO_massert(msgid, msg, expr) (void)( MONGO_likely(!!(expr)) || (mongo::msgasserted(msgid, msg), 0) )
+#define MONGO_massert(msgid, msg, expr) (void)( MONGO_likely(!!(expr)) || (::mongo::msgasserted(msgid, msg), 0) )
     /* same as massert except no msgid */
-#define MONGO_verify(_Expression) (void)( MONGO_likely(!!(_Expression)) || (mongo::verifyFailed(#_Expression, __FILE__, __LINE__), 0) )
+#define MONGO_verify(_Expression) (void)( MONGO_likely(!!(_Expression)) || (::mongo::verifyFailed(#_Expression, __FILE__, __LINE__), 0) )
 
     /* dassert is 'debug assert' -- might want to turn off for production as these
        could be slow.
@@ -292,8 +302,10 @@ namespace mongo {
     try { \
         expression; \
     } catch ( const std::exception &e ) { \
-        problem() << "caught exception (" << e.what() << ") in destructor (" << __FUNCTION__ << ")" << endl; \
+        problem() << "caught exception (" << e.what() << ") in destructor (" << __FUNCTION__ \
+                  << ")" << std::endl; \
     } catch ( ... ) { \
-        problem() << "caught unknown exception in destructor (" << __FUNCTION__ << ")" << endl; \
+        problem() << "caught unknown exception in destructor (" << __FUNCTION__ << ")" \
+                  << std::endl; \
     }
 

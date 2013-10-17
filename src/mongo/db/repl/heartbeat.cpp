@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -77,7 +89,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::replSetHeartbeat);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( replSetBlind ) {
@@ -112,9 +124,10 @@ namespace mongo {
             }
             {
                 string s = string(cmdObj.getStringField("replSetHeartbeat"));
-                if( cmdLine.ourSetName() != s ) {
+                if (replSettings.ourSetName() != s) {
                     errmsg = "repl set names do not match";
-                    log() << "replSet set names do not match, our cmdline: " << cmdLine._replSet << rsLog;
+                    log() << "replSet set names do not match, our cmdline: " << replSettings.replSet
+                          << rsLog;
                     log() << "replSet s: " << s << rsLog;
                     result.append("mismatch", true);
                     return false;
@@ -283,11 +296,13 @@ namespace mongo {
                     down(mem, info.getStringField("errmsg"));
                 }
             }
-            catch(DBException& e) {
+            catch (const DBException& e) {
+                log() << "replSet health poll task caught a DBException: " << e.what();
                 down(mem, e.what());
             }
-            catch(...) {
-                down(mem, "replSet unexpected exception in ReplSetHealthPollTask");
+            catch (const std::exception& e) {
+                log() << "replSet health poll task caught an exception: " << e.what();
+                down(mem, e.what());
             }
             m = mem;
 

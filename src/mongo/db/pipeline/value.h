@@ -12,15 +12,27 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
 #pragma once
 
 #include "mongo/db/pipeline/value_internal.h"
+#include "mongo/platform/unordered_set.h"
 
 namespace mongo {
     class BSONElement;
-    class Builder;
 
     /** A variant type that can hold any type of data representable in BSON
      *
@@ -64,7 +76,8 @@ namespace mongo {
         explicit Value(const string& value)       : _storage(String, StringData(value)) {}
         explicit Value(const char* value)         : _storage(String, StringData(value)) {}
         explicit Value(const Document& doc)       : _storage(Object, doc) {}
-        explicit Value(const BSONObj& obj);//     : _storage(Object, Document(obj)) {} // in cpp
+        explicit Value(const BSONObj& obj);
+        explicit Value(const BSONArray& arr);
         explicit Value(const vector<Value>& vec)  : _storage(Array, new RCVector(vec)) {}
         explicit Value(const BSONBinData& bd)     : _storage(BinData, bd) {}
         explicit Value(const BSONRegEx& re)       : _storage(RegEx, re) {}
@@ -79,11 +92,6 @@ namespace mongo {
         explicit Value(const Date_t& date)
             : _storage(Date, static_cast<long long>(date.millis)) // millis really signed
         {}
-
-        /** Creates an empty or zero value of specified type.
-         *  This is currently the only way to create Undefined or Null Values.
-         */
-        explicit Value(BSONType type);
 
         // TODO: add an unsafe version that can share storage with the BSONElement
         /// Deep-convert from BSONElement to Value
@@ -200,6 +208,14 @@ namespace mongo {
             }
             return (Value::compare(v1, v2) == 0);
         }
+        
+        friend bool operator!=(const Value& v1, const Value& v2) {
+            return !(v1 == v2);
+        }
+
+        friend bool operator<(const Value& lhs, const Value& rhs) {
+            return (Value::compare(lhs, rhs) < 0);
+        }
 
         /// This is for debugging, logging, etc. See getString() for how to extract a string.
         string toString() const;
@@ -259,6 +275,8 @@ namespace mongo {
         friend class MutableValue; // gets and sets _storage.genericRCPtr
     };
     BOOST_STATIC_ASSERT(sizeof(Value) == 16);
+
+    typedef unordered_set<Value, Value::Hash> ValueSet;
 }
 
 namespace std {

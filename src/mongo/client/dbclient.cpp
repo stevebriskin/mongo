@@ -15,10 +15,11 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/client/auth_helpers.h"
 #include "mongo/client/constants.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/dbclientcursor.h"
@@ -31,11 +32,7 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/net/ssl_manager.h"
-
-#ifdef MONGO_SSL
-// TODO: Remove references to cmdline from the client.
-#include "mongo/db/cmdline.h"
-#endif  // defined MONGO_SSL
+#include "mongo/util/net/ssl_options.h"
 
 namespace mongo {
 
@@ -525,16 +522,7 @@ namespace mongo {
     BSONObj getnoncecmdobj = fromjson("{getnonce:1}");
 
     string DBClientWithCommands::createPasswordDigest( const string & username , const string & clearTextPassword ) {
-        md5digest d;
-        {
-            md5_state_t st;
-            md5_init(&st);
-            md5_append(&st, (const md5_byte_t *) username.data(), username.length());
-            md5_append(&st, (const md5_byte_t *) ":mongo:", 7 );
-            md5_append(&st, (const md5_byte_t *) clearTextPassword.data(), clearTextPassword.length());
-            md5_finish(&st, d);
-        }
-        return digestToString( d );
+        return auth::createPasswordDigest(username, clearTextPassword);
     }
 
     void DBClientWithCommands::_auth(const BSONObj& params) {
@@ -572,10 +560,26 @@ namespace mongo {
             uassertStatusOK(bsonExtractStringField(params,
                                                    saslCommandUserSourceFieldName,
                                                    &userSource));
+            std::string user;
+            uassertStatusOK(bsonExtractStringField(params,
+                                                   saslCommandUserFieldName,
+                                                   &user));
+
+            uassert(ErrorCodes::AuthenticationFailed,
+                    "Please enable SSL on the client-side to use the MONGODB-X509 "
+                    "authentication mechanism.",
+                    getSSLManager() != NULL);
+
+            uassert(ErrorCodes::AuthenticationFailed,
+                    "Username \"" + user + 
+                    "\" does not match the provided client certificate user \"" +
+                    getSSLManager()->getClientSubjectName() + "\"",
+                    user ==  getSSLManager()->getClientSubjectName());
+ 
             std::string errmsg;
             uassert(ErrorCodes::AuthenticationFailed,
                     errmsg,
-                    _authX509(userSource, getSSLManager()->getClientSubjectName(), errmsg));
+                    _authX509(userSource, user, errmsg));
         }
 #endif
         else if (saslClientAuthenticate != NULL) {
@@ -797,7 +801,7 @@ namespace mongo {
         string ns = db + ".system.namespaces";
         auto_ptr<DBClientCursor> c = query( ns.c_str() , BSONObj() );
         while ( c->more() ) {
-            string name = c->next()["name"].valuestr();
+            string name = c->nextSafe()["name"].valuestr();
             if ( name.find( "$" ) != string::npos )
                 continue;
             names.push_back( name );
@@ -888,8 +892,10 @@ namespace mongo {
         }
 
 #ifdef MONGO_SSL
-        if ( cmdLine.sslOnNormalPorts ) {
-            p->secure( sslManager() );
+        int sslModeVal = sslGlobalParams.sslMode.load();
+        if (sslModeVal == SSLGlobalParams::SSLMode_sendAcceptSSL ||
+            sslModeVal == SSLGlobalParams::SSLMode_sslOnly) {
+            return p->secure( sslManager() );
         }
 #endif
 
@@ -919,15 +925,13 @@ namespace mongo {
     void DBClientConnection::_checkConnection() {
         if ( !_failed )
             return;
-        if ( lastReconnectTry && time(0)-lastReconnectTry < 2 ) {
-            // we wait a little before reconnect attempt to avoid constant hammering.
-            // but we throw we don't want to try to use a connection in a bad state
-            throw SocketException( SocketException::FAILED_STATE , toString() );
-        }
+
         if ( !autoReconnect )
             throw SocketException( SocketException::FAILED_STATE , toString() );
 
-        lastReconnectTry = time(0);
+        // Don't hammer reconnects, backoff if needed
+        autoReconnectBackoff.nextSleepMillis();
+
         LOG(_logLevel) << "trying reconnect to " << _serverString << endl;
         string errmsg;
         _failed = false;
@@ -944,9 +948,9 @@ namespace mongo {
             } catch (UserException& ex) {
                 if (ex.getCode() != ErrorCodes::AuthenticationFailed)
                     throw;
-                LOG(_logLevel) << "reconnect: auth failed db:" <<
+                LOG(_logLevel) << "reconnect: auth failed " <<
                     i->second[saslCommandUserSourceFieldName] <<
-                    " user:" << i->second[saslCommandUserFieldName] << ' ' <<
+                    i->second[saslCommandUserFieldName] << ' ' <<
                     ex.what() << std::endl;
             }
         }

@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 /* pdfile.h
@@ -41,7 +53,6 @@
 #include "mongo/util/log.h"
 #include "mongo/util/mmap.h"
 
-
 namespace mongo {
 
     class Cursor;
@@ -54,11 +65,6 @@ namespace mongo {
     void dropDatabase(const std::string& db);
     bool repairDatabase(string db, string &errmsg, bool preserveClonedFilesOnFailure = false, bool backupOriginalFiles = false);
 
-    /* low level - only drops this ns */
-    void dropNS(const string& dropNs);
-
-    /* deletes this ns, indexes and cursors */
-    void dropCollection( const string &name, string &errmsg, BSONObjBuilder &result );
     bool userCreateNS(const char *ns, BSONObj j, string& err, bool logForReplication, bool *deferIdIndex = 0);
     shared_ptr<Cursor> findTableScan(const char *ns, const BSONObj& order, const DiskLoc &startLoc=DiskLoc());
 
@@ -72,15 +78,11 @@ namespace mongo {
         DataFileMgr();
         void init(const string& path );
 
-        /* see if we can find an extent of the right size in the freelist. */
-        static Extent* allocFromFreeList(const char *ns, int approxSize, bool capped = false);
-
         /** @return DiskLoc where item ends up */
         // changedId should be initialized to false
         const DiskLoc updateRecord(
             const char *ns,
-            NamespaceDetails *d,
-            NamespaceDetailsTransient *nsdt,
+            Collection* collection,
             Record *toupdate, const DiskLoc& dl,
             const char *buf, int len, OpDebug& debug, bool god=false);
 
@@ -294,34 +296,12 @@ namespace mongo {
 
     // XXX-ERH
 
-    inline Extent* DataFile::_getExtent(DiskLoc loc) const {
-        loc.assertOk();
-        Extent *e = (Extent *) (p()+loc.getOfs());
-        return e;
-    }
-
-    inline Extent* DataFile::getExtent(DiskLoc loc) const {
-        Extent *e = _getExtent(loc);
-        e->assertOk();
-        memconcept::is(e, memconcept::concept::extent);
-        return e;
-    }
-
     inline Extent* Extent::getNextExtent() {
         return xnext.isNull() ? 0 : DataFileMgr::getExtent(xnext);
     }
 
     inline Extent* Extent::getPrevExtent() {
         return xprev.isNull() ? 0 : DataFileMgr::getExtent(xprev);
-    }
-
-    // XXX-ERH
-    inline Record* DataFile::recordAt(DiskLoc dl) const {
-        int ofs = dl.getOfs();
-        if (ofs < DataFileHeader::HeaderSize) {
-            badOfs(ofs); // will uassert - external call to keep out of the normal code path
-        }
-        return reinterpret_cast<Record*>(p() + ofs);
     }
 
     inline DiskLoc Record::getNext(const DiskLoc& myLoc) {
@@ -427,12 +407,12 @@ namespace mongo {
 
     inline Extent* DataFileMgr::getExtent(const DiskLoc& dl) {
         verify( dl.a() != -1 );
-        return cc().database()->getFile(dl.a())->getExtent(dl);
+        return cc().database()->getExtentManager().getExtent(dl);
     }
 
     inline Record* DataFileMgr::getRecord(const DiskLoc& dl) {
         verify(dl.a() != -1);
-        return cc().database()->getFile(dl.a())->recordAt(dl);
+        return cc().database()->getExtentManager().recordFor( dl );
     }
 
     BOOST_STATIC_ASSERT( 16 == sizeof(DeletedRecord) );

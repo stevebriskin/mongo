@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/pch.h"
@@ -24,6 +36,7 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/kill_current_op.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/parsed_query.h"
 #include "mongo/db/pdfile.h"
@@ -31,10 +44,12 @@
 #include "mongo/db/query_optimizer.h"
 #include "mongo/db/query_optimizer_internal.h"
 #include "mongo/db/queryoptimizercursor.h"
+#include "mongo/db/query/new_find.h"
 #include "mongo/db/repl/finding_start_cursor.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_reads_ok.h"
 #include "mongo/db/scanandorder.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/server.h"
@@ -91,6 +106,17 @@ namespace mongo {
         return qr;
     }
 
+    static BSONObj extractKey(Cursor* c, const KeyPattern& usingKeyPattern ) {
+        KeyPattern currentIndex( c->indexKeyPattern() );
+        if ( usingKeyPattern.isCoveredBy( currentIndex ) && ! currentIndex.isSpecial() ){
+            BSONObj currKey = c->currKey();
+            BSONObj prettyKey = currKey.replaceFieldNames( currentIndex.toBSON() );
+            return usingKeyPattern.extractSingleKey( prettyKey );
+        }
+
+        return usingKeyPattern.extractSingleKey( c->current() );
+    }
+
     QueryResult* processGetMore(const char* ns,
                                 int ntoreturn,
                                 long long cursorid,
@@ -98,6 +124,28 @@ namespace mongo {
                                 int pass,
                                 bool& exhaust,
                                 bool* isCursorAuthorized ) {
+
+        if (isNewQueryFrameworkEnabled()) {
+            bool useNewSystem = false;
+
+            // Scoped to kill the pin after seeing if the runner's there.
+            {
+                // See if there's a runner.  We do this because some CCs may be cursors and some may
+                // be runners until we're done implementing all new functionality in the new
+                // system...
+                ClientCursorPin p(cursorid);
+                ClientCursor *cc = p.c();
+                if (NULL != cc && NULL != cc->getRunner()) {
+                    useNewSystem = true;
+                }
+            }
+
+            if (useNewSystem) {
+                return newGetMore(ns, ntoreturn, cursorid, curop, pass, exhaust,
+                                  isCursorAuthorized);
+            }
+        }
+
         exhaust = false;
 
         int bufSize = 512 + sizeof( QueryResult ) + MaxBytesToReturnToClientAtOnce;
@@ -112,9 +160,8 @@ namespace mongo {
         // call this readlocked so state can't change
         replVerifyReadsOk();
 
-        ClientCursor::Pin p(cursorid);
+        ClientCursorPin p(cursorid);
         ClientCursor *cc = p.c();
-
 
         if ( unlikely(!cc) ) {
             LOGSOME << "getMore: cursorid not found " << ns << " " << cursorid << endl;
@@ -122,6 +169,13 @@ namespace mongo {
             resultFlags = ResultFlag_CursorNotFound;
         }
         else {
+            // Some internal users create a ClientCursor with a Runner.  Don't crash if this
+            // happens.  Instead, hand them off to the new framework.
+            if (NULL != cc->getRunner()) {
+                p.release();
+                return newGetMore(ns, ntoreturn, cursorid, curop, pass, exhaust, isCursorAuthorized);
+            }
+
             // check for spoofing of the ns such that it does not match the one originally there for the cursor
             uassert(14833, "auth error", str::equals(ns, cc->ns().c_str()));
 
@@ -130,6 +184,11 @@ namespace mongo {
             // This must be done after auth check to ensure proper cleanup.
             uassert(16951, "failing getmore due to set failpoint",
                     !MONGO_FAIL_POINT(getMoreError));
+
+            // If the operation that spawned this cursor had a time limit set, apply leftover
+            // time to this getmore.
+            curop.setMaxTimeMicros( cc->getLeftoverMaxTimeMicros() );
+            killCurrentOp.checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
             if ( pass == 0 )
                 cc->updateSlaveLocation( curop );
@@ -160,10 +219,10 @@ namespace mongo {
             while ( 1 ) {
                 if ( !c->ok() ) {
                     if ( c->tailable() ) {
-                        /* when a tailable cursor hits "EOF", ok() goes false, and current() is null.  however
-                           advance() can still be retries as a reactivation attempt.  when there is new data, it will
-                           return true.  that's what we are doing here.
-                           */
+                        // when a tailable cursor hits "EOF", ok() goes false, and current() is
+                        // null.  however advance() can still be retries as a reactivation attempt.
+                        // when there is new data, it will return true.  that's what we are doing
+                        // here.
                         if ( c->advance() )
                             continue;
 
@@ -190,7 +249,7 @@ namespace mongo {
                 // in some cases (clone collection) there won't be a matcher
                 if ( !c->currentMatches( &details ) ) {
                 }
-                else if ( metadata && !metadata->keyBelongsToMe( cc->extractKey( keyPattern ) ) ) {
+                else if ( metadata && !metadata->keyBelongsToMe( extractKey(c, keyPattern ) ) ) {
                     LOG(2) << "cursor skipping document in un-owned chunk: " << c->current()
                                << endl;
                 }
@@ -202,7 +261,17 @@ namespace mongo {
                         last = c->currLoc();
                         n++;
 
-                        cc->fillQueryResultFromObj( b, &details );
+                        // Fill out the fields requested by the query.
+                        const Projection::KeyOnly *keyFieldsOnly = c->keyFieldsOnly();
+                        if ( keyFieldsOnly ) {
+                            fillQueryResultFromObj( b, 0, keyFieldsOnly->hydrate(
+                            c->currKey() ), &details );
+                        }
+                        else {
+                            DiskLoc loc = c->currLoc();
+                            fillQueryResultFromObj( b, cc->fields.get(), c->current(), &details,
+                                    ( ( cc->pq.get() && cc->pq->showDiskLoc() ) ? &loc : 0 ) );
+                        }
 
                         if ( ( ntoreturn && n >= ntoreturn ) || b.len() > MaxBytesToReturnToClientAtOnce ) {
                             c->advance();
@@ -230,9 +299,12 @@ namespace mongo {
                 else {
                     cc->c()->noteLocation();
                 }
-                cc->mayUpgradeStorage();
                 cc->storeOpForSlave( last );
                 exhaust = cc->queryOptions() & QueryOption_Exhaust;
+
+                // If the getmore had a time limit, remaining time is "rolled over" back to the
+                // cursor (for use by future getmore ops).
+                cc->setLeftoverMaxTimeMicros( curop.getRemainingMaxTimeMicros() );
             }
         }
 
@@ -726,7 +798,7 @@ namespace mongo {
                 ( QueryResponseBuilder::make( pq, cursor, queryPlan, oldPlan ) );
         bool saveClientCursor = false;
         OpTime slaveReadTill;
-        ClientCursor::Holder ccPointer( new ClientCursor( QueryOption_NoCursorTimeout, cursor,
+        ClientCursorHolder ccPointer( new ClientCursor( QueryOption_NoCursorTimeout, cursor,
                                                          ns ) );
         
         for( ; cursor->ok(); cursor->advance() ) {
@@ -801,7 +873,9 @@ namespace mongo {
             // we might be missing some data
             // and its safe to send this as mongos can resend
             // at this point
-            throw SendStaleConfigException( ns , "version changed during initial query", shardingVersionAtStart, shardingState.getVersion( ns ) );
+            throw SendStaleConfigException(ns, "version changed during initial query",
+                                           shardingVersionAtStart,
+                                           shardingState.getVersion(ns));
         }
         
         parentPageFaultSection.reset(0);
@@ -846,6 +920,11 @@ namespace mongo {
             ccPointer->setPos( nReturned );
             ccPointer->pq = pq_shared;
             ccPointer->fields = pq.getFieldPtr();
+
+            // If the query had a time limit, remaining time is "rolled over" to the cursor (for
+            // use by future getmore ops).
+            ccPointer->setLeftoverMaxTimeMicros( curop.getRemainingMaxTimeMicros() );
+
             ccPointer.release();
         }
         
@@ -889,7 +968,7 @@ namespace mongo {
                     
                     BSONObj resObject; // put inside since we don't own the memory
                     
-                    Client::ReadContext ctx( ns , dbpath ); // read locks
+                    Client::ReadContext ctx(ns, storageGlobalParams.dbpath); // read locks
                     replVerifyReadsOk(&pq);
                     
                     bool found = Helpers::findById( currentClient, ns, query, resObject, &nsFound, &indexFound );
@@ -971,8 +1050,13 @@ namespace mongo {
         uassert( 16256, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
 
         // Run a command.
-        
-        if ( pq.couldBeCommand() ) {
+
+        if ( nsString.isCommand() ) {
+            int nToReturn = pq.getNumToReturn();
+            uassert( 16979, str::stream() << "bad numberToReturn (" << nToReturn
+                                          << ") for $cmd type ns - can only be 1 or -1",
+                     nToReturn == 1 || nToReturn == -1 );
+
             curop.markCommand();
             BufBuilder bb;
             bb.skip(sizeof(QueryResult));
@@ -1014,6 +1098,17 @@ namespace mongo {
             uassert( 10110 , "bad query object", false);
         }
 
+        if (isNewQueryFrameworkEnabled()) {
+            // TODO: Copy prequel curop debugging into runNewQuery
+            CanonicalQuery* cq = NULL;
+            if (canUseNewSystem(q, &cq)) {
+                return newRunQuery(cq, curop, result);
+            }
+        }
+
+        // Handle query option $maxTimeMS (not used with commands).
+        curop.setMaxTimeMicros(static_cast<unsigned long long>(pq.getMaxTimeMS()) * 1000);
+        killCurrentOp.checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
         // Run a simple id query.
         if ( ! (explain || pq.showDiskLoc()) && isSimpleIdQuery( query ) && !pq.hasOption( QueryOption_CursorTailable ) ) {
@@ -1043,7 +1138,7 @@ namespace mongo {
             }
                 
             try {
-                Client::ReadContext ctx( ns , dbpath ); // read locks
+                Client::ReadContext ctx(ns, storageGlobalParams.dbpath); // read locks
                 const ChunkVersion shardingVersionAtStart = shardingState.getVersion( ns );
                 
                 replVerifyReadsOk(&pq);

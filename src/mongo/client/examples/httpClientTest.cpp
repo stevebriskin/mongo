@@ -19,7 +19,7 @@
 
 #include "mongo/base/init.h"
 #include "mongo/client/dbclient.h"
-#include "util/net/httpclient.h"
+#include "mongo/util/net/httpclient.h"
 
 #ifndef verify
 #  define verify(x) MONGO_verify(x)
@@ -47,7 +47,7 @@ void play( string url ) {
 int main( int argc, const char **argv, char **envp) {
 
 #ifdef MONGO_SSL
-    cmdLine.sslOnNormalPorts = true;
+    sslGlobalParams.sslMode.store(SSLGlobalParams::SSLMode_sslOnly);
     runGlobalInitializersOrDie(argc, argv, envp);
 #endif
 
@@ -64,7 +64,7 @@ int main( int argc, const char **argv, char **envp) {
     play( str::stream() << "http://localhost:" << port << "/" );
     
 #ifdef MONGO_SSL
-    play( "https://www.10gen.com/" );
+    play( "https://www.mongodb.com/" );
 #endif
 
     return EXIT_SUCCESS;

@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
@@ -26,6 +38,7 @@
 #include "mongo/db/repl/rs_exception.h"
 #include "mongo/db/repl/rs_member.h"
 #include "mongo/db/repl/rs_sync.h"
+#include "mongo/db/repl/sync_source_feedback.h"
 #include "mongo/util/concurrency/list.h"
 #include "mongo/util/concurrency/msg.h"
 #include "mongo/util/concurrency/thread_pool.h"
@@ -58,6 +71,14 @@ namespace mongo {
 
     // Main entry point for replica sets
     void startReplSets(ReplSetCmdline *replSetCmdline);
+
+    class ReplicationStartSynchronizer {
+    public:
+        ReplicationStartSynchronizer() : indexRebuildDone(false) {}
+        boost::mutex mtx;
+        bool indexRebuildDone;
+        boost::condition cond;
+    };
 
     /* member of a replica set */
     class Member : public List1<Member>::Base {
@@ -148,7 +169,7 @@ namespace mongo {
          * it to P (_currentSyncTarget). Then it would use this connection to
          * pretend to be S1, replicating off of P.
          */
-        void percolate(const BSONObj& rid, const OpTime& last);
+        void percolate(const mongo::OID& rid, const OpTime& last);
         void associateSlave(const BSONObj& rid, const int memberId);
         void updateSlave(const mongo::OID& id, const OpTime& last);
         void clearCache();
@@ -330,6 +351,7 @@ namespace mongo {
         static StartupStatus startupStatus;
         static DiagStr startupStatusMsg;
         static string stateAsHtml(MemberState state);
+        static ReplicationStartSynchronizer rss;
 
         /* todo thread */
         void msgUpdateHBInfo(HeartbeatInfo);
@@ -340,6 +362,8 @@ namespace mongo {
         void msgUpdateHBRecv(unsigned id, time_t newTime);
 
         StateBox box;
+
+        SyncSourceFeedback syncSourceFeedback;
 
         OpTime lastOpTimeWritten;
         long long lastH; // hash we use to make sure we are reading the right flow of ops and aren't on an out-of-date "fork"
@@ -505,6 +529,7 @@ namespace mongo {
         Member* head() const { return _members.head(); }
     public:
         const Member* findById(unsigned id) const;
+        Member* getMutableMember(unsigned id);
         Member* findByName(const std::string& hostname) const;
     private:
         void _getTargets(list<Target>&, int &configVersion);
@@ -562,6 +587,10 @@ namespace mongo {
         void syncRollback(OplogReader& r);
         void syncThread();
         const OpTime lastOtherOpTime() const;
+        /**
+         * The most up to date electable replica
+         */
+        const OpTime lastOtherElectableOpTime() const;
 
         /**
          * When a member reaches its minValid optime it is in a consistent state.  Thus, minValid is
@@ -665,7 +694,7 @@ namespace mongo {
         bool check(string& errmsg, BSONObjBuilder& result) {
             if( !replSet ) {
                 errmsg = "not running with --replSet";
-                if( cmdLine.configsvr ) { 
+                if (serverGlobalParams.configsvr) {
                     result.append("info", "configsvr"); // for shell prompt
                 }
                 return false;

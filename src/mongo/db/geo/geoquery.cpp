@@ -1,142 +1,153 @@
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*/
+ *    Copyright (C) 2013 MongoDB Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under the terms of the GNU Affero General Public License, version 3,
+ *    as published by the Free Software Foundation.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License for more details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/db/geo/geoquery.h"
 
+#include "mongo/db/geo/geoconstants.h"
+
 namespace mongo {
+
+    using mongoutils::str::equals;
 
     bool NearQuery::parseFromGeoNear(const BSONObj &obj, double radius) {
         if (obj["near"].eoo()) { return false; }
         BSONObj nearObj = obj["near"].embeddedObject();
 
-        if (!GeoParser::isPoint(nearObj)) { return false; }
-        GeoParser::parsePoint(nearObj, &centroid);
-
-        // The CRS for the legacy points dictates that distances are in radians.
-        fromRadians = (FLAT == centroid.crs);
+        if (!GeoParser::isPoint(nearObj) || !GeoParser::parsePoint(nearObj, &centroid)) {
+            return false;
+        }
 
         if (!obj["minDistance"].eoo()) {
-            if (obj["minDistance"].isNumber()) {
-                double distArg = obj["minDistance"].number();
-                uassert(16901, "minDistance must be non-negative", distArg >= 0.0);
-                if (fromRadians) {
-                    minDistance = distArg * radius;
-                } else {
-                    minDistance = distArg;
-                }
-            } else {
-                return false;
-            }
+            uassert(17035, "minDistance must be a number", obj["minDistance"].isNumber());
+            double distArg = obj["minDistance"].number();
+            uassert(16901, "minDistance must be non-negative", distArg >= 0.0);
+            minDistance = distArg;
         }
 
         if (!obj["maxDistance"].eoo()) {
-            if (obj["maxDistance"].isNumber()) {
-                double distArg = obj["maxDistance"].number();
-                uassert(16902, "maxDistance must be non-negative", distArg >= 0.0);
-                if (fromRadians) {
-                    maxDistance = distArg * radius;
-                } else {
-                    maxDistance = distArg;
-                }
-            } else {
-                return false;
-            }
+            uassert(17036, "maxDistance must be a number", obj["maxDistance"].isNumber());
+            double distArg = obj["maxDistance"].number();
+            uassert(16902, "maxDistance must be non-negative", distArg >= 0.0);
+            maxDistance = distArg;
         }
+
         return true;
     }
 
-    bool NearQuery::parseFrom(const BSONObj &obj, double radius) {
+    bool NearQuery::parseLegacyQuery(const BSONObj &obj) {
         bool hasGeometry = false;
 
         // First, try legacy near, e.g.:
         // t.find({ loc : { $nearSphere: [0,0], $minDistance: 1, $maxDistance: 3 }})
         // t.find({ loc : { $nearSphere: [0,0] }})
         // t.find({ loc : { $near: { someGeoJSONPoint}})
+        // t.find({ loc : { $geoNear: { someGeoJSONPoint}})
         BSONObjIterator it(obj);
         while (it.more()) {
             BSONElement e = it.next();
-            bool isNearSphere = mongoutils::str::equals(e.fieldName(), "$nearSphere");
-            bool isMinDistance = mongoutils::str::equals(e.fieldName(), "$minDistance");
-            bool isMaxDistance = mongoutils::str::equals(e.fieldName(), "$maxDistance");
-            bool isNear = mongoutils::str::equals(e.fieldName(), "$near")
-                          || mongoutils::str::equals(e.fieldName(), "$geoNear");
-            if (isNearSphere || isNear) {
+            if (equals(e.fieldName(), "$near") || equals(e.fieldName(), "$geoNear")
+                                               || equals(e.fieldName(), "$nearSphere")) {
                 if (!e.isABSONObj()) { return false; }
                 BSONObj embeddedObj = e.embeddedObject();
 
                 if (!GeoParser::isPoint(embeddedObj)) { continue; }
-                GeoParser::parsePoint(embeddedObj, &centroid);
+                if (!GeoParser::parsePoint(embeddedObj, &centroid)) { return false; }
 
-                if (isNearSphere) {
-                    fromRadians = (centroid.crs == FLAT);
-                    hasGeometry = true;
-                } else if (isNear && (centroid.crs == SPHERE)) {
-                    // We don't accept $near : [oldstylepoint].
-                    hasGeometry = true;
-                }
-            } else if (isMinDistance) {
+                isNearSphere = equals(e.fieldName(), "$nearSphere");
+                hasGeometry = true;
+            } else if (equals(e.fieldName(), "$minDistance")) {
                 uassert(16893, "$minDistance must be a number", e.isNumber());
                 minDistance = e.Number();
                 uassert(16894, "$minDistance must be non-negative", minDistance >= 0.0);
-            } else if (isMaxDistance) {
+            } else if (equals(e.fieldName(), "$maxDistance")) {
                 uassert(16895, "$maxDistance must be a number", e.isNumber());
                 maxDistance = e.Number();
                 uassert(16896, "$maxDistance must be non-negative", maxDistance >= 0.0);
             }
         }
 
-        if (fromRadians) {
-            minDistance *= radius;
-            maxDistance *= radius;
-        }
+        return hasGeometry;
+    }
 
-        if (hasGeometry) { return true; }
+    bool NearQuery::parseNewQuery(const BSONObj &obj) {
+        bool hasGeometry = false;
 
-        // Next, try "new" near:
+        BSONObjIterator objIt(obj);
+        if (!objIt.more()) { return false; }
+        BSONElement e = objIt.next();
+        // Just one arg. to $geoNear.
+        if (objIt.more()) { return false; }
+
+        // Parse "new" near:
         // t.find({"geo" : {"$near" : {"$geometry": pointA, $minDistance: 1, $maxDistance: 3}}})
-        BSONElement e = obj.firstElement();
+        // t.find({"geo" : {"$geoNear" : {"$geometry": pointA, $minDistance: 1, $maxDistance: 3}}})
         if (!e.isABSONObj()) { return false; }
         BSONObj::MatchType matchType = static_cast<BSONObj::MatchType>(e.getGtLtOp());
         if (BSONObj::opNEAR != matchType) { return false; }
 
-        // Restart it.
-        it = BSONObjIterator(e.embeddedObject());
+        // Iterate over the argument.
+        BSONObjIterator it(e.embeddedObject());
         while (it.more()) {
             BSONElement e = it.next();
-            if (mongoutils::str::equals(e.fieldName(), "$geometry")) {
+            if (equals(e.fieldName(), "$geometry")) {
                 if (e.isABSONObj()) {
                     BSONObj embeddedObj = e.embeddedObject();
                     uassert(16885, "$near requires a point, given " + embeddedObj.toString(),
                             GeoParser::isPoint(embeddedObj));
-                    GeoParser::parsePoint(embeddedObj, &centroid);
+                    if (!GeoParser::parsePoint(embeddedObj, &centroid)) { return false; }
                     uassert(16681, "$near requires geojson point, given " + embeddedObj.toString(),
                             (SPHERE == centroid.crs));
                     hasGeometry = true;
                 }
-            } else if (mongoutils::str::equals(e.fieldName(), "$minDistance")) {
+            } else if (equals(e.fieldName(), "$minDistance")) {
                 uassert(16897, "$minDistance must be a number", e.isNumber());
                 minDistance = e.Number();
                 uassert(16898, "$minDistance must be non-negative", minDistance >= 0.0);
-            } else if (mongoutils::str::equals(e.fieldName(), "$maxDistance")) {
+            } else if (equals(e.fieldName(), "$maxDistance")) {
                 uassert(16899, "$maxDistance must be a number", e.isNumber());
                 maxDistance = e.Number();
                 uassert(16900, "$maxDistance must be non-negative", maxDistance >= 0.0);
             }
         }
+
         return hasGeometry;
+    }
+
+
+    bool NearQuery::parseFrom(const BSONObj &obj) {
+        if (parseLegacyQuery(obj)) { return true; }
+        // Clear out any half-baked data.
+        minDistance = 0;
+        isNearSphere = false;
+        maxDistance = std::numeric_limits<double>::max();
+        centroid = PointWithCRS();
+        // And try parsing new format.
+        return parseNewQuery(obj);
     }
 
     bool GeoQuery::parseLegacyQuery(const BSONObj &obj) {
@@ -237,7 +248,7 @@ namespace mongo {
     }
 
     bool GeometryContainer::hasS2Region() const {
-        return NULL != _point
+        return (NULL != _point && (_point->crs == SPHERE || _point->flatUpgradedToSphere))
                || NULL != _line
                || (NULL != _polygon && _polygon->crs == SPHERE)
                || (NULL != _cap && _cap->crs == SPHERE)
@@ -245,6 +256,12 @@ namespace mongo {
                || NULL != _multiLine
                || NULL != _multiPolygon
                || NULL != _geometryCollection;
+    }
+
+    bool GeometryContainer::hasFlatRegion() const {
+        return (NULL != _polygon && _polygon->crs == FLAT)
+               || NULL != _cap
+               || NULL != _box;
     }
 
     bool GeoQuery::satisfiesPredicate(const GeometryContainer &otherContainer) const {
@@ -281,6 +298,11 @@ namespace mongo {
 
         // Iterate over the other thing and see if we contain it all.
         if (NULL != otherContainer._point) {
+            // The point must be valid lng, lat if it was old-style.
+            if (FLAT == otherContainer._point->crs
+                && !otherContainer._point->flatUpgradedToSphere) {
+                return false;
+            }
             return contains(otherContainer._point->cell, otherContainer._point->point);
         }
 
@@ -489,6 +511,11 @@ namespace mongo {
 
     bool GeometryContainer::intersects(const GeometryContainer& otherContainer) const {
         if (NULL != otherContainer._point) {
+            // The point must be valid lng, lat if it was old-style.
+            if (FLAT == otherContainer._point->crs
+                && !otherContainer._point->flatUpgradedToSphere) {
+                return false;
+            }
             return intersects(otherContainer._point->cell);
         } else if (NULL != otherContainer._line) {
             return intersects(otherContainer._line->line);
@@ -556,6 +583,10 @@ namespace mongo {
     // Does this (GeometryContainer) intersect the provided data?
     bool GeometryContainer::intersects(const S2Cell &otherPoint) const {
         if (NULL != _point) {
+            // The point must be valid lng, lat if it was old-style.
+            if (FLAT == _point->crs && !_point->flatUpgradedToSphere) {
+                return false;
+            }
             return _point->cell.MayIntersect(otherPoint);
         } else if (NULL != _line) {
             return _line->line.MayIntersect(otherPoint);
@@ -630,6 +661,10 @@ namespace mongo {
 
     bool GeometryContainer::intersects(const S2Polyline& otherLine) const {
         if (NULL != _point) {
+            // The point must be valid lng, lat if it was old-style.
+            if (FLAT == _point->crs && !_point->flatUpgradedToSphere) {
+                return false;
+            }
             return otherLine.MayIntersect(_point->cell);
         } else if (NULL != _line) {
             return otherLine.Intersects(&_line->line);
@@ -700,6 +735,10 @@ namespace mongo {
     // Does 'this' intersect with the provided polygon?
     bool GeometryContainer::intersects(const S2Polygon& otherPolygon) const {
         if (NULL != _point) {
+            // The point must be valid lng, lat if it was old-style.
+            if (FLAT == _point->crs && !_point->flatUpgradedToSphere) {
+                return false;
+            }
             return otherPolygon.MayIntersect(_point->cell);
         } else if (NULL != _line) {
             return polygonLineIntersection(_line->line, otherPolygon);
@@ -779,43 +818,45 @@ namespace mongo {
         if (GeoParser::isPolygon(obj)) {
             // We can't really pass these things around willy-nilly except by ptr.
             _polygon.reset(new PolygonWithCRS());
-            GeoParser::parsePolygon(obj, _polygon.get());
+            if (!GeoParser::parsePolygon(obj, _polygon.get())) { return false; }
         } else if (GeoParser::isPoint(obj)) {
             _point.reset(new PointWithCRS());
-            GeoParser::parsePoint(obj, _point.get());
+            if (!GeoParser::parsePoint(obj, _point.get())) { return false; }
         } else if (GeoParser::isLine(obj)) {
             _line.reset(new LineWithCRS());
-            GeoParser::parseLine(obj, _line.get());
+            if (!GeoParser::parseLine(obj, _line.get())) { return false; }
         } else if (GeoParser::isBox(obj)) {
             _box.reset(new BoxWithCRS());
-            GeoParser::parseBox(obj, _box.get());
+            if (!GeoParser::parseBox(obj, _box.get())) { return false; }
         } else if (GeoParser::isCap(obj)) {
             _cap.reset(new CapWithCRS());
-            GeoParser::parseCap(obj, _cap.get());
+            if (!GeoParser::parseCap(obj, _cap.get())) { return false; }
         } else if (GeoParser::isMultiPoint(obj)) {
             _multiPoint.reset(new MultiPointWithCRS());
-            GeoParser::parseMultiPoint(obj, _multiPoint.get());
+            if (!GeoParser::parseMultiPoint(obj, _multiPoint.get())) { return false; }
             _region.reset(new S2RegionUnion());
             for (size_t i = 0; i < _multiPoint->cells.size(); ++i) {
                 _region->Add(&_multiPoint->cells[i]);
             }
         } else if (GeoParser::isMultiLine(obj)) {
             _multiLine.reset(new MultiLineWithCRS());
-            GeoParser::parseMultiLine(obj, _multiLine.get());
+            if (!GeoParser::parseMultiLine(obj, _multiLine.get())) { return false; }
             _region.reset(new S2RegionUnion());
             for (size_t i = 0; i < _multiLine->lines.vector().size(); ++i) {
                 _region->Add(_multiLine->lines.vector()[i]);
             }
         } else if (GeoParser::isMultiPolygon(obj)) {
             _multiPolygon.reset(new MultiPolygonWithCRS());
-            GeoParser::parseMultiPolygon(obj, _multiPolygon.get());
+            if (!GeoParser::parseMultiPolygon(obj, _multiPolygon.get())) { return false; }
             _region.reset(new S2RegionUnion());
             for (size_t i = 0; i < _multiPolygon->polygons.vector().size(); ++i) {
                 _region->Add(_multiPolygon->polygons.vector()[i]);
             }
         } else if (GeoParser::isGeometryCollection(obj)) {
             _geometryCollection.reset(new GeometryCollection());
-            GeoParser::parseGeometryCollection(obj, _geometryCollection.get());
+            if (!GeoParser::parseGeometryCollection(obj, _geometryCollection.get())) {
+                return false;
+            }
             _region.reset(new S2RegionUnion());
             for (size_t i = 0; i < _geometryCollection->points.size(); ++i) {
                 _region->Add(&_geometryCollection->points[i].cell);
@@ -854,7 +895,10 @@ namespace mongo {
 
     const S2Region& GeometryContainer::getRegion() const {
         if (NULL != _point) {
-            // _point->crs might be FLAT but we "upgrade" it for free.
+            // _point->crs might be FLAT but we "upgrade" it for free if it was in bounds.
+            if (FLAT == _point->crs) {
+                verify(_point->flatUpgradedToSphere);
+            }
             return _point->cell;
         } else if (NULL != _line) {
             return _line->line;

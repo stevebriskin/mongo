@@ -12,17 +12,30 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/exec/and_hash.h"
 
 #include "mongo/db/exec/and_common-inl.h"
+#include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
 
 namespace mongo {
 
-    AndHashStage::AndHashStage(WorkingSet* ws, Matcher* matcher)
-        : _ws(ws), _matcher(matcher), _resultIterator(_dataMap.end()),
+    AndHashStage::AndHashStage(WorkingSet* ws, const MatchExpression* filter)
+        : _ws(ws), _filter(filter), _resultIterator(_dataMap.end()),
           _shouldScanChildren(true), _currentChild(0) {}
 
     AndHashStage::~AndHashStage() {
@@ -37,6 +50,8 @@ namespace mongo {
     }
 
     PlanStage::StageState AndHashStage::work(WorkingSetID* out) {
+        ++_commonStats.works;
+
         if (isEOF()) { return PlanStage::IS_EOF; }
 
         // An AND is either reading the first child into the hash table, probing against the hash
@@ -44,12 +59,12 @@ namespace mongo {
 
         // We read the first child into our hash table.
         if (_shouldScanChildren && (0 == _currentChild)) {
-            return readFirstChild();
+            return readFirstChild(out);
         }
 
         // Probing into our hash table with other children.
         if (_shouldScanChildren) {
-            return hashOtherChildren();
+            return hashOtherChildren(out);
         }
 
         // Returning results.
@@ -65,18 +80,20 @@ namespace mongo {
 
         // We should check for matching at the end so the matcher can use information in the
         // indices of all our children.
-        if (NULL == _matcher || _matcher->matches(member)) {
+        if (Filter::passes(member, _filter)) {
             *out = idToReturn;
+            ++_commonStats.advanced;
             return PlanStage::ADVANCED;
         }
         else {
             _ws->free(idToReturn);
             // Skip over the non-matching thing we currently point at.
+            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
     }
 
-    PlanStage::StageState AndHashStage::readFirstChild() {
+    PlanStage::StageState AndHashStage::readFirstChild(WorkingSetID* out) {
         verify(_currentChild == 0);
 
         WorkingSetID id;
@@ -89,24 +106,38 @@ namespace mongo {
             verify(_dataMap.end() == _dataMap.find(member->loc));
 
             _dataMap[member->loc] = id;
+            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
         else if (PlanStage::IS_EOF == childStatus) {
             // Done reading child 0.
             _currentChild = 1;
+
             // If our first child was empty, don't scan any others, no possible results.
             if (_dataMap.empty()) {
                 _shouldScanChildren = false;
                 return PlanStage::IS_EOF;
             }
+
+            ++_commonStats.needTime;
+            _specificStats.mapAfterChild.push_back(_dataMap.size());
+
             return PlanStage::NEED_TIME;
         }
         else {
+            if (PlanStage::NEED_FETCH == childStatus) {
+                *out = id;
+                ++_commonStats.needFetch;
+            }
+            else if (PlanStage::NEED_TIME == childStatus) {
+                ++_commonStats.needTime;
+            }
+
             return childStatus;
         }
     }
 
-    PlanStage::StageState AndHashStage::hashOtherChildren() {
+    PlanStage::StageState AndHashStage::hashOtherChildren(WorkingSetID* out) {
         verify(_currentChild > 0);
 
         WorkingSetID id;
@@ -125,6 +156,7 @@ namespace mongo {
                 AndCommon::mergeFrom(olderMember, member);
             }
             _ws->free(id);
+            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
         else if (PlanStage::IS_EOF == childStatus) {
@@ -143,6 +175,8 @@ namespace mongo {
                 else { ++it; }
             }
 
+            _specificStats.mapAfterChild.push_back(_dataMap.size());
+
             _seenMap.clear();
 
             // _dataMap is now the intersection of the first _currentChild nodes.
@@ -159,27 +193,41 @@ namespace mongo {
                 _resultIterator = _dataMap.begin();
             }
 
+            ++_commonStats.needTime;
             return PlanStage::NEED_TIME;
         }
         else {
-            // NEED_YIELD or FAILURE.
+            if (PlanStage::NEED_FETCH == childStatus) {
+                *out = id;
+                ++_commonStats.needFetch;
+            }
+            else if (PlanStage::NEED_TIME == childStatus) {
+                ++_commonStats.needTime;
+            }
+
             return childStatus;
         }
     }
 
     void AndHashStage::prepareToYield() {
+        ++_commonStats.yields;
+
         for (size_t i = 0; i < _children.size(); ++i) {
             _children[i]->prepareToYield();
         }
     }
 
     void AndHashStage::recoverFromYield() {
+        ++_commonStats.unyields;
+
         for (size_t i = 0; i < _children.size(); ++i) {
             _children[i]->recoverFromYield();
         }
     }
 
     void AndHashStage::invalidate(const DiskLoc& dl) {
+        ++_commonStats.invalidates;
+
         if (isEOF()) { return; }
 
         for (size_t i = 0; i < _children.size(); ++i) {
@@ -199,6 +247,13 @@ namespace mongo {
             WorkingSetMember* member = _ws->get(id);
             verify(member->loc == dl);
 
+            if (_shouldScanChildren) {
+                ++_specificStats.flaggedInProgress;
+            }
+            else {
+                ++_specificStats.flaggedButPassed;
+            }
+
             // The loc is about to be invalidated.  Fetch it and clear the loc.
             WorkingSetCommon::fetchAndInvalidateLoc(member);
 
@@ -206,6 +261,18 @@ namespace mongo {
             _ws->flagForReview(id);
             _dataMap.erase(it);
         }
+    }
+
+    PlanStageStats* AndHashStage::getStats() {
+        _commonStats.isEOF = isEOF();
+
+        auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_AND_HASH));
+        ret->specific.reset(new AndHashStats(_specificStats));
+        for (size_t i = 0; i < _children.size(); ++i) {
+            ret->children.push_back(_children[i]->getStats());
+        }
+
+        return ret.release();
     }
 
 }  // namespace mongo

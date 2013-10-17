@@ -29,7 +29,7 @@
 #include "mongo/db/index/catalog_hack.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
-#include "mongo/db/matcher.h"
+#include "mongo/db/matcher/expression_parser.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace QueryStageAnd {
@@ -93,7 +93,7 @@ namespace QueryStageAnd {
      * Invalidate a DiskLoc held by a hashed AND before the AND finishes evaluating.  The AND should
      * process all other data just fine and flag the invalidated DiskLoc in the WorkingSet.
      */
-    class AndHashInvalidation : public QueryStageAndBase {
+    class QueryStageAndHashInvalidation : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -111,17 +111,18 @@ namespace QueryStageAnd {
             // Foo <= 20
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = -1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
             // Bar >= 10
             params.descriptor = getIndex(BSON("bar" << 1));
-            params.startKey = BSON("" << 10);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.startKey = BSON("" << 10);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -184,7 +185,7 @@ namespace QueryStageAnd {
 
 
     // An AND with three children.
-    class AndHashThreeLeaf : public QueryStageAndBase {
+    class QueryStageAndHashThreeLeaf : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -203,25 +204,26 @@ namespace QueryStageAnd {
             // Foo <= 20
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = -1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
             // Bar >= 10
             params.descriptor = getIndex(BSON("bar" << 1));
-            params.startKey = BSON("" << 10);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.startKey = BSON("" << 10);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
             // 5 <= baz <= 15
             params.descriptor = getIndex(BSON("baz" << 1));
-            params.startKey = BSON("" << 5);
-            params.endKey = BSON("" << 15);
-            params.endKeyInclusive = true;
+            params.bounds.startKey = BSON("" << 5);
+            params.bounds.endKey = BSON("" << 15);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -232,7 +234,7 @@ namespace QueryStageAnd {
     };
 
     // An AND with an index scan that returns nothing.
-    class AndHashWithNothing : public QueryStageAndBase {
+    class QueryStageAndHashWithNothing : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -250,17 +252,18 @@ namespace QueryStageAnd {
             // Foo <= 20
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = -1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
             // Bar == 5.  Index scan should be eof.
             params.descriptor = getIndex(BSON("bar" << 1));
-            params.startKey = BSON("" << 5);
-            params.endKey = BSON("" << 5);
-            params.endKeyInclusive = true;
+            params.bounds.startKey = BSON("" << 5);
+            params.bounds.endKey = BSON("" << 5);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -269,7 +272,7 @@ namespace QueryStageAnd {
     };
 
     // An AND that scans data but returns nothing.
-    class AndHashProducesNothing : public QueryStageAndBase {
+    class QueryStageAndHashProducesNothing : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -288,20 +291,21 @@ namespace QueryStageAnd {
             // Foo >= 100
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 100);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 100);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
             // Bar <= 100
             params.descriptor = getIndex(BSON("bar" << 1));
-            params.startKey = BSON("" << 100);
+            params.bounds.startKey = BSON("" << 100);
             // This is subtle and confusing.  We couldn't extract any keys from the elements with
             // 'foo' in them so we would normally index them with the "nothing found" key.  We don't
             // want to include that in our scan.
-            params.endKey = BSON("" << "");
-            params.endKeyInclusive = false;
+            params.bounds.endKey = BSON("" << "");
+            params.bounds.endKeyInclusive = false;
             params.direction = -1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -310,7 +314,7 @@ namespace QueryStageAnd {
     };
 
     // An AND that would return more data but the matcher filters it.
-    class AndHashWithMatcher : public QueryStageAndBase {
+    class QueryStageAndHashWithMatcher : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -324,22 +328,26 @@ namespace QueryStageAnd {
 
             WorkingSet ws;
             BSONObj filter = BSON("bar" << 97);
-            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, new Matcher(filter)));
+            StatusWithMatchExpression swme = MatchExpressionParser::parse(filter);
+            verify(swme.isOK());
+            auto_ptr<MatchExpression> filterExpr(swme.getValue());
+            scoped_ptr<AndHashStage> ah(new AndHashStage(&ws, filterExpr.get()));
 
             // Foo <= 20
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = -1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
             // Bar >= 95
             params.descriptor = getIndex(BSON("bar" << 1));
-            params.startKey = BSON("" << 10);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.startKey = BSON("" << 10);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -356,7 +364,7 @@ namespace QueryStageAnd {
      * Invalidate a DiskLoc held by a sorted AND before the AND finishes evaluating.  The AND should
      * process all other data just fine and flag the invalidated DiskLoc in the WorkingSet.
      */
-    class AndSortedInvalidation : public QueryStageAndBase {
+    class QueryStageAndSortedInvalidation : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -374,9 +382,10 @@ namespace QueryStageAnd {
             // Scan over foo == 1
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 1);
-            params.endKey = BSON("" << 1);
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 1);
+            params.bounds.endKey = BSON("" << 1);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -466,7 +475,7 @@ namespace QueryStageAnd {
 
 
     // An AND with three children.
-    class AndSortedThreeLeaf : public QueryStageAndBase {
+    class QueryStageAndSortedThreeLeaf : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -493,9 +502,10 @@ namespace QueryStageAnd {
             // Scan over foo == 1
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 1);
-            params.endKey = BSON("" << 1);
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 1);
+            params.bounds.endKey = BSON("" << 1);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -512,7 +522,7 @@ namespace QueryStageAnd {
     };
 
     // An AND with an index scan that returns nothing.
-    class AndSortedWithNothing : public QueryStageAndBase {
+    class QueryStageAndSortedWithNothing : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -530,17 +540,18 @@ namespace QueryStageAnd {
             // Foo == 7.  Should be EOF.
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 7);
-            params.endKey = BSON("" << 7);
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 7);
+            params.bounds.endKey = BSON("" << 7);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
             // Bar == 20, not EOF.
             params.descriptor = getIndex(BSON("bar" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSON("" << 20);
-            params.endKeyInclusive = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSON("" << 20);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -549,7 +560,7 @@ namespace QueryStageAnd {
     };
 
     // An AND that scans data but returns nothing.
-    class AndSortedProducesNothing : public QueryStageAndBase {
+    class QueryStageAndSortedProducesNothing : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -571,17 +582,18 @@ namespace QueryStageAnd {
             // foo == 7.
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 7);
-            params.endKey = BSON("" << 7);
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 7);
+            params.bounds.endKey = BSON("" << 7);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
             // bar == 20.
             params.descriptor = getIndex(BSON("bar" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSON("" << 20);
-            params.endKeyInclusive = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSON("" << 20);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -590,7 +602,7 @@ namespace QueryStageAnd {
     };
 
     // An AND that would return data but the matcher prevents it.
-    class AndSortedWithMatcher : public QueryStageAndBase {
+    class QueryStageAndSortedWithMatcher : public QueryStageAndBase {
     public:
         void run() {
             Client::WriteContext ctx(ns());
@@ -603,15 +615,19 @@ namespace QueryStageAnd {
             addIndex(BSON("bar" << 1));
 
             WorkingSet ws;
-            BSONObj filter = BSON("foo" << BSON("$ne" << 1));
-            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, new Matcher(filter)));
+            BSONObj filterObj = BSON("foo" << BSON("$ne" << 1));
+            StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
+            verify(swme.isOK());
+            auto_ptr<MatchExpression> filterExpr(swme.getValue());
+            scoped_ptr<AndSortedStage> ah(new AndSortedStage(&ws, filterExpr.get()));
 
             // Scan over foo == 1
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 1);
-            params.endKey = BSON("" << 1);
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 1);
+            params.bounds.endKey = BSON("" << 1);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
             ah->addChild(new IndexScan(params, &ws, NULL));
 
@@ -624,22 +640,21 @@ namespace QueryStageAnd {
         }
     };
 
-
     class All : public Suite {
     public:
         All() : Suite( "query_stage_and" ) { }
 
         void setupTests() {
-            add<AndHashInvalidation>();
-            add<AndHashThreeLeaf>();
-            add<AndHashWithNothing>();
-            add<AndHashProducesNothing>();
-            add<AndHashWithMatcher>();
-            add<AndSortedInvalidation>();
-            add<AndSortedThreeLeaf>();
-            add<AndSortedWithNothing>();
-            add<AndSortedProducesNothing>();
-            add<AndSortedWithMatcher>();
+            add<QueryStageAndHashInvalidation>();
+            add<QueryStageAndHashThreeLeaf>();
+            add<QueryStageAndHashWithNothing>();
+            add<QueryStageAndHashProducesNothing>();
+            add<QueryStageAndHashWithMatcher>();
+            add<QueryStageAndSortedInvalidation>();
+            add<QueryStageAndSortedThreeLeaf>();
+            add<QueryStageAndSortedWithNothing>();
+            add<QueryStageAndSortedProducesNothing>();
+            add<QueryStageAndSortedWithMatcher>();
         }
     }  queryStageAndAll;
 

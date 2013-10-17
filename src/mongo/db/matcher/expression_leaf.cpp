@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/matcher/expression_leaf.h"
@@ -35,7 +47,7 @@ namespace mongo {
 
 
     bool LeafMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        boost::scoped_ptr<ElementIterator> cursor( doc->getIterator( _elementPath ) );
+        MatchableDocument::IteratorHolder cursor( doc, &_elementPath );
         while ( cursor->more() ) {
             ElementIterator::Context e = cursor->next();
             if ( !matchesSingleElement( e.element() ) )
@@ -143,7 +155,15 @@ namespace mongo {
         case GTE: debug << "$gte"; break;
         default: debug << " UNKNOWN - should be impossible"; break;
         }
-        debug << " " << _rhs.toString( false ) << "\n";
+        debug << " " << _rhs.toString( false );
+
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+
+        debug << "\n";
     }
 
     // ---------------
@@ -216,7 +236,14 @@ namespace mongo {
 
     void RegexMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << path() << " regex /" << _regex << "/" << _flags << "\n";
+        debug << path() << " regex /" << _regex << "/" << _flags;
+
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
     }
 
     // ---------
@@ -237,7 +264,13 @@ namespace mongo {
 
     void ModMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << path() << " mod " << _divisor << " % x == "  << _remainder << "\n";
+        debug << path() << " mod " << _divisor << " % x == "  << _remainder;
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
     }
 
     bool ModMatchExpression::equivalent( const MatchExpression* other ) const {
@@ -264,7 +297,13 @@ namespace mongo {
 
     void ExistsMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << path() << " exists\n";
+        debug << path() << " exists";
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
     }
 
     bool ExistsMatchExpression::equivalent( const MatchExpression* other ) const {
@@ -289,7 +328,7 @@ namespace mongo {
     }
 
     bool TypeMatchExpression::matches( const MatchableDocument* doc, MatchDetails* details ) const {
-        boost::scoped_ptr<ElementIterator> cursor( doc->getIterator( _elementPath ) );
+        MatchableDocument::IteratorHolder cursor( doc, &_elementPath );
         while ( cursor->more() ) {
             ElementIterator::Context e = cursor->next();
             if ( e.outerArray() )
@@ -307,7 +346,13 @@ namespace mongo {
 
     void TypeMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << _path << " type: " << _type << "\n";
+        debug << _path << " type: " << _type;
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
     }
 
 
@@ -421,7 +466,13 @@ namespace mongo {
 
     void InMatchExpression::debugString( StringBuilder& debug, int level ) const {
         _debugAddSpace( debug, level );
-        debug << path() << " $in: TODO\n";
+        debug << path() << ";$in: TODO ";
+        MatchExpression::TagData* td = getTag();
+        if (NULL != td) {
+            debug << " ";
+            td->debugString(&debug);
+        }
+        debug << "\n";
     }
 
     bool InMatchExpression::equivalent( const MatchExpression* other ) const {
@@ -436,6 +487,9 @@ namespace mongo {
     LeafMatchExpression* InMatchExpression::shallowClone() const {
         InMatchExpression* next = new InMatchExpression();
         copyTo( next );
+        if ( getTag() ) {
+            next->setTag(getTag()->clone());
+        }
         return next;
     }
 

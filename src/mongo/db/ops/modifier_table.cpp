@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/modifier_table.h"
@@ -23,6 +35,8 @@
 #include "mongo/base/status.h"
 #include "mongo/db/ops/modifier_add_to_set.h"
 #include "mongo/db/ops/modifier_bit.h"
+#include "mongo/db/ops/modifier_compare.h"
+#include "mongo/db/ops/modifier_current_date.h"
 #include "mongo/db/ops/modifier_inc.h"
 #include "mongo/db/ops/modifier_pop.h"
 #include "mongo/db/ops/modifier_pull.h"
@@ -59,6 +73,21 @@ namespace modifiertable {
             ModifierEntry* entryBit = new ModifierEntry("$bit", MOD_BIT);
             nameMap->insert(make_pair(StringData(entryBit->name), entryBit));
 
+            ModifierEntry* entryCurrentDate = new ModifierEntry("$currentDate", MOD_CURRENTDATE);
+            nameMap->insert(make_pair(StringData(entryCurrentDate->name), entryCurrentDate));
+
+            ModifierEntry* entryInc = new ModifierEntry("$inc", MOD_INC);
+            nameMap->insert(make_pair(StringData(entryInc->name), entryInc));
+
+            ModifierEntry* entryMax = new ModifierEntry("$max", MOD_MAX);
+            nameMap->insert(make_pair(StringData(entryMax->name), entryMax));
+
+            ModifierEntry* entryMin = new ModifierEntry("$min", MOD_MIN);
+            nameMap->insert(make_pair(StringData(entryMin->name), entryMin));
+
+            ModifierEntry* entryMul = new ModifierEntry("$mul", MOD_MUL);
+            nameMap->insert(make_pair(StringData(entryMul->name), entryMul));
+
             ModifierEntry* entryPop = new ModifierEntry("$pop", MOD_POP);
             nameMap->insert(make_pair(StringData(entryPop->name), entryPop));
 
@@ -73,9 +102,6 @@ namespace modifiertable {
 
             ModifierEntry* entryPushAll = new ModifierEntry("$pushAll", MOD_PUSH_ALL);
             nameMap->insert(make_pair(StringData(entryPushAll->name), entryPushAll));
-
-            ModifierEntry* entryInc = new ModifierEntry("$inc", MOD_INC);
-            nameMap->insert(make_pair(StringData(entryInc->name), entryInc));
 
             ModifierEntry* entrySet = new ModifierEntry("$set", MOD_SET);
             nameMap->insert(make_pair(StringData(entrySet->name), entrySet));
@@ -113,8 +139,16 @@ namespace modifiertable {
             return new ModifierAddToSet;
         case MOD_BIT:
             return new ModifierBit;
+        case MOD_CURRENTDATE:
+            return new ModifierCurrentDate;
         case MOD_INC:
-            return new ModifierInc;
+            return new ModifierInc(ModifierInc::MODE_INC);
+        case MOD_MAX:
+            return new ModifierCompare(ModifierCompare::MAX);
+        case MOD_MIN:
+            return new ModifierCompare(ModifierCompare::MIN);
+        case MOD_MUL:
+            return new ModifierInc(ModifierInc::MODE_MUL);
         case MOD_POP:
             return new ModifierPop;
         case MOD_PULL:

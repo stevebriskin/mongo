@@ -14,17 +14,29 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/db/commands/find_and_modify.h"
 
-#include "mongo/db/commands.h"
-#include "mongo/db/instance.h"
 #include "mongo/db/clientcursor.h"
-#include "mongo/db/pagefault.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/pagefault.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/queryutil.h"
@@ -49,7 +61,7 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
-            find_and_modify::addPrivilegesRequiredForFindAndModify(dbname, cmdObj, out);
+            find_and_modify::addPrivilegesRequiredForFindAndModify(this, dbname, cmdObj, out);
         }
         /* this will eventually replace run,  once sort is handled */
         bool runNoDirectClient( const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
@@ -123,7 +135,6 @@ namespace mongo {
             Client::Context cx( ns );
 
             BSONObj doc;
-            
             bool found = Helpers::findOne( ns.c_str() , queryOriginal , doc );
 
             BSONObj queryModified = queryOriginal;
@@ -187,7 +198,7 @@ namespace mongo {
             if ( remove ) {
                 _appendHelper( result , doc , found , fields );
                 if ( found ) {
-                    deleteObjects( ns.c_str() , queryModified , true , true );
+                    deleteObjects( ns , queryModified , true , true );
                     BSONObjBuilder le( result.subobjStart( "lastErrorObject" ) );
                     le.appendNumber( "n" , 1 );
                     le.done();
@@ -206,16 +217,30 @@ namespace mongo {
                         _appendHelper( result , doc , found , fields );
                     }
                     
-                    UpdateResult res = updateObjects( ns.c_str() , update , queryModified , upsert , false , true , cc().curop()->debug() );
-                    
+                    const NamespaceString requestNs(ns);
+                    UpdateRequest request(requestNs);
+
+                    request.setQuery(queryModified);
+                    request.setUpdates(update);
+                    request.setUpsert(upsert);
+                    request.setUpdateOpLog();
+
+                    UpdateResult res = mongo::update(request, &cc().curop()->debug());
+
+                    LOG(3) << "update result: "  << res ;
                     if ( returnNew ) {
-                        if ( res.upserted.isSet() ) {
-                            queryModified = BSON( "_id" << res.upserted );
+                        if ( !res.upserted.isEmpty() ) {
+                            BSONElement upsertedElem = res.upserted[kUpsertedFieldName];
+                            LOG(3) << "using new _id to get new doc: "
+                                   << upsertedElem;
+                            queryModified = upsertedElem.wrap("_id");
                         }
                         else if ( queryModified["_id"].type() ) {
                             // we do this so that if the update changes the fields, it still matches
                             queryModified = queryModified["_id"].wrap();
                         }
+
+                        LOG(3) << "using modified query to return the new doc: " << queryModified;
                         if ( ! Helpers::findOne( ns.c_str() , queryModified , doc ) ) {
                             errmsg = str::stream() << "can't find object after modification  " 
                                                    << " ns: " << ns 
@@ -229,9 +254,10 @@ namespace mongo {
                     
                     BSONObjBuilder le( result.subobjStart( "lastErrorObject" ) );
                     le.appendBool( "updatedExisting" , res.existing );
-                    le.appendNumber( "n" , res.num );
-                    if ( res.upserted.isSet() )
-                        le.append( "upserted" , res.upserted );
+                    le.appendNumber( "n" , res.numMatched );
+                    if ( !res.upserted.isEmpty() ) {
+                        le.append( res.upserted[kUpsertedFieldName] );
+                    }
                     le.done();
                     
                 }
@@ -286,11 +312,14 @@ namespace mongo {
                 }
 
                 if (cmdObj["new"].trueValue()) {
-                    BSONElement _id = gle["upserted"];
-                    if (_id.eoo())
-                        _id = origQuery["_id"];
+                    BSONObjBuilder bob;
+                    BSONElement _id = gle[kUpsertedFieldName];
+                    if (!_id.eoo())
+                        bob.appendAs(_id, "_id");
+                    else
+                        bob.appendAs(origQuery["_id"], "_id");
 
-                    out = db.findOne(ns, QUERY("_id" << _id), fields);
+                    out = db.findOne(ns, bob.done(), fields);
                 }
 
             }

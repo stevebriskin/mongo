@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -26,6 +38,8 @@
 #include "mongo/db/ops/modifier_interface.h"
 
 namespace mongo {
+
+    class LogBuilder;
 
     class ModifierSet : public ModifierInterface {
         MONGO_DISALLOW_COPYING(ModifierSet);
@@ -47,7 +61,7 @@ namespace mongo {
          * assigned to it from 'modExpr'. It returns OK if successful or a status describing
          * the error.
          */
-        virtual Status init(const BSONElement& modExpr);
+        virtual Status init(const BSONElement& modExpr, const Options& opts);
 
         /**
          * Looks up the field name in the sub-tree rooted at 'root', and binds, if necessary,
@@ -70,7 +84,7 @@ namespace mongo {
          * Adds a log entry to logRoot corresponding to the operation applied here. Returns OK
          * if successful or a status describing the error.
          */
-        virtual Status log(mutablebson::Element logRoot) const;
+        virtual Status log(LogBuilder* logBuilder) const;
 
     private:
 
@@ -85,6 +99,9 @@ namespace mongo {
 
         // Element of the $set expression.
         BSONElement _val;
+
+        // See the class comments in modifier_interface.h
+        ModifierInterface::Options _modOptions;
 
         // The instance of the field in the provided doc. This state is valid after a
         // prepare() was issued and until a log() is issued. The document this mod is

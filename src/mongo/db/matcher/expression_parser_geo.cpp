@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/matcher/expression_parser.h"
@@ -27,16 +39,41 @@
 namespace mongo {
 
     StatusWithMatchExpression expressionParserGeoCallbackReal( const char* name,
-                                                                  const BSONObj& section ) {
-        GeoQuery gq;
-        if ( !gq.parseFrom( section ) )
-            return StatusWithMatchExpression( ErrorCodes::BadValue, "bad geo query" );
+                                                               int type,
+                                                               const BSONObj& section ) {
+        if (BSONObj::opWITHIN == type || BSONObj::opGEO_INTERSECTS == type) {
+            GeoQuery gq(name);
+            if ( !gq.parseFrom( section ) )
+                return StatusWithMatchExpression( ErrorCodes::BadValue, "bad geo query" );
 
-        auto_ptr<GeoMatchExpression> e( new GeoMatchExpression() );
-        Status s = e->init( name, gq );
-        if ( !s.isOK() )
-            return StatusWithMatchExpression( s );
-        return StatusWithMatchExpression( e.release() );
+            auto_ptr<GeoMatchExpression> e( new GeoMatchExpression() );
+
+            // Until the index layer accepts non-BSON predicates, or special indices are moved into
+            // stages, we have to clean up the raw object so it can be passed down to the index
+            // layer.
+            BSONObjBuilder bob;
+            bob.append(name, section);
+            Status s = e->init( name, gq, bob.obj() );
+            if ( !s.isOK() )
+                return StatusWithMatchExpression( s );
+            return StatusWithMatchExpression( e.release() );
+        }
+        else {
+            verify(BSONObj::opNEAR == type);
+            NearQuery nq(name);
+            if ( !nq.parseFrom( section ) )
+                return StatusWithMatchExpression( ErrorCodes::BadValue, "bad geo near query" );
+            auto_ptr<GeoNearMatchExpression> e( new GeoNearMatchExpression() );
+            // Until the index layer accepts non-BSON predicates, or special indices are moved into
+            // stages, we have to clean up the raw object so it can be passed down to the index
+            // layer.
+            BSONObjBuilder bob;
+            bob.append(name, section);
+            Status s = e->init( name, nq, bob.obj() );
+            if ( !s.isOK() )
+                return StatusWithMatchExpression( s );
+            return StatusWithMatchExpression( e.release() );
+        }
     }
 
     MONGO_INITIALIZER( MatchExpressionParserGeo )( ::mongo::InitializerContext* context ) {

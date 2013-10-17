@@ -12,22 +12,45 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/modifier_push.h"
 
 #include <algorithm>
+#include <limits>
 
 #include "mongo/base/error_codes.h"
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/db/ops/field_checker.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/db/ops/path_support.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
+    namespace mb = mutablebson;
+    namespace str = mongoutils::str;
+
     namespace {
+
+        const char kEach[] = "$each";
+        const char kSlice[] = "$slice";
+        const char kSort[] = "$sort";
+        const char kPosition[] = "$position";
 
         bool isPatternElement(const BSONElement& pattern) {
             if (!pattern.isNumber()) {
@@ -48,7 +71,7 @@ namespace mongo {
                 return false;
             }
             BSONObj obj = modExpr.embeddedObject();
-            if (obj["$each"].type() == EOO) {
+            if (obj[kEach].type() == EOO) {
                 return false;
             }
             return true;
@@ -58,7 +81,8 @@ namespace mongo {
                              const BSONElement& modExpr,
                              BSONElement* eachElem,
                              BSONElement* sliceElem,
-                             BSONElement* sortElem) {
+                             BSONElement* sortElem,
+                             BSONElement* positionElem) {
 
             Status status = Status::OK();
 
@@ -72,7 +96,7 @@ namespace mongo {
             }
 
             // The $each clause must be an array.
-            *eachElem = modExpr.embeddedObject()["$each"];
+            *eachElem = modExpr.embeddedObject()[kEach];
             if (eachElem->type() != Array) {
                 return Status(ErrorCodes::BadValue, "$each must be an array");
             }
@@ -82,7 +106,7 @@ namespace mongo {
             BSONObjIterator itMod(modExpr.embeddedObject());
             while (itMod.more()) {
                 BSONElement modElem = itMod.next();
-                if (mongoutils::str::equals(modElem.fieldName(), "$each")) {
+                if (mongoutils::str::equals(modElem.fieldName(), kEach)) {
                     if (seenEach) {
                         return Status(ErrorCodes::BadValue, "duplicated $each clause");
                     }
@@ -96,46 +120,44 @@ namespace mongo {
             while (itEach.more()) {
                 BSONElement eachItem = itEach.next();
                 if (eachItem.type() == Object || eachItem.type() == Array) {
-                    if (! eachItem.Obj().okForStorage()) {
-                        return Status(ErrorCodes::BadValue, "cannot use '$' in $each entries");
-                    }
+                    Status s = eachItem.Obj().storageValidEmbedded();
+                    if (!s.isOK())
+                        return s;
                 }
             }
 
-            // Slice and sort are optional and may be present in any order.
+            // Slice, sort, position are optional and may be present in any order.
             bool seenSlice = false;
             bool seenSort = false;
+            bool seenPosition = false;
             BSONObjIterator itPush(modExpr.embeddedObject());
             while (itPush.more()) {
                 BSONElement elem = itPush.next();
-                if (mongoutils::str::equals(elem.fieldName(), "$slice")) {
+                if (mongoutils::str::equals(elem.fieldName(), kSlice)) {
                     if (seenSlice) {
                         return Status(ErrorCodes::BadValue, "duplicate $slice clause");
                     }
                     *sliceElem = elem;
                     seenSlice = true;
                 }
-                else if (mongoutils::str::equals(elem.fieldName(), "$sort")) {
+                else if (mongoutils::str::equals(elem.fieldName(), kSort)) {
                     if (seenSort) {
                         return Status(ErrorCodes::BadValue, "duplicate $sort clause");
                     }
                     *sortElem = elem;
                     seenSort = true;
                 }
-                else if (!mongoutils::str::equals(elem.fieldName(), "$each")) {
-                    return Status(ErrorCodes::BadValue, "unrecognized clause is $push");
-                }
-            }
-
-            if (seenSort) {
-                BSONObjIterator itEach(eachElem->embeddedObject());
-                while (itEach.more()) {
-                    BSONElement eachItem = itEach.next();
-                    if (eachItem.type() != Object) {
-                        return Status(
-                            ErrorCodes::BadValue,
-                            "$push like modifiers using $sort require all elements to be objects");
+                else if (mongoutils::str::equals(elem.fieldName(), kPosition)) {
+                    if (seenPosition) {
+                        return Status(ErrorCodes::BadValue, "duplicate $position clause");
                     }
+                    *positionElem = elem;
+                    seenPosition = true;
+                }
+                else if (!mongoutils::str::equals(elem.fieldName(), kEach)) {
+                    return Status(ErrorCodes::BadValue,
+                                  str::stream() << "Unrecognized clause in $push: "
+                                                << elem.fieldNameStringData());
                 }
             }
 
@@ -150,20 +172,23 @@ namespace mongo {
             : doc(*targetDoc)
             , idxFound(0)
             , elemFound(doc.end())
-            , boundDollar("") {
+            , boundDollar("")
+            , arrayPreModSize(0) {
         }
 
         // Document that is going to be changed.
         mutablebson::Document& doc;
 
         // Index in _fieldRef for which an Element exist in the document.
-        int32_t idxFound;
+        size_t idxFound;
 
         // Element corresponding to _fieldRef[0.._idxFound].
         mutablebson::Element elemFound;
 
         // Value to bind to a $-positional field, if one is provided.
         std::string boundDollar;
+
+        size_t arrayPreModSize;
 
     };
 
@@ -175,6 +200,7 @@ namespace mongo {
         , _slicePresent(false)
         , _slice(0)
         , _sortPresent(false)
+        , _startPosition(std::numeric_limits<std::size_t>::max())
         , _sort()
         , _pushMode(pushMode)
         , _val() {
@@ -183,7 +209,7 @@ namespace mongo {
     ModifierPush::~ModifierPush() {
     }
 
-    Status ModifierPush::init(const BSONElement& modExpr) {
+    Status ModifierPush::init(const BSONElement& modExpr, const Options& opts) {
 
         //
         // field name analysis
@@ -202,7 +228,9 @@ namespace mongo {
         size_t foundCount;
         bool foundDollar = fieldchecker::isPositional(_fieldRef, &_posDollar, &foundCount);
         if (foundDollar && foundCount > 1) {
-            return Status(ErrorCodes::BadValue, "too many positional($) elements found.");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "Too many positional (i.e. '$') elements found in path '"
+                                        << _fieldRef.dottedField() << "'");
         }
 
         //
@@ -212,11 +240,14 @@ namespace mongo {
         // Are the target push values safe to store?
         BSONElement sliceElem;
         BSONElement sortElem;
+        BSONElement positionElem;
         switch (modExpr.type()) {
 
         case Array:
-            if (! modExpr.Obj().okForStorage()) {
-                return Status(ErrorCodes::BadValue, "cannot use '$' or '.' as values");
+            {
+                Status s = modExpr.Obj().storageValidEmbedded();
+                if (!s.isOK())
+                    return s;
             }
 
             if (_pushMode == PUSH_ALL) {
@@ -225,7 +256,8 @@ namespace mongo {
                                               modExpr,
                                               &_eachElem,
                                               &sliceElem,
-                                              &sortElem);
+                                              &sortElem,
+                                              &positionElem);
                 if (!status.isOK()) {
                     return status;
                 }
@@ -237,7 +269,9 @@ namespace mongo {
 
         case Object:
             if (_pushMode == PUSH_ALL) {
-                return Status(ErrorCodes::BadValue, "$pushAll requires an array of values");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "$pushAll requires an array of values "
+                                      "but was given an embedded document, not an array.");
             }
 
             // If any known clause ($each, $slice, or $sort) is present, we'd assume
@@ -248,22 +282,27 @@ namespace mongo {
                                               modExpr,
                                               &_eachElem,
                                               &sliceElem,
-                                              &sortElem);
+                                              &sortElem,
+                                              &positionElem);
                 if (!status.isOK()) {
                     return status;
                 }
             }
             else {
-                if (! modExpr.Obj().okForStorage()) {
-                    return Status(ErrorCodes::BadValue, "cannot use '$' as values");
-                }
+                Status s = modExpr.Obj().storageValidEmbedded();
+                if (!s.isOK())
+                    return s;
+
                 _val = modExpr;
             }
             break;
 
         default:
             if (_pushMode == PUSH_ALL) {
-                return Status(ErrorCodes::BadValue, "$pushAll requires an array of values");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "$pushAll requires an array of values "
+                                               "but was given an "
+                                            << typeName(modExpr.type()));
             }
 
             _val = modExpr;
@@ -277,67 +316,129 @@ namespace mongo {
             }
 
             if (!sliceElem.isNumber()) {
-                return Status(ErrorCodes::BadValue, "$slice must be a numeric value");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The value for $slice must "
+                                               "a be a numeric value not "
+                                            << typeName(sliceElem.type()));
             }
+
+            // TODO: Cleanup and unify numbers wrt getting int32/64 bson values (from doubles)
 
             // If the value of slice is not fraction, even if it's a double, we allow it. The
             // reason here is that the shell will use doubles by default unless told otherwise.
-            double fractional = sliceElem.numberDouble();
-            if (fractional - static_cast<int64_t>(fractional) != 0) {
-                return Status(ErrorCodes::BadValue, "$slice in $push cannot be fractional");
+            const double doubleVal = sliceElem.numberDouble();
+            if (doubleVal - static_cast<int64_t>(doubleVal) != 0) {
+                return Status(ErrorCodes::BadValue,
+                              "The $slice value in $push cannot be fractional");
             }
 
             _slice = sliceElem.numberLong();
-            if (_slice > 0) {
-                return Status(ErrorCodes::BadValue, "$slice in $push must be zero or negative");
-            }
             _slicePresent = true;
+        }
+
+        // Is position present and correct?
+        if (positionElem.type() != EOO) {
+            if (_pushMode == PUSH_ALL) {
+                return Status(ErrorCodes::BadValue, "cannot use $position in $pushAll");
+            }
+
+            if (!positionElem.isNumber()) {
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The value for $position must "
+                                               "a be a positive numeric value not "
+                                            << typeName(positionElem.type()));
+            }
+
+            // TODO: Cleanup and unify numbers wrt getting int32/64 bson values (from doubles)
+
+            // If the value of position is not fraction, even if it's a double, we allow it. The
+            // reason here is that the shell will use doubles by default unless told otherwise.
+            const double doubleVal = positionElem.numberDouble();
+            if (doubleVal - static_cast<int64_t>(doubleVal) != 0) {
+                return Status(ErrorCodes::BadValue,
+                              "The $position value in $push cannot be fractional");
+            }
+
+            if (static_cast<double>(numeric_limits<int64_t>::max()) < doubleVal) {
+                return Status(ErrorCodes::BadValue,
+                              "The $position value in $push is too large a number.");
+            }
+
+            if (static_cast<double>(numeric_limits<int64_t>::min()) > doubleVal) {
+                return Status(ErrorCodes::BadValue,
+                              "The $position value in $push is too small a number.");
+            }
+
+            const int64_t tempVal = positionElem.numberLong();
+            if (tempVal < 0)
+                return Status(ErrorCodes::BadValue,
+                              "The $position value in $push must be positive.");
+
+            _startPosition = size_t(tempVal);
         }
 
         // Is sort present and correct?
         if (sortElem.type() != EOO) {
             if (_pushMode == PUSH_ALL) {
-                return Status(ErrorCodes::BadValue, "cannot use $sort in $pushAll");
+                return Status(ErrorCodes::BadValue,
+                              "cannot use $sort in $pushAll");
             }
 
-            if (!_slicePresent) {
-                return Status(ErrorCodes::BadValue, "$sort requires $slice to be present");
-            }
-            else if (sortElem.type() != Object) {
-                return Status(ErrorCodes::BadValue, "invalid $sort clause");
-            }
-
-            BSONObj sortObj = sortElem.embeddedObject();
-            if (sortObj.isEmpty()) {
-                return Status(ErrorCodes::BadValue, "sort parttern is empty");
+            if (sortElem.type() != Object && !sortElem.isNumber()) {
+                return Status(ErrorCodes::BadValue,
+                              "The $sort is invalid: use 1/-1 to sort the whole element, "
+                              "or {field:1/-1} to sort embedded fields");
             }
 
-            // Check if the sort pattern is sound.
-            BSONObjIterator sortIter(sortObj);
-            while (sortIter.more()) {
-
-                BSONElement sortPatternElem = sortIter.next();
-
-                // We require either <field>: 1 or -1 for asc and desc.
-                if (!isPatternElement(sortPatternElem)) {
-                    return Status(ErrorCodes::BadValue, "$sort elements' must be either 1 or -1");
+            if (sortElem.isABSONObj()) {
+                BSONObj sortObj = sortElem.embeddedObject();
+                if (sortObj.isEmpty()) {
+                    return Status(ErrorCodes::BadValue,
+                                  "The $sort pattern is empty when it should be a set of fields.");
                 }
 
-                // All fields parts must be valid.
-                FieldRef sortField;
-                sortField.parse(sortPatternElem.fieldName());
-                if (sortField.numParts() == 0) {
-                    return Status(ErrorCodes::BadValue, "$sort field cannot be empty");
-                }
+                // Check if the sort pattern is sound.
+                BSONObjIterator sortIter(sortObj);
+                while (sortIter.more()) {
 
-                for (size_t i = 0; i < sortField.numParts(); i++) {
-                    if (sortField.getPart(i).size() == 0) {
-                        return Status(ErrorCodes::BadValue, "empty field in dotted sort pattern");
+                    BSONElement sortPatternElem = sortIter.next();
+
+                    // We require either <field>: 1 or -1 for asc and desc.
+                    if (!isPatternElement(sortPatternElem)) {
+                        return Status(ErrorCodes::BadValue,
+                                      "The $sort element value must be either 1 or -1");
+                    }
+
+                    // All fields parts must be valid.
+                    FieldRef sortField;
+                    sortField.parse(sortPatternElem.fieldName());
+                    if (sortField.numParts() == 0) {
+                        return Status(ErrorCodes::BadValue,
+                                      "The $sort field cannot be empty");
+                    }
+
+                    for (size_t i = 0; i < sortField.numParts(); i++) {
+                        if (sortField.getPart(i).size() == 0) {
+                            return Status(ErrorCodes::BadValue,
+                                          str::stream() << "The $sort field is a dotted field "
+                                                           "but has an empty part: "
+                                                        << sortField.dottedField());
+                        }
                     }
                 }
+
+                _sort = PatternElementCmp(sortElem.embeddedObject());
+            }
+            else {
+                // Ensure the sortElem number is valid.
+                if (!isPatternElement(sortElem)) {
+                    return Status(ErrorCodes::BadValue,
+                                  "The $sort element value must be either 1 or -1");
+                }
+
+                _sort = PatternElementCmp(BSON("" << sortElem.number()));
             }
 
-            _sort = PatternElementCmp(sortElem.embeddedObject());
             _sortPresent = true;
         }
 
@@ -353,7 +454,10 @@ namespace mongo {
         // If we have a $-positional field, it is time to bind it to an actual field part.
         if (_posDollar) {
             if (matchedField.empty()) {
-                return Status(ErrorCodes::BadValue, "matched field not provided");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The positional operator did not find the match "
+                                               "needed from the query. Unexpanded update: "
+                                            << _fieldRef.dottedField());
             }
             _preparedState->boundDollar = matchedField.toString();
             _fieldRef.setPart(_posDollar, _preparedState->boundDollar);
@@ -377,28 +481,17 @@ namespace mongo {
         }
         else if (status.isOK()) {
 
-            const bool destExists = (_preparedState->idxFound ==
-                                            static_cast<int32_t>(_fieldRef.numParts()-1));
+            const bool destExists = (_preparedState->idxFound == (_fieldRef.numParts()-1));
             // If the path exists, we require the target field to be already an
             // array.
             if (destExists && _preparedState->elemFound.getType() != Array) {
-                return Status(ErrorCodes::BadValue, "can only $push into arrays");
+                mb::Element idElem = mb::findElementNamed(root.leftChild(), "_id");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The field '" << _fieldRef.dottedField() << "'"
+                                            << " must be and array but is of type "
+                                            << typeName(_preparedState->elemFound.getType())
+                                            << " in document " << idElem.toString() );
             }
-
-            // If the $sort clause is being used, we require all the items in the array to be
-            // objects themselves (as opposed to base types). This is a temporary restriction
-            // that can be lifted once we support full sort semantics in $push.
-            if (_sortPresent && destExists) {
-                mutablebson::Element curr = _preparedState->elemFound.leftChild();
-                while (curr.ok()) {
-                    if (curr.getType() != Object) {
-                        return Status(ErrorCodes::BadValue,
-                                      "$push with sort requires object arrays");
-                    }
-                    curr = curr.rightSibling();
-                }
-            }
-
         }
         else {
             return status;
@@ -410,6 +503,43 @@ namespace mongo {
 
         return Status::OK();
     }
+
+    namespace {
+        Status pushFirstElement(mb::Element& arrayElem,
+                                const size_t arraySize,
+                                const size_t pos,
+                                mb::Element& elem) {
+
+
+            // Empty array or pushing to the front
+            if (arraySize == 0 || pos == 0) {
+                return arrayElem.pushFront(elem);
+            }
+            else {
+
+                // Push position is at the end, or beyond
+                if (pos >= arraySize) {
+                    return arrayElem.pushBack(elem);
+                }
+
+                const size_t appendPos = pos - 1;
+                mutablebson::Element fromElem = getNthChild(arrayElem, appendPos);
+
+                // This should not be possible since the checks above should
+                // cover us but error just in case
+                if (!fromElem.ok()){
+                    return Status(ErrorCodes::InvalidLength,
+                                  str::stream() << "The specified position (" << appendPos << "/"
+                                                << pos
+                                                << ") is invalid based on the length ( "
+                                                << arraySize
+                                                << ") of the array");
+                }
+
+                return fromElem.addSiblingRight(elem);
+            }
+        }
+    } //unamed namespace
 
     Status ModifierPush::apply() const {
 
@@ -429,7 +559,7 @@ namespace mongo {
         // 1. If the array field is not there, create it as an array and attach it to the
         // document.
         if (!_preparedState->elemFound.ok() ||
-            _preparedState->idxFound < static_cast<int32_t>(_fieldRef.numParts()-1)) {
+            _preparedState->idxFound < (_fieldRef.numParts()-1)) {
 
             // Creates the array element
             mutablebson::Document& doc = _preparedState->doc;
@@ -465,17 +595,42 @@ namespace mongo {
 
         }
 
-        // 2. Concatenate the two arrays together, either by going over the $each array or by
-        // appending the (old style $push) element. Note that if we're the latter case, we
-        // won't need to proceed to the $sort and $slice phases of the apply.
+        // This is the count of the array before we change it, or 0 if missing from the doc.
+        _preparedState->arrayPreModSize = countChildren(_preparedState->elemFound);
+
+        // 2. Add new elements to the array either by going over the $each array or by
+        // appending the (old style $push) element.
         if (_eachMode || _pushMode == PUSH_ALL) {
             BSONObjIterator itEach(_eachElem.embeddedObject());
+
+            // When adding more than one element we keep track of the previous one
+            // so we can add right siblings to it.
+            mutablebson::Element prevElem = _preparedState->doc.end();
+
+            // The first element is special below
+            bool first = true;
+
             while (itEach.more()) {
                 BSONElement eachItem = itEach.next();
-                status = _preparedState->elemFound.appendElement(eachItem);
+                mutablebson::Element elem =
+                    _preparedState->doc.makeElementWithNewFieldName(StringData(), eachItem);
+
+                if (first) {
+                    status = pushFirstElement(_preparedState->elemFound,
+                                              _preparedState->arrayPreModSize,
+                                              _startPosition,
+                                              elem); }
+                else {
+                    status = prevElem.addSiblingRight(elem);
+                }
+
                 if (!status.isOK()) {
                     return status;
                 }
+
+                // For the next iteration the previous element will be the left sibling
+                prevElem = elem;
+                first = false;
             }
         }
         else {
@@ -484,7 +639,10 @@ namespace mongo {
             if (!elem.ok()) {
                 return Status(ErrorCodes::InternalError, "can't wrap element being $push-ed");
             }
-            return  _preparedState->elemFound.pushBack(elem);
+            return pushFirstElement(_preparedState->elemFound,
+                                    _preparedState->arrayPreModSize,
+                                    _startPosition,
+                                    elem);
         }
 
         // 3. Sort the resulting array, if $sort was requested.
@@ -492,17 +650,31 @@ namespace mongo {
             sortChildren(_preparedState->elemFound, _sort);
         }
 
-        // 4. Trim the resulting array according to $slice, if present. We are assuming here
-        // that slices are negative. When we implement both sides slicing, this needs changing.
+        // 4. Trim the resulting array according to $slice, if present.
         if (_slicePresent) {
 
-            int64_t numChildren = mutablebson::countChildren(_preparedState->elemFound);
-            int64_t countRemoved = std::max(static_cast<int64_t>(0), numChildren + _slice);
+            // Slice 0 means to remove all
+            if (_slice == 0) {
+                while(_preparedState->elemFound.ok() &&
+                      _preparedState->elemFound.rightChild().ok()) {
+                    _preparedState->elemFound.rightChild().remove();
+                }
+            }
 
-            mutablebson::Element curr = _preparedState->elemFound.leftChild();
+            const int64_t numChildren = mutablebson::countChildren(_preparedState->elemFound);
+            int64_t countRemoved = std::max(static_cast<int64_t>(0), numChildren - abs(_slice));
+
+            // If _slice is negative, remove from the bottom, otherwise from the top
+            const bool removeFromEnd = (_slice > 0);
+
+            // Either start at right or left depending if we are taking from top or bottom
+            mutablebson::Element curr = removeFromEnd ?
+                                            _preparedState->elemFound.rightChild() :
+                                            _preparedState->elemFound.leftChild();
             while (curr.ok() && countRemoved > 0) {
                 mutablebson::Element toRemove = curr;
-                curr = curr.rightSibling();
+                // Either go right or left depending if we are taking from top or bottom
+                curr = removeFromEnd ? curr.leftSibling() : curr.rightSibling();
 
                 status = toRemove.remove();
                 if (!status.isOK()) {
@@ -515,36 +687,51 @@ namespace mongo {
         return status;
     }
 
-    Status ModifierPush::log(mutablebson::Element logRoot) const {
-        // TODO We can log just a positional set in several cases. For now, let's just log the
-        // full resulting array.
+    Status ModifierPush::log(LogBuilder* logBuilder) const {
 
-        // We'd like to create an entry such as {$set: {<fieldname>: [<resulting aray>]}} under
-        // 'logRoot'.  We start by creating the {$set: ...} Element.
-        mutablebson::Document& doc = logRoot.getDocument();
-        mutablebson::Element setElement = doc.makeElementObject("$set");
-        if (!setElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot create log entry for $push mod");
+        // The start position to use for positional (ordinal) updates to the array
+        // (We will increment as we append elements to the oplog entry so can't be const)
+        size_t position = _preparedState->arrayPreModSize;
+
+        // NOTE: Idempotence Requirement
+        // In the case that the document does't have an array or it is empty we need to make sure
+        // that the first time the field gets filled with items that it is a full set of the array.
+
+        // If we sorted, sliced, or added the first items to the array, make a full array copy.
+        const bool doFullCopy = _slicePresent || _sortPresent
+                       || (position == 0) // first element in new/empty array
+                       || (_startPosition < _preparedState->arrayPreModSize); // add in middle
+
+        if (doFullCopy) {
+            return logBuilder->addToSetsWithNewFieldName(_fieldRef.dottedField(),
+                                                         _preparedState->elemFound);
         }
+        else {
+            // Set only the positional elements appended
+            if (_eachMode || _pushMode == PUSH_ALL) {
+                // For each input element log it as a posisional $set
+                BSONObjIterator itEach(_eachElem.embeddedObject());
+                while (itEach.more()) {
+                    BSONElement eachItem = itEach.next();
+                    // value for the logElement ("field.path.name.N": <value>)
+                    const std::string positionalName =
+                        mongoutils::str::stream() << _fieldRef.dottedField() << "." << position++;
 
-        // value for the logElement ("field.path.name": <value>)
-        mutablebson::Element logElement = logRoot.getDocument().makeElementWithNewFieldName(
-                                                            _fieldRef.dottedField(),
-                                                            _preparedState->elemFound);
-        if (!logElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot create details for $push mod");
+                    Status s = logBuilder->addToSetsWithNewFieldName(positionalName, eachItem);
+                    if (!s.isOK())
+                        return s;
+                }
+
+                return Status::OK();
+            }
+            else {
+               // single value for the logElement ("field.path.name.N": <value>)
+               const std::string positionalName =
+                   mongoutils::str::stream() << _fieldRef.dottedField() << "." << position++;
+
+               return logBuilder->addToSetsWithNewFieldName(positionalName, _val);
+            }
         }
-
-        // Now, we attach the {<fieldname>: [<filled array>]} Element under the {$set: ...}
-        // one.
-        Status status = setElement.pushBack(logElement);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        // And attach the result under the 'logRoot' Element provided.
-        return logRoot.pushBack(setElement);
-
     }
 
 } // namespace mongo

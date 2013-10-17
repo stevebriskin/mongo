@@ -12,17 +12,28 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/owned_pointer_vector.h"
 #include "mongo/base/status.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/principal.h"
 #include "mongo/db/client.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/repl/bgsync.h"
@@ -102,6 +113,22 @@ namespace mongo {
         changeState(MemberState::RS_RECOVERING);
     }
 
+namespace {
+    void dropAllTempCollections() {
+        vector<string> dbNames;
+        getDatabaseNames(dbNames);
+        for (vector<string>::const_iterator it = dbNames.begin(); it != dbNames.end(); ++it) {
+            // The local db is special because it isn't replicated. It is cleared at startup even on
+            // replica set members.
+            if (*it == "local")
+                continue;
+
+            Client::Context ctx(*it);
+            cc().database()->clearTmpCollections();
+        }
+    }
+}
+
     void ReplSetImpl::assumePrimary() {
         LOG(2) << "replSet assuming primary" << endl;
         verify( iAmPotentiallyHot() );
@@ -121,6 +148,11 @@ namespace mongo {
         }
 
         changeState(MemberState::RS_PRIMARY);
+
+        // This must be done after becoming primary but before releasing the write lock. This adds
+        // the dropCollection entries for every temp collection to the opLog since we want it to be
+        // replicated to secondaries.
+        dropAllTempCollections();
     }
 
     void ReplSetImpl::changeState(MemberState s) { box.change(s, _self); }
@@ -140,11 +172,14 @@ namespace mongo {
             _maintenanceMode++;
             changeState(MemberState::RS_RECOVERING);
         }
-        else {
+        else if (_maintenanceMode > 0) {
             _maintenanceMode--;
             // no need to change state, syncTail will try to go live as a secondary soon
 
             log() << "leaving maintenance mode (" << _maintenanceMode << " other tasks)" << rsLog;
+        }
+        else {
+            return false;
         }
 
         fassert(16844, _maintenanceMode >= 0);
@@ -426,7 +461,7 @@ namespace mongo {
         }
 
         // Figure out indexPrefetch setting
-        std::string& prefetch = cmdLine.rsIndexPrefetch;
+        std::string& prefetch = replSettings.rsIndexPrefetch;
         if (!prefetch.empty()) {
             IndexPrefetchConfig prefetchConfig = PREFETCH_ALL;
             if (prefetch == "none")
@@ -477,6 +512,12 @@ namespace mongo {
 
     /* call after constructing to start - returns fairly quickly after launching its threads */
     void ReplSetImpl::_go() {
+        {
+            boost::unique_lock<boost::mutex> lk(rss.mtx);
+            while (!rss.indexRebuildDone) {
+                rss.cond.wait(lk);
+            }
+        }
         try {
             loadLastOpTimeWritten();
         }
@@ -495,6 +536,7 @@ namespace mongo {
 
     ReplSetImpl::StartupStatus ReplSetImpl::startupStatus = PRESTART;
     DiagStr ReplSetImpl::startupStatusMsg;
+    ReplicationStartSynchronizer ReplSetImpl::rss;
 
     extern BSONObj *getLastErrorDefault;
 
@@ -526,6 +568,7 @@ namespace mongo {
         // node/nodes and nothing else is changing, this is additive. If it's
         // not a reconfig, we're not adding anything
         bool additive = reconf;
+        bool updateConfigs = false;
         {
             unsigned nfound = 0;
             int me = 0;
@@ -541,8 +584,11 @@ namespace mongo {
                     if( old ) {
                         nfound++;
                         verify( (int) old->id() == m._id );
-                        if( old->config() != m ) {
+                        if (!old->config().isSameIgnoringTags(m)) {
                             additive = false;
+                        }
+                        if (!updateConfigs && old->config() != m) {
+                            updateConfigs = true;
                         }
                     }
                     else {
@@ -610,6 +656,32 @@ namespace mongo {
 
                 _members.push(mi);
                 startHealthTaskFor(mi);
+            }
+
+            if (updateConfigs) {
+                // for logging
+                string members = "";
+
+                // not setting _self to 0 as other threads use _self w/o locking
+                int me = 0;
+                for(vector<ReplSetConfig::MemberCfg>::const_iterator i = config().members.begin();
+                    i != config().members.end(); i++) {
+                    const ReplSetConfig::MemberCfg& m = *i;
+                    Member *mi;
+                    members += (members == "" ? "" : ", ") + m.h.toString();
+                    if (m.h.isSelf()) {
+                        verify(me++ == 0);
+                        mi = new Member(m.h, m._id, &m, true);
+                        if (!reconf) {
+                            log() << "replSet I am " << m.h.toString() << rsLog;
+                        }
+                        setSelfTo(mi);
+                    }
+                    else {
+                        mi = new Member(m.h, m._id, &m, false);
+                        _members.push(mi);
+                    }
+                }
             }
 
             // if we aren't creating new members, we may have to update the
@@ -822,6 +894,11 @@ namespace mongo {
         newConfig.saveConfigLocally(comment);
 
         try {
+            BSONObj oldConfForAudit = config().asBson();
+            BSONObj newConfForAudit = newConfig.asBson();
+            audit::logReplSetReconfig(ClientBasic::getCurrent(),
+                                      &oldConfForAudit,
+                                      &newConfForAudit);
             if (initFromConfig(newConfig, true)) {
                 log() << "replSet replSetReconfig new config saved locally" << rsLog;
             }
@@ -876,10 +953,7 @@ namespace mongo {
     }
 
     void replLocalAuth() {
-        if (!AuthorizationManager::isAuthEnabled())
-            return;
-        cc().getAuthorizationSession()->grantInternalAuthorization(
-                UserName("_repl", "local"));
+        cc().getAuthorizationSession()->grantInternalAuthorization();
     }
 
     const char* ReplSetImpl::_initialSyncFlagString = "doingInitialSync";
@@ -925,8 +999,11 @@ namespace mongo {
     void ReplSetImpl::registerSlave(const BSONObj& rid, const int memberId) {
         // To prevent race conditions with clearing the cache at reconfig time,
         // we lock the replset mutex here.
-        lock lk(this);
-        ghost->associateSlave(rid, memberId);
+        {
+            lock lk(this);
+            ghost->associateSlave(rid, memberId);
+        }
+        syncSourceFeedback.associateMember(rid, memberId);
     }
 
     class ReplIndexPrefetch : public ServerParameter {

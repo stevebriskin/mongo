@@ -12,9 +12,21 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include <vector>
 
@@ -31,6 +43,7 @@
 #include "mongo/db/pipeline/pipeline_d.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/ops/query.h"
+#include "mongo/db/storage_options.h"
 
 namespace mongo {
 
@@ -67,7 +80,7 @@ namespace mongo {
                                     : 101; // same as query
 
         // Using limited cursor API that ignores many edge cases. Should be sufficient for commands.
-        ClientCursor::Pin pin(id);
+        ClientCursorPin pin(id);
         ClientCursor* cursor = pin.c();
 
         massert(16958, "Cursor shouldn't have been deleted",
@@ -83,11 +96,12 @@ namespace mongo {
             // can't use result BSONObjBuilder directly since it won't handle exceptions correctly.
             BSONArrayBuilder resultsArray;
             const int byteLimit = MaxBytesToReturnToClientAtOnce;
-            for (int objs = 0;
-                    objs < batchSize && cursor->ok() && resultsArray.len() <= byteLimit;
-                    objs++) {
-                // TODO may need special logic if cursor->current() would cause results to be > 16MB
-                resultsArray.append(cursor->current());
+            for (int objCount = 0; objCount < batchSize && cursor->ok(); objCount++) {
+                BSONObj current = cursor->current();
+                if (resultsArray.len() + current.objsize() > byteLimit)
+                    break; // too big. current will be the first doc in the second batch
+
+                resultsArray.append(current);
                 cursor->advance();
             }
 
@@ -99,6 +113,12 @@ namespace mongo {
                 ClientCursor::erase(id);
                 id = 0;
                 cursor = NULL; // make it an obvious error to use cursor after this point
+            }
+
+            if (cursor) {
+                // If a time limit was set on the pipeline, remaining time is "rolled over" to the
+                // cursor (for use by future getmore ops).
+                cursor->setLeftoverMaxTimeMicros( cc().curop()->getRemainingMaxTimeMicros() );
             }
 
             BSONObjBuilder cursorObj(result.subobjStart("cursor"));
@@ -120,15 +140,31 @@ namespace mongo {
     public:
         PipelineCursor(intrusive_ptr<Pipeline> pipeline)
             : _pipeline(pipeline)
+            , _started(false)
+            , _done(false)
         {}
 
         // "core" cursor protocol
-        virtual bool ok() { return !iterator()->eof(); }
-        virtual bool advance() { return iterator()->advance(); }
+        virtual bool ok() {
+            if (!_started) {
+                _started = true;
+                getNext();
+            }
+            return !_done;
+        }
+        virtual bool advance() {
+            if (!_started) {
+                _started = true;
+                // skip first result
+                getNext();
+            }
+
+            getNext();
+            return !_done;
+        }
         virtual BSONObj current() {
-            BSONObjBuilder builder;
-            iterator()->getCurrent().toBson(&builder);
-            return builder.obj();
+            verify(ok());
+            return _currentObj;
         }
 
         virtual bool requiresLock() { return false; }
@@ -151,7 +187,19 @@ namespace mongo {
         const DocumentSource* iterator() const { return _pipeline->output(); }
         DocumentSource* iterator() { return _pipeline->output(); }
 
+        void getNext() {
+            if (boost::optional<Document> result = iterator()->getNext()) {
+                _currentObj = result->toBson();
+            }
+            else {
+                _done = true;
+            }
+        }
+
         intrusive_ptr<Pipeline> _pipeline;
+        bool _started;
+        bool _done;
+        BSONObj _currentObj;
     };
 
     class PipelineCommand :
@@ -161,7 +209,8 @@ namespace mongo {
 
         // Locks are managed manually, in particular by DocumentSourceCursor.
         virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const { return true; }
+        virtual bool slaveOk() const { return false; }
+        virtual bool slaveOverrideOk() const { return true; }
         virtual void help(stringstream &help) const {
             help << "{ pipeline : [ { <data-pipe-op>: {...}}, ... ] }";
         }
@@ -169,49 +218,46 @@ namespace mongo {
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::find);
-            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+            Pipeline::addRequiredPrivileges(this, dbname, cmdObj, out);
         }
 
         virtual bool run(const string &db, BSONObj &cmdObj, int options, string &errmsg,
                          BSONObjBuilder &result, bool fromRepl) {
 
+            string ns = parseNs(db, cmdObj);
+
             intrusive_ptr<ExpressionContext> pCtx =
-                ExpressionContext::create(&InterruptStatusMongod::status);
+                new ExpressionContext(InterruptStatusMongod::status, NamespaceString(ns));
+            pCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
 
             /* try to parse the command; if this fails, then we didn't run */
             intrusive_ptr<Pipeline> pPipeline = Pipeline::parseCommand(errmsg, cmdObj, pCtx);
             if (!pPipeline.get())
                 return false;
 
-            string ns = parseNs(db, cmdObj);
-
-            if (pPipeline->getSplitMongodPipeline()) {
-                // This is only used in testing
-                return executeSplitPipeline(result, errmsg, ns, db, pPipeline, pCtx);
-            }
-
 #if _DEBUG
             // This is outside of the if block to keep the object alive until the pipeline is finished.
             BSONObj parsed;
-            if (!pPipeline->isExplain() && !pCtx->getInShard()) {
+            if (!pPipeline->isExplain() && !pCtx->inShard) {
                 // Make sure all operations round-trip through Pipeline::toBson()
                 // correctly by reparsing every command on DEBUG builds. This is
                 // important because sharded aggregations rely on this ability.
                 // Skipping when inShard because this has already been through the
                 // transformation (and this unsets pCtx->inShard).
-                BSONObjBuilder bb;
-                pPipeline->toBson(&bb);
-                parsed = bb.obj();
+                parsed = pPipeline->serialize().toBson();
                 pPipeline = Pipeline::parseCommand(errmsg, parsed, pCtx);
                 verify(pPipeline);
             }
 #endif
 
             // This does the mongod-specific stuff like creating a cursor
-            PipelineD::prepareCursorSource(pPipeline, nsToDatabase(ns), pCtx);
+            PipelineD::prepareCursorSource(pPipeline, pCtx);
             pPipeline->stitch();
+
+            if (pPipeline->isExplain()) {
+                result << "stages" << Value(pPipeline->writeExplainOps());
+                return true; // don't do any actual execution
+            }
 
             if (isCursorCommand(cmdObj)) {
                 CursorId id;
@@ -231,95 +277,6 @@ namespace mongo {
             }
 
             return true;
-        }
-
-    private:
-        /*
-          Execute the pipeline for the explain.  This is common to both the
-          locked and unlocked code path.  However, the results are different.
-          For an explain, with no lock, it really outputs the pipeline
-          chain rather than fetching the data.
-         */
-        bool executeSplitPipeline(BSONObjBuilder& result, string& errmsg,
-                                  const string& ns, const string& db,
-                                  intrusive_ptr<Pipeline>& pPipeline,
-                                  intrusive_ptr<ExpressionContext>& pCtx) {
-            /* setup as if we're in the router */
-            pCtx->setInRouter(true);
-
-            /*
-            Here, we'll split the pipeline in the same way we would for sharding,
-            for testing purposes.
-
-            Run the shard pipeline first, then feed the results into the remains
-            of the existing pipeline.
-
-            Start by splitting the pipeline.
-            */
-            intrusive_ptr<Pipeline> pShardSplit = pPipeline->splitForSharded();
-
-            /*
-            Write the split pipeline as we would in order to transmit it to
-            the shard servers.
-            */
-            BSONObjBuilder shardBuilder;
-            pShardSplit->toBson(&shardBuilder);
-            BSONObj shardBson(shardBuilder.done());
-
-            DEV (log() << "\n---- shardBson\n" <<
-                 shardBson.jsonString(Strict, 1) << "\n----\n");
-
-            /* for debugging purposes, show what the pipeline now looks like */
-            DEV {
-                BSONObjBuilder pipelineBuilder;
-                pPipeline->toBson(&pipelineBuilder);
-                BSONObj pipelineBson(pipelineBuilder.done());
-                (log() << "\n---- pipelineBson\n" <<
-                 pipelineBson.jsonString(Strict, 1) << "\n----\n");
-            }
-
-            /* on the shard servers, create the local pipeline */
-            intrusive_ptr<ExpressionContext> pShardCtx(
-                ExpressionContext::create(&InterruptStatusMongod::status));
-            intrusive_ptr<Pipeline> pShardPipeline(
-                Pipeline::parseCommand(errmsg, shardBson, pShardCtx));
-            if (!pShardPipeline.get()) {
-                return false;
-            }
-
-            PipelineD::prepareCursorSource(pShardPipeline, nsToDatabase(ns), pCtx);
-
-            /* run the shard pipeline */
-            BSONObjBuilder shardResultBuilder;
-            string shardErrmsg;
-            pShardPipeline->stitch();
-            pShardPipeline->run(shardResultBuilder);
-            BSONObj shardResult(shardResultBuilder.done());
-
-            /* pick out the shard result, and prepare to read it */
-            intrusive_ptr<DocumentSourceBsonArray> pShardSource;
-            BSONObjIterator shardIter(shardResult);
-            while(shardIter.more()) {
-                BSONElement shardElement(shardIter.next());
-                const char *pFieldName = shardElement.fieldName();
-
-                if ((strcmp(pFieldName, "result") == 0) ||
-                    (strcmp(pFieldName, "serverPipeline") == 0)) {
-                    pPipeline->addInitialSource(DocumentSourceBsonArray::create(&shardElement, pCtx));
-                    pPipeline->stitch();
-
-                    /*
-                    Connect the output of the shard pipeline with the mongos
-                    pipeline that will merge the results.
-                    */
-                    pPipeline->run(result);
-                    return true;
-                }
-            }
-
-            /* NOTREACHED */
-            verify(false);
-            return false;
         }
     } cmdPipeline;
 

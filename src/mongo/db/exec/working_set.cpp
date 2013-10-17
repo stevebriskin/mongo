@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/exec/working_set.h"
@@ -62,8 +74,7 @@ namespace mongo {
     WorkingSetMember::WorkingSetMember() : state(WorkingSetMember::INVALID) { }
 
     bool WorkingSetMember::hasLoc() const {
-        return state == LOC_AND_IDX || state == LOC_AND_UNOWNED_OBJ
-               || state == LOC_AND_OWNED_OBJ;
+        return state == LOC_AND_IDX || state == LOC_AND_UNOWNED_OBJ;
     }
 
     bool WorkingSetMember::hasObj() const {
@@ -71,14 +82,14 @@ namespace mongo {
     }
 
     bool WorkingSetMember::hasOwnedObj() const {
-        return state == OWNED_OBJ || state == LOC_AND_OWNED_OBJ;
+        return state == OWNED_OBJ;
     }
 
     bool WorkingSetMember::hasUnownedObj() const {
         return state == LOC_AND_UNOWNED_OBJ;
     }
 
-    bool WorkingSetMember::getFieldDotted(const string& field, BSONElement* out) {
+    bool WorkingSetMember::getFieldDotted(const string& field, BSONElement* out) const {
         // If our state is such that we have an object, use it.
         if (hasObj()) {
             *out = obj.getFieldDotted(field);

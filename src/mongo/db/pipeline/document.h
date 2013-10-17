@@ -12,6 +12,18 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
 #pragma once
@@ -123,6 +135,7 @@ namespace mongo {
 
         /// Add this document to the BSONObj under construction with the given BSONObjBuilder.
         void toBson(BSONObjBuilder *pBsonObjBuilder) const;
+        BSONObj toBson() const;
 
         // Support BSONObjBuilder and BSONArrayBuilder "stream" API
         friend BSONObjBuilder& operator << (BSONObjBuilderValueStream& builder, const Document& d);
@@ -149,32 +162,42 @@ namespace mongo {
         int memUsageForSorter() const { return getApproximateSize(); }
         Document getOwned() const { return *this; }
 
-        // TEMP for compatibility with legacy intrusive_ptr<Document>
-              Document& operator*()       { return *this; }
-        const Document& operator*() const { return *this; }
-              Document* operator->()       { return this; }
-        const Document* operator->() const { return this; }
+        /// only for testing
         const void* getPtr() const { return _storage.get(); }
-        void reset() { return _storage.reset(); }
-        static Document createFromBsonObj(BSONObj* pBsonObj) { return Document(*pBsonObj); }
-        size_t getFieldCount() const { return size(); }
-        Value getValue(StringData fieldName) const { return getField(fieldName); }
-
-        // TODO: replace with logical equality once all current usages are fixed
-        bool operator== (const Document& lhs) const { return _storage == lhs._storage; }
-
-        explicit Document(const DocumentStorage* ptr) : _storage(ptr) {};
 
     private:
         friend class FieldIterator;
         friend class ValueStorage;
         friend class MutableDocument;
+        friend class MutableValue;
+
+        explicit Document(const DocumentStorage* ptr) : _storage(ptr) {};
 
         const DocumentStorage& storage() const {
             return (_storage ? *_storage : DocumentStorage::emptyDoc());
         }
         intrusive_ptr<const DocumentStorage> _storage;
     };
+
+    inline bool operator== (const Document& l, const Document& r) {
+        return Document::compare(l, r) == 0;
+    }
+    inline bool operator!= (const Document& l, const Document& r) {
+        return Document::compare(l, r) != 0;
+    }
+    inline bool operator<  (const Document& l, const Document& r) {
+        return Document::compare(l, r) <  0;
+    }
+    inline bool operator<= (const Document& l, const Document& r) {
+        return Document::compare(l, r) <= 0;
+    }
+    inline bool operator>  (const Document& l, const Document& r) {
+        return Document::compare(l, r) >  0;
+    }
+    inline bool operator>= (const Document& l, const Document& r) {
+        return Document::compare(l, r) >= 0;
+    }
+
 
     /** This class is returned by MutableDocument to allow you to modify its values.
      *  You are not allowed to hold variables of this type (enforced by the type system).
@@ -201,8 +224,17 @@ namespace mongo {
 
         /// Used by MutableDocument(MutableValue)
         const RefCountable*& getDocPtr() {
-            if (_val.getType() != Object)
-                *this = Value(Document());
+            if (_val.getType() != Object || _val._storage.genericRCPtr == NULL) {
+                // If the current value isn't an object we replace it with a Object-typed Value.
+                // Note that we can't just use Document() here because that is a NULL pointer and
+                // Value doesn't refcount NULL pointers. This led to a memory leak (SERVER-10554)
+                // because MutableDocument::newStorage() would set a non-NULL pointer into the Value
+                // without setting the refCounter bit. While allocating a DocumentStorage here could
+                // result in an allocation where none is needed, in practice this is only called
+                // when we are about to add a field to the sub-document so this just changes where
+                // the allocation is done.
+                _val = Value(Document(new DocumentStorage()));
+            }
 
             return _val._storage.genericRCPtr;
         }

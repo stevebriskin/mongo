@@ -17,11 +17,11 @@
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/simple_plan_runner.h"
 #include "mongo/db/index/catalog_hack.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
-#include "mongo/db/matcher.h"
+#include "mongo/db/matcher/expression_parser.h"
+#include "mongo/db/query/plan_executor.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -57,14 +57,18 @@ namespace QueryStageTests {
             _client.ensureIndex(ns(), obj);
         }
 
-        int countResults(const IndexScanParams& params, Matcher* matcher = NULL) {
+        int countResults(const IndexScanParams& params, BSONObj filterObj = BSONObj()) {
             Client::ReadContext ctx(ns());
-            SimplePlanRunner runner;
 
-            runner.setRoot(new IndexScan(params, runner.getWorkingSet(), matcher));
+            StatusWithMatchExpression swme = MatchExpressionParser::parse(filterObj);
+            verify(swme.isOK());
+            auto_ptr<MatchExpression> filterExpr(swme.getValue());
+
+            WorkingSet* ws = new WorkingSet();
+            PlanExecutor runner(ws, new IndexScan(params, ws, filterExpr.get()));
 
             int count = 0;
-            for (BSONObj obj; runner.getNext(&obj); ) {
+            for (DiskLoc dl; Runner::RUNNER_ADVANCED == runner.getNext(NULL, &dl); ) {
                 ++count;
             }
 
@@ -97,17 +101,18 @@ namespace QueryStageTests {
 
     DBDirectClient IndexScanBase::_client;
 
-    class QueryStageBasicIXScan : public IndexScanBase {
+    class QueryStageIXScanBasic : public IndexScanBase {
     public:
-        virtual ~QueryStageBasicIXScan() { }
+        virtual ~QueryStageIXScanBasic() { }
 
         void run() {
             // foo <= 20
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = -1;
 
             ASSERT_EQUALS(countResults(params), 21);
@@ -122,9 +127,10 @@ namespace QueryStageTests {
             // 20 <= foo < 30
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSON("" << 30);
-            params.endKeyInclusive = false;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSON("" << 30);
+            params.bounds.endKeyInclusive = false;
             params.direction = 1;
 
             ASSERT_EQUALS(countResults(params), 10);
@@ -139,9 +145,10 @@ namespace QueryStageTests {
             // 20 <= foo <= 30
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSON("" << 30);
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSON("" << 30);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
 
             ASSERT_EQUALS(countResults(params), 11);
@@ -157,13 +164,13 @@ namespace QueryStageTests {
             // foo == 25
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSON("" << 30);
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSON("" << 30);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
 
-            ASSERT_EQUALS(countResults(params, new Matcher(BSON("foo" << 25))),
-                          1);
+            ASSERT_EQUALS(countResults(params, BSON("foo" << 25)), 1);
         }
     };
 
@@ -176,13 +183,13 @@ namespace QueryStageTests {
             // bar == 25 (not covered, should error.)
             IndexScanParams params;
             params.descriptor = getIndex(BSON("foo" << 1));
-            params.startKey = BSON("" << 20);
-            params.endKey = BSON("" << 30);
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("" << 20);
+            params.bounds.endKey = BSON("" << 30);
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
 
-            ASSERT_THROWS(countResults(params, new Matcher(BSON("baz" << 25))),
-                          MsgAssertionException);
+            ASSERT_THROWS(countResults(params, BSON("baz" << 25)), MsgAssertionException);
         }
     };
 
@@ -197,11 +204,12 @@ namespace QueryStageTests {
 
             IndexScanParams params;
             params.descriptor = getIndex(BSON("geo" << "2dsphere"));
-            params.startKey = BSON("geo" << BSON("$geoNear" << BSON("$geometry"
-                                   << BSON("type" << "Point"
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("geo" << BSON("$geoNear" << BSON("$geometry"
+                                  << BSON("type" << "Point"
                                         << "coordinates" << BSON_ARRAY(0 << 0)))));
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
 
             ASSERT_EQUALS(countResults(params), numObj());
@@ -219,9 +227,10 @@ namespace QueryStageTests {
             // 2d should also work.
             IndexScanParams params;
             params.descriptor = getIndex(BSON("geo" << "2d"));
-            params.startKey = BSON("geo" << BSON("$near" << BSON_ARRAY(0 << 0)));
-            params.endKey = BSONObj();
-            params.endKeyInclusive = true;
+            params.bounds.isSimpleRange = true;
+            params.bounds.startKey = BSON("geo" << BSON("$near" << BSON_ARRAY(0 << 0)));
+            params.bounds.endKey = BSONObj();
+            params.bounds.endKeyInclusive = true;
             params.direction = 1;
 
             ASSERT_EQUALS(countResults(params), numObj());
@@ -233,7 +242,7 @@ namespace QueryStageTests {
         All() : Suite( "query_stage_tests" ) { }
 
         void setupTests() {
-            add<QueryStageBasicIXScan>();
+            add<QueryStageIXScanBasic>();
             add<QueryStageIXScanLowerUpper>();
             add<QueryStageIXScanLowerUpperIncl>();
             add<QueryStageIXScanLowerUpperInclFilter>();

@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include <vector>
@@ -23,6 +35,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/geo/geoconstants.h"
 #include "mongo/db/geo/s2common.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/index/2d_index_cursor.h"
@@ -38,9 +51,13 @@
 namespace mongo {
 
     GeoNearArguments::GeoNearArguments(const BSONObj &cmdObj) {
-        const char* limitName = cmdObj["num"].isNumber() ? "num" : "limit";
-        if (cmdObj[limitName].isNumber()) {
-            numWanted = cmdObj[limitName].numberInt();
+        // If 'num' is passed, use it and ignore 'limit'. Otherwise use 'limit'.
+        const char* limitName = !cmdObj["num"].eoo() ? "num" : "limit";
+        BSONElement eNumWanted = cmdObj[limitName];
+        if (!eNumWanted.eoo()) {
+            uassert(17032, str::stream() << limitName << " must be a number",
+                    eNumWanted.isNumber());
+            numWanted = eNumWanted.numberInt();
         } else {
             numWanted = 100;
         }
@@ -61,8 +78,11 @@ namespace mongo {
             query = cmdObj["query"].embeddedObject();
         }
 
-        if (cmdObj["distanceMultiplier"].isNumber()) {
-            distanceMultiplier = cmdObj["distanceMultiplier"].number();
+        BSONElement eDistanceMultiplier = cmdObj["distanceMultiplier"];
+        if (!eDistanceMultiplier.eoo()) {
+            uassert(17033, "distanceMultiplier must be a number", eDistanceMultiplier.isNumber());
+            distanceMultiplier = eDistanceMultiplier.number();
+            uassert(17034, "distanceMultiplier must be non-negative", distanceMultiplier >= 0);
         } else {
             distanceMultiplier = 1.0;
         }
@@ -87,7 +107,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::find);
-            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
 
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
@@ -178,6 +198,11 @@ namespace mongo {
             // we've geo-indexed any of the fields in it.
             vector<GeoQuery> regions;
 
+            if (FLAT == nearQuery.centroid.crs) {
+                nearQuery.maxDistance *= kRadiusOfEarthInMeters;
+                nearQuery.minDistance *= kRadiusOfEarthInMeters;
+            }
+
             nic->seek(parsedArgs.query, nearQuery, regions);
 
             // We do pass in the query above, but it's just so we can possibly use it in our index
@@ -199,7 +224,7 @@ namespace mongo {
 
                 double dist = nic->currentDistance();
                 // If we got the distance in radians, output it in radians too.
-                if (nearQuery.fromRadians) { dist /= params.radius; }
+                if (FLAT == nearQuery.centroid.crs) { dist /= params.radius; }
                 dist *= parsedArgs.distanceMultiplier;
                 totalDistance += dist;
                 if (dist > farthestDist) { farthestDist = dist; }

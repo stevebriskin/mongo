@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -31,6 +43,7 @@
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/rs_sync.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/stats/timer_stats.h"
@@ -104,7 +117,7 @@ namespace replset {
             lk.reset(new Lock::DBWrite(ns)); 
         }
 
-        Client::Context ctx(ns, dbpath);
+        Client::Context ctx(ns, storageGlobalParams.dbpath);
         ctx.getClient()->curop()->reset();
         // For non-initial-sync, we convert updates to upserts
         // to suppress errors when replaying oplog entries.
@@ -842,21 +855,22 @@ namespace replset {
         rwlock lk( _lock , false );
         MAP::iterator i = _ghostCache.find( rid );
         if ( i == _ghostCache.end() ) {
-            OCCASIONALLY warning() << "couldn't update slave " << rid << " no entry" << rsLog;
+            OCCASIONALLY warning() << "couldn't update position of the secondary with replSet _id '"
+                                   << rid << "' because we have no entry for it" << rsLog;
             return;
         }
 
         GhostSlave& slave = *(i->second);
         if (!slave.init) {
-            OCCASIONALLY log() << "couldn't update slave " << rid << " not init" << rsLog;
+            OCCASIONALLY log() << "couldn't update position of the secondary with replSet _id '"
+                               << rid << "' because it has not been initialized" << rsLog;
             return;
         }
 
         ((ReplSetConfig::MemberCfg)slave.slave->config()).updateGroups(last);
     }
 
-    void GhostSync::percolate(const BSONObj& id, const OpTime& last) {
-        const OID rid = id["_id"].OID();
+    void GhostSync::percolate(const mongo::OID& rid, const OpTime& last) {
         shared_ptr<GhostSlave> slave;
         {
             rwlock lk( _lock , false );
@@ -899,7 +913,7 @@ namespace replset {
                 // so we check tailCheck() as well; see SERVER-8420
                 slave->reader.tailCheck();
                 if (!slave->reader.haveCursor()) {
-                    if (!slave->reader.connect(id, slave->slave->id(), target->fullName())) {
+                    if (!slave->reader.connect(rid, slave->slave->id(), target->fullName())) {
                         // error message logged in OplogReader::connect
                         sleepsecs(1);
                         continue;

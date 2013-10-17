@@ -16,14 +16,13 @@
 
 #include "mongo/pch.h"
 
-#include "mongo/db/query_optimizer_internal.h"
-
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/query.h"
 #include "mongo/db/parsed_query.h"
+#include "mongo/db/query_optimizer_internal.h"
 #include "mongo/db/queryutil.h"
 #include "mongo/dbtests/dbtests.h"
 
@@ -45,13 +44,7 @@ namespace mongo {
 namespace {
 
     using boost::shared_ptr;
-    
-    void dropCollection( const char *ns ) {
-     	string errmsg;
-        BSONObjBuilder result;
-        dropCollection( ns, errmsg, result );
-    }
-    
+
     namespace QueryPlanTests {
 
         class ToString {
@@ -75,7 +68,7 @@ namespace {
             ~Base() {
                 if ( !nsd() )
                     return;
-                dropCollection( ns() );
+                cc().database()->dropCollection( ns() );
             }
         protected:
             static const char *ns() { return "unittests.QueryPlanTests"; }

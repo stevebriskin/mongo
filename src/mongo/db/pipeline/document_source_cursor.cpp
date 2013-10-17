@@ -12,6 +12,18 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
 #include "mongo/pch.h"
@@ -20,7 +32,9 @@
 
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/instance.h"
+#include "mongo/db/ops/query.h"
 #include "mongo/db/pipeline/document.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h" // for SendStaleConfigException
 
@@ -30,28 +44,23 @@ namespace mongo {
         dispose();
     }
 
-    bool DocumentSourceCursor::eof() {
-        /* if we haven't gotten the first one yet, do so now */
-        if (unstarted)
-            findNext();
-
-        return !hasCurrent;
+    const char *DocumentSourceCursor::getSourceName() const {
+        return "$cursor";
     }
 
-    bool DocumentSourceCursor::advance() {
-        DocumentSource::advance(); // check for interrupts
+    boost::optional<Document> DocumentSourceCursor::getNext() {
+        pExpCtx->checkForInterrupt();
 
-        /* if we haven't gotten the first one yet, do so now */
-        if (unstarted)
-            findNext();
+        if (_currentBatch.empty()) {
+            loadBatch();
 
-        findNext();
-        return hasCurrent;
-    }
+            if (_currentBatch.empty()) // exhausted the cursor
+                return boost::none;
+        }
 
-    Document DocumentSourceCursor::getCurrent() {
-        verify(hasCurrent);
-        return pCurrent;
+        Document out = _currentBatch.front();
+        _currentBatch.pop_front();
+        return out;
     }
 
     void DocumentSourceCursor::dispose() {
@@ -61,11 +70,10 @@ namespace mongo {
         }
 
         _collMetadata.reset();
-        hasCurrent = false;
-        pCurrent = Document();
+        _currentBatch.clear();
     }
 
-    bool DocumentSourceCursor::canUseCoveredIndex(ClientCursor* cursor) {
+    bool DocumentSourceCursor::canUseCoveredIndex(ClientCursor* cursor) const {
         // We can't use a covered index when we have collection metadata because we
         // need to examine the object to see if it belongs on this shard
         return (!_collMetadata &&
@@ -90,9 +98,7 @@ namespace mongo {
         }
     }
 
-    void DocumentSourceCursor::findNext() {
-        unstarted = false;
-
+    void DocumentSourceCursor::loadBatch() {
         if (!_cursorId) {
             dispose();
             return;
@@ -101,9 +107,9 @@ namespace mongo {
         // We have already validated the sharding version when we constructed the cursor
         // so we shouldn't check it again.
         Lock::DBRead lk(ns);
-        Client::Context ctx(ns, dbpath, /*doVersion=*/false);
+        Client::Context ctx(ns, storageGlobalParams.dbpath, /*doVersion=*/false);
 
-        ClientCursor::Pin pin(_cursorId);
+        ClientCursorPin pin(_cursorId);
         ClientCursor* cursor = pin.c();
 
         uassert(16950, "Cursor deleted. Was the collection or database dropped?",
@@ -111,6 +117,7 @@ namespace mongo {
 
         cursor->c()->recoverFromYield();
 
+        int memUsageBytes = 0;
         for( ; cursor->ok(); cursor->advance() ) {
 
             yieldSometimes(cursor);
@@ -126,7 +133,7 @@ namespace mongo {
             if (canUseCoveredIndex(cursor)) {
                 // Can't have collection metadata if we are here
                 BSONObj indexKey = cursor->currKey();
-                pCurrent = Document(cursor->c()->keyFieldsOnly()->hydrate(indexKey));
+                _currentBatch.push_back(Document(cursor->c()->keyFieldsOnly()->hydrate(indexKey)));
             }
             else {
                 BSONObj next = cursor->current();
@@ -138,56 +145,41 @@ namespace mongo {
                     if ( !_collMetadata->keyBelongsToMe( kp.extractSingleKey( next ) ) ) continue;
                 }
 
-                if (!_projection) {
-                    pCurrent = Document(next);
-                }
-                else {
-                    pCurrent = documentFromBsonWithDeps(next, _dependencies);
-
-                    if (debug && !_dependencies.empty()) {
-                        // Make sure we behave the same as Projection.  Projection doesn't have a
-                        // way to specify "no fields needed" so we skip the test in that case.
-
-                        MutableDocument byAggo(pCurrent);
-                        MutableDocument byProj(Document(_projection->transform(next)));
-
-                        if (_dependencies["_id"].getType() == Object) {
-                            // We handle subfields of _id identically to other fields.
-                            // Projection doesn't handle them correctly.
-
-                            byAggo.remove("_id");
-                            byProj.remove("_id");
-                        }
-
-                        if (Document::compare(byAggo.peek(), byProj.peek()) != 0) {
-                            PRINT(next);
-                            PRINT(_dependencies);
-                            PRINT(_projection->getSpec());
-                            PRINT(byAggo.peek());
-                            PRINT(byProj.peek());
-                            verify(false);
-                        }
-                    }
-                }
+                _currentBatch.push_back(_projection
+                                            ? documentFromBsonWithDeps(next, _dependencies)
+                                            : Document(next));
             }
 
-            hasCurrent = true;
-            cursor->advance();
-
-            if (cursor->c()->supportYields()) {
-                ClientCursor::YieldData data;
-                cursor->prepareToYield(data);
-            } else {
-                cursor->c()->noteLocation();
+            if (_limit) {
+                if (++_docsAddedToBatches == _limit->getLimit()) {
+                    break;
+                }
+                verify(_docsAddedToBatches < _limit->getLimit());
             }
 
-            return;
+            memUsageBytes += _currentBatch.back().getApproximateSize();
+
+            if (memUsageBytes > MaxBytesToReturnToClientAtOnce) {
+                // End this batch and prepare cursor for yielding.
+                cursor->advance();
+
+                if (cursor->c()->supportYields()) {
+                    ClientCursor::YieldData data;
+                    cursor->prepareToYield(data);
+                } else {
+                    cursor->c()->noteLocation();
+                }
+
+                return;
+            }
         }
 
         // If we got here, there aren't any more documents.
         // The Cursor must be released, see SERVER-6123.
         pin.release();
-        dispose(); // sets into eof state
+        ClientCursor::erase(_cursorId);
+        _cursorId = 0;
+        _collMetadata.reset();
     }
 
     void DocumentSourceCursor::setSource(DocumentSource *pSource) {
@@ -195,49 +187,57 @@ namespace mongo {
         verify(false);
     }
 
-    void DocumentSourceCursor::sourceToBson(
-        BSONObjBuilder *pBuilder, bool explain) const {
+    long long DocumentSourceCursor::getLimit() const {
+        return _limit ? _limit->getLimit() : -1;
+    }
 
-        /* this has no analog in the BSON world, so only allow it for explain */
-        if (explain)
-        {
-            BSONObj bsonObj;
-            
-            pBuilder->append("query", _query);
+    bool DocumentSourceCursor::coalesce(const intrusive_ptr<DocumentSource>& nextSource) {
+        // Note: Currently we assume the $limit is logically after any $sort or
+        // $match. If we ever pull in $match or $sort using this method, we
+        // will need to keep track of the order of the sub-stages.
 
-            if (!_sort.isEmpty()) {
-                pBuilder->append("sort", _sort);
-            }
-
-            BSONObj projectionSpec;
-            if (_projection) {
-                projectionSpec = _projection->getSpec();
-                pBuilder->append("projection", projectionSpec);
-            }
-
-            // construct query for explain
-            BSONObjBuilder queryBuilder;
-            queryBuilder.append("$query", _query);
-            if (!_sort.isEmpty())
-                queryBuilder.append("$orderby", _sort);
-            queryBuilder.append("$explain", 1);
-            Query query(queryBuilder.obj());
-
-            DBDirectClient directClient;
-            BSONObj explainResult(directClient.findOne(ns, query, _projection
-                                                                  ? &projectionSpec
-                                                                  : NULL));
-
-            pBuilder->append("cursor", explainResult);
+        if (!_limit) {
+            _limit = dynamic_cast<DocumentSourceLimit*>(nextSource.get());
+            return _limit; // false if next is not a $limit
         }
+        else {
+            return _limit->coalesce(nextSource);
+        }
+
+        return false;
+    }
+
+    Value DocumentSourceCursor::serialize(bool explain) const {
+        // we never parse a documentSourceCursor, so we only serialize for explain
+        if (!explain)
+            return Value();
+
+        Lock::DBRead lk(ns);
+        Client::Context ctx(ns, storageGlobalParams.dbpath, /*doVersion=*/false);
+
+        ClientCursorPin pin(_cursorId);
+        ClientCursor* cursor = pin.c();
+
+        uassert(17135, "Cursor deleted. Was the collection or database dropped?",
+                cursor);
+
+        cursor->c()->recoverFromYield();
+
+        return Value(DOC(getSourceName() <<
+            DOC("query" << Value(_query)
+             << "sort" << (!_sort.isEmpty() ? Value(_sort) : Value())
+             << "limit" << (_limit ? Value(_limit->getLimit()) : Value())
+             << "fields" << (_projection ? Value(_projection->getSpec()) : Value())
+             << "indexOnly" << canUseCoveredIndex(cursor)
+             << "cursorType" << cursor->c()->toString()
+        ))); // TODO get more plan information
     }
 
     DocumentSourceCursor::DocumentSourceCursor(const string& ns,
                                                CursorId cursorId,
                                                const intrusive_ptr<ExpressionContext> &pCtx)
         : DocumentSource(pCtx)
-        , unstarted(true)
-        , hasCurrent(false)
+        , _docsAddedToBatches(0)
         , ns(ns)
         , _cursorId(cursorId)
         , _collMetadata(shardingState.needCollectionMetadata( ns )
@@ -257,7 +257,7 @@ namespace mongo {
         _projection.reset(new Projection);
         _projection->init(projection);
 
-        ClientCursor::Pin pin (_cursorId);
+        ClientCursorPin pin (_cursorId);
         verify(pin.c());
         pin.c()->fields = _projection;
 

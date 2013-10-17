@@ -12,12 +12,28 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/index_rebuilder.h"
 
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/client.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/repl/rs.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -33,53 +49,67 @@ namespace mongo {
     void IndexRebuilder::run() {
         Client::initThread(name().c_str()); 
         ON_BLOCK_EXIT_OBJ(cc(), &Client::shutdown);
-        Client::GodScope gs;
+        cc().getAuthorizationSession()->grantInternalAuthorization();
 
-        bool firstTime = true;
         std::vector<std::string> dbNames;
         getDatabaseNames(dbNames);
 
+        std::vector<std::string> nsToCheck;
         try {
             for (std::vector<std::string>::const_iterator it = dbNames.begin();
                  it < dbNames.end();
                  it++) {
-                checkDB(*it, &firstTime);
+                const std::string systemNS = *it + ".system.namespaces";
+                DBDirectClient cli;
+                scoped_ptr<DBClientCursor> cursor(cli.query(systemNS, Query()));
+
+                // This depends on system.namespaces not changing while we iterate
+                while (cursor->more()) {
+                    BSONObj nsDoc = cursor->nextSafe();
+                    nsToCheck.push_back(nsDoc["name"].valuestrsafe());
+                }
             }
+            {
+                boost::unique_lock<boost::mutex> lk(ReplSet::rss.mtx);
+                ReplSet::rss.indexRebuildDone = true;
+                ReplSet::rss.cond.notify_all();
+            }
+            checkNS(nsToCheck);
         }
         catch (const DBException&) {
             warning() << "index rebuilding did not complete" << endl;
+            {
+                boost::unique_lock<boost::mutex> lk(ReplSet::rss.mtx);
+                ReplSet::rss.indexRebuildDone = true;
+                ReplSet::rss.cond.notify_all();
+            }
         }
         LOG(1) << "checking complete" << endl;
     }
 
-    void IndexRebuilder::checkDB(const std::string& dbName, bool* firstTime) {
-        const std::string systemNS = dbName + ".system.namespaces";
-        DBDirectClient cli;
-        scoped_ptr<DBClientCursor> cursor(cli.query(systemNS, Query()));
-
-        // This depends on system.namespaces not changing while we iterate
-        while (cursor->more()) {
-            BSONObj nsDoc = cursor->nextSafe();
-            const char* ns = nsDoc["name"].valuestrsafe();
-            LOG(1) << "checking ns " << ns << " for interrupted index builds" << endl;
+    void IndexRebuilder::checkNS(const std::vector<std::string>& nsToCheck) {
+        bool firstTime = true;
+        for (std::vector<std::string>::const_iterator it = nsToCheck.begin();
+                it != nsToCheck.end();
+                ++it) {
             // This write lock is held throughout the index building process
             // for this namespace.
-            Client::WriteContext ctx(ns);
-            NamespaceDetails* nsd = nsdetails(ns);
+            Client::WriteContext ctx(*it);
+            NamespaceDetails* nsd = nsdetails(*it);
 
             if ( nsd == NULL || nsd->getIndexBuildsInProgress() == 0 ) {
                 continue;
             }
 
-            log() << "found interrupted index build(s) on " << ns << endl;
-            if (*firstTime) {
+            log() << "found interrupted index build(s) on " << *it << endl;
+            if (firstTime) {
                 log() << "note: restart the server with --noIndexBuildRetry to skip index rebuilds"
                       << endl;
-                *firstTime = false;
+                firstTime = false;
             }
 
             // If the indexBuildRetry flag isn't set, just clear the inProg flag
-            if (!cmdLine.indexBuildRetry) {
+            if (!serverGlobalParams.indexBuildRetry) {
                 // If we crash between unsetting the inProg flag and cleaning up the index, the
                 // index space will be lost.
                 nsd->blowAwayInProgressIndexEntries();
@@ -88,6 +118,7 @@ namespace mongo {
 
             // We go from right to left building these indexes, so that indexBuildInProgress-- has
             // the correct effect of "popping" an index off the list.
+            std::string dbName = it->substr(0, it->find('.'));
             while ( nsd->getTotalIndexCount() > nsd->getCompletedIndexCount() ) {
                 retryIndexBuild(dbName, nsd);
             }

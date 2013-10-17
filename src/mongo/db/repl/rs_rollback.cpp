@@ -13,6 +13,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -20,6 +32,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/cloner.h"
 #include "mongo/db/ops/update.h"
+#include "mongo/db/ops/update_request.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/rs.h"
@@ -377,10 +390,9 @@ namespace mongo {
 
                 Client::Context c(ns);
                 {
-                    bob res;
-                    string errmsg;
-                    dropCollection(ns, errmsg, res);
+                    c.db()->dropCollection(ns);
                     {
+                        string errmsg;
                         dbtemprelease r;
                         bool ok = Cloner::copyCollectionFromRemote(them->getServerAddress(), ns, errmsg);
                         uassert(15909, str::stream() << "replSet rollback error resyncing collection " << ns << ' ' << errmsg, ok);
@@ -428,10 +440,8 @@ namespace mongo {
         for( set<string>::iterator i = h.toDrop.begin(); i != h.toDrop.end(); i++ ) {
             Client::Context c(*i);
             try {
-                bob res;
-                string errmsg;
                 log() << "replSet rollback drop: " << *i << rsLog;
-                dropCollection(*i, errmsg, res);
+                c.db()->dropCollection(*i);
             }
             catch(...) {
                 log() << "replset rollback error dropping collection " << *i << rsLog;
@@ -443,7 +453,7 @@ namespace mongo {
         NamespaceDetails *oplogDetails = nsdetails(rsoplog);
         uassert(13423, str::stream() << "replSet error in rollback can't find " << rsoplog, oplogDetails);
 
-        map<string,shared_ptr<RemoveSaver> > removeSavers;
+        map<string,shared_ptr<Helpers::RemoveSaver> > removeSavers;
 
         unsigned deletes = 0, updates = 0;
         for( list<pair<DocID,bo> >::iterator i = goodVersions.begin(); i != goodVersions.end(); i++ ) {
@@ -459,9 +469,9 @@ namespace mongo {
                 getDur().commitIfNeeded();
 
                 /* keep an archive of items rolled back */
-                shared_ptr<RemoveSaver>& rs = removeSavers[d.ns];
+                shared_ptr<Helpers::RemoveSaver>& rs = removeSavers[d.ns];
                 if ( ! rs )
-                    rs.reset( new RemoveSaver( "rollback" , "" , d.ns ) );
+                    rs.reset( new Helpers::RemoveSaver( "rollback" , "" , d.ns ) );
 
                 // todo: lots of overhead in context, this can be faster
                 Client::Context c(d.ns);
@@ -515,7 +525,7 @@ namespace mongo {
                         else {
                             try {
                                 deletes++;
-                                deleteObjects(d.ns, pattern, /*justone*/true, /*logop*/false, /*god*/true, rs.get() );
+                                deleteObjects(d.ns, pattern, /*justone*/true, /*logop*/false, /*god*/true);
                             }
                             catch(...) {
                                 log() << "replSet error rollback delete failed ns:" << d.ns << rsLog;
@@ -529,9 +539,7 @@ namespace mongo {
                                 if( o.isEmpty() ) {
                                     // we should drop
                                     try {
-                                        bob res;
-                                        string errmsg;
-                                        dropCollection(d.ns, errmsg, res);
+                                        cc().database()->dropCollection(d.ns);
                                     }
                                     catch(...) {
                                         log() << "replset error rolling back collection " << d.ns << rsLog;
@@ -549,32 +557,17 @@ namespace mongo {
                     // todo faster...
                     OpDebug debug;
                     updates++;
-                    if (isNewUpdateFrameworkEnabled()) {
 
-                        _updateObjectsNEW(/*god*/true,
-                                          d.ns,
-                                          i->second,
-                                          pattern,
-                                          /*upsert=*/true,
-                                          /*multi=*/false,
-                                          /*logtheop=*/false,
-                                          debug,
-                                          rs.get());
+                    const NamespaceString requestNs(d.ns);
+                    UpdateRequest request(requestNs);
 
-                    }
-                    else {
+                    request.setQuery(pattern);
+                    request.setUpdates(i->second);
+                    request.setGod();
+                    request.setUpsert();
 
-                        _updateObjects(/*god*/true,
-                                       d.ns,
-                                       i->second,
-                                       pattern,
-                                       /*upsert=*/true,
-                                       /*multi=*/false,
-                                       /*logtheop=*/false,
-                                       debug,
-                                       rs.get());
+                    update(request, &debug);
 
-                    }
                 }
             }
             catch(DBException& e) {

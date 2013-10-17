@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -35,7 +47,6 @@
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop-inl.h"
 #include "mongo/db/index/catalog_hack.h"
@@ -44,6 +55,8 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/alignedbuilder.h"
 #include "mongo/util/background.h"
@@ -123,7 +136,8 @@ namespace mongo {
             catch(...) { }
 
             try {
-                result.append("onSamePartition", onSamePartition(dur::getJournalDir().string(), dbpath));
+                result.append("onSamePartition", onSamePartition(dur::getJournalDir().string(),
+                                                                 storageGlobalParams.dbpath));
             }
             catch(...) { }
 
@@ -155,14 +169,14 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::validate);
-            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
         //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
 
         bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
             NamespaceDetails * d = nsdetails( ns );
-            if ( !cmdLine.quiet ) {
+            if (!serverGlobalParams.quiet) {
                 MONGO_TLOG(0) << "CMD: validate " << ns << endl;
             }
 
@@ -299,7 +313,6 @@ namespace mongo {
 
                 set<DiskLoc> recs;
                 if( scanData ) {
-                    shared_ptr<Cursor> c = theDataFileMgr.findAll(ns);
                     int n = 0;
                     int nInvalid = 0;
                     long long nQuantizedSize = 0;
@@ -309,10 +322,13 @@ namespace mongo {
                     long long bsonLen = 0;
                     int outOfOrder = 0;
                     DiskLoc cl_last;
-                    while ( c->ok() ) {
+
+                    DiskLoc cl;
+                    Runner::RunnerState state;
+                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns));
+                    while (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, &cl))) {
                         n++;
 
-                        DiskLoc cl = c->currLoc();
                         if ( n < 1000000 )
                             recs.insert(cl);
                         if ( d->isCapped() ) {
@@ -321,7 +337,7 @@ namespace mongo {
                             cl_last = cl;
                         }
 
-                        Record *r = c->_current();
+                        Record *r = cl.rec();
                         len += r->lengthWithHeaders();
                         nlen += r->netLength();
                         
@@ -369,8 +385,10 @@ namespace mongo {
                                 bsonLen += obj.objsize();
                             }
                         }
-
-                        c->advance();
+                    }
+                    if (Runner::RUNNER_EOF != state) {
+                        // TODO: more descriptive logging.
+                        warning() << "Internal error while reading collection " << ns << endl;
                     }
                     if ( d->isCapped() && !d->capLooped() ) {
                         result.append("cappedOutOfOrder", outOfOrder);

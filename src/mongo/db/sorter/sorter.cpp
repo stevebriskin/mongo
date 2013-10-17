@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 /**
@@ -36,15 +48,17 @@
 #include "mongo/db/sorter/sorter.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <snappy.h>
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/atomic_int.h"
-#include "mongo/db/cmdline.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/bufreader.h"
+#include "mongo/util/goodies.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/paths.h"
 
 namespace mongo {
     namespace sorter {
@@ -97,7 +111,11 @@ namespace mongo {
         class FileDeleter {
         public:
             FileDeleter(const string& fileName) :_fileName(fileName) {}
-            ~FileDeleter() { boost::filesystem::remove(_fileName); }
+            ~FileDeleter() {
+                DESTRUCTOR_GUARD(
+                    boost::filesystem::remove(_fileName);
+                )
+            }
         private:
             const std::string _fileName;
         };
@@ -140,7 +158,7 @@ namespace mongo {
 
             FileIterator(const string& fileName,
                          const Settings& settings,
-                         shared_ptr<FileDeleter> fileDeleter)
+                         boost::shared_ptr<FileDeleter> fileDeleter)
                 : _settings(settings)
                 , _done(false)
                 , _fileName(fileName)
@@ -181,14 +199,38 @@ namespace mongo {
             }
 
             void fill() {
-                int32_t blockSize;
-                read(&blockSize, sizeof(blockSize));
+                int32_t rawSize;
+                read(&rawSize, sizeof(rawSize));
                 if (_done) return;
+
+                // negative size means compressed
+                const bool compressed = rawSize < 0;
+                const int32_t blockSize = std::abs(rawSize);
 
                 _buffer.reset(new char[blockSize]);
                 read(_buffer.get(), blockSize);
                 massert(16816, "file too short?", !_done);
-                _reader.reset(new BufReader(_buffer.get(), blockSize));
+
+                if (!compressed) {
+                    _reader.reset(new BufReader(_buffer.get(), blockSize));
+                    return;
+                }
+
+                dassert(snappy::IsValidCompressedBuffer(_buffer.get(), blockSize));
+
+                size_t uncompressedSize;
+                massert(17061, "couldn't get uncompressed length",
+                        snappy::GetUncompressedLength(_buffer.get(), blockSize, &uncompressedSize));
+
+                boost::scoped_array<char> decompressionBuffer(new char[uncompressedSize]);
+                massert(17062, "decompression failed",
+                        snappy::RawUncompress(_buffer.get(),
+                                              blockSize,
+                                              decompressionBuffer.get()));
+
+                // hold on to decompressed data and throw out compressed data at block exit
+                _buffer.swap(decompressionBuffer);
+                _reader.reset(new BufReader(_buffer.get(), uncompressedSize));
             }
 
             // sets _done to true on EOF - asserts on any other error
@@ -213,7 +255,7 @@ namespace mongo {
             boost::scoped_ptr<BufReader> _reader;
             string _fileName;
             boost::shared_ptr<FileDeleter> _fileDeleter; // Must outlive _file
-            ifstream _file;
+            std::ifstream _file;
         };
 
         /** Merge-sorts results from 0 or more FileIterators */
@@ -224,7 +266,7 @@ namespace mongo {
             typedef std::pair<Key, Value> Data;
 
 
-            MergeIterator(const vector<shared_ptr<Input> >& iters,
+            MergeIterator(const std::vector<boost::shared_ptr<Input> >& iters,
                           const SortOptions& opts,
                           const Comparator& comp)
                 : _opts(opts)
@@ -414,7 +456,7 @@ namespace mongo {
 
                 sort();
 
-                SortedFileWriter<Key, Value> writer(_settings);
+                SortedFileWriter<Key, Value> writer(_opts, _settings);
                 for ( ; !_data.empty(); _data.pop_front()) {
                     writer.addAlreadySorted(_data.front().first, _data.front().second);
                 }
@@ -494,6 +536,9 @@ namespace mongo {
                 , _settings(settings)
                 , _opts(opts)
                 , _memUsed(0)
+                , _haveCutoff(false)
+                , _worstCount(0)
+                , _medianCount(0)
             {
                 // This also *works* with limit==1 but LimitOneSorter should be used instead
                 verify(_opts.limit > 1);
@@ -508,9 +553,13 @@ namespace mongo {
 
             void add(const Key& key, const Value& val) {
                 STLComparator less(_comp);
+                Data contender(key, val);
 
                 if (_data.size() < _opts.limit) {
-                    _data.push_back(std::make_pair(key, val));
+                    if (_haveCutoff && !less(contender, _cutoff))
+                        return;
+
+                    _data.push_back(contender);
 
                     _memUsed += key.memUsageForSorter();
                     _memUsed += val.memUsageForSorter();
@@ -526,7 +575,6 @@ namespace mongo {
 
                 verify(_data.size() == _opts.limit);
 
-                Data contender(key, val);
                 if (!less(contender, _data.front()))
                     return; // not good enough
 
@@ -582,6 +630,85 @@ namespace mongo {
                 }
             }
 
+            // Can only be called after _data is sorted
+            void updateCutoff() {
+                // Theory of operation: We want to be able to eagerly ignore values we know will not
+                // be in the TopK result set by setting _cutoff to a value we know we have at least
+                // K values equal to or better than. There are two values that we track to
+                // potentially become the next value of _cutoff: _worstSeen and _lastMedian. When
+                // one of these values becomes the new _cutoff, its associated counter is reset to 0
+                // and a new value is chosen for that member the next time we spill.
+                //
+                // _worstSeen is the worst value we've seen so that all kept values are better than
+                // (or equal to) it. This means that once _worstCount >= _opts.limit there is no
+                // reason to consider values worse than _worstSeen so it can become the new _cutoff.
+                // This technique is especially useful when the input is already roughly sorted (eg
+                // sorting ASC on an ObjectId or Date field) since we will quickly find a cutoff
+                // that will exclude most later values, making the full TopK operation including
+                // the MergeIterator phase is O(K) in space and O(N + K*Log(K)) in time.
+                //
+                // _lastMedian was the median of the _data in the first spill() either overall or
+                // following a promotion of _lastMedian to _cutoff. We count the number of kept
+                // values that are better than or equal to _lastMedian in _medianCount and can
+                // promote _lastMedian to _cutoff once _medianCount >=_opts.limit. Assuming
+                // reasonable median selection (which should happen when the data is completely
+                // unsorted), after the first K spilled values, we will keep roughly 50% of the
+                // incoming values, 25% after the second K, 12.5% after the third K, etc. This means
+                // that by the time we spill 3*K values, we will have seen (1*K + 2*K + 4*K) values,
+                // so the expected number of kept values is O(Log(N/K) * K). The final run time if
+                // using the O(K*Log(N)) merge algorithm in MergeIterator is O(N + K*Log(K) +
+                // K*LogLog(N/K)) which is much closer to O(N) than O(N*Log(K)).
+                //
+                // This leaves a currently unoptimized worst case of data that is already roughly
+                // sorted, but in the wrong direction, such that the desired results are all the
+                // last ones seen. It will require O(N) space and O(N*Log(K)) time. Since this
+                // should be trivially detectable, as a future optimization it might be nice to
+                // detect this case and reverse the direction of input (if possible) which would
+                // turn this into the best case described above.
+                //
+                // Pedantic notes: The time complexities above (which count number of comparisons)
+                // ignore the sorting of batches prior to spilling to disk since they make it more
+                // confusing without changing the results. If you want to add them back in, add an
+                // extra term to each time complexity of (SPACE_COMPLEXITY * Log(BATCH_SIZE)). Also,
+                // all space complexities measure disk space rather than memory since this class is
+                // O(1) in memory due to the _opts.maxMemoryUsageBytes limit.
+
+                STLComparator less(_comp); // less is "better" for TopK.
+
+                // Pick a new _worstSeen or _lastMedian if should.
+                if (_worstCount == 0 || less(_worstSeen, _data.back())) {
+                    _worstSeen = _data.back();
+                }
+                if (_medianCount == 0) {
+                    size_t medianIndex = _data.size() / 2; // chooses the higher if size() is even.
+                    _lastMedian = _data[medianIndex];
+                }
+
+                // Add the counters of kept objects better than or equal to _worstSeen/_lastMedian.
+                _worstCount += _data.size(); // everything is better or equal
+                typename std::vector<Data>::iterator firstWorseThanLastMedian =
+                    std::upper_bound(_data.begin(), _data.end(), _lastMedian, less);
+                _medianCount += std::distance(_data.begin(), firstWorseThanLastMedian);
+
+
+                // Promote _worstSeen or _lastMedian to _cutoff and reset counters if should.
+                if (_worstCount >= _opts.limit) {
+                    if (!_haveCutoff || less(_worstSeen, _cutoff)) {
+                        _cutoff = _worstSeen;
+                        _haveCutoff = true;
+                    }
+                    _worstCount = 0;
+                }
+                if (_medianCount >= _opts.limit) {
+                    if (!_haveCutoff || less(_lastMedian, _cutoff)) {
+                        _cutoff = _lastMedian;
+                        _haveCutoff = true;
+                    }
+                    _medianCount = 0;
+                }
+
+            }
+
             void spill() {
                 if (_data.empty())
                     return;
@@ -593,8 +720,9 @@ namespace mongo {
                         );
 
                 sort();
+                updateCutoff();
 
-                SortedFileWriter<Key, Value> writer(_settings);
+                SortedFileWriter<Key, Value> writer(_opts, _settings);
                 for (size_t i=0; i<_data.size(); i++) {
                     writer.addAlreadySorted(_data[i].first, _data[i].second);
                 }
@@ -613,6 +741,14 @@ namespace mongo {
             size_t _memUsed;
             std::vector<Data> _data; // the "current" data. Organized as max-heap if size == limit.
             std::vector<boost::shared_ptr<Iterator> > _iters; // data that has already been spilled
+
+            // See updateCutoff() for a full description of how these members are used.
+            bool _haveCutoff;
+            Data _cutoff; // We can definitely ignore values worse than this.
+            Data _worstSeen; // The worst Data seen so far. Reset when _worstCount >= _opts.limit.
+            size_t _worstCount; // Number of docs better or equal to _worstSeen kept so far.
+            Data _lastMedian; // Median of a batch. Reset when _medianCount >= _opts.limit.
+            size_t _medianCount; // Number of docs better or equal to _lastMedian kept so far.
         };
 
         inline unsigned nextFileNumber() {
@@ -628,23 +764,28 @@ namespace mongo {
 
 
     template <typename Key, typename Value>
-    SortedFileWriter<Key, Value>::SortedFileWriter(const Settings& settings)
+    SortedFileWriter<Key, Value>::SortedFileWriter(const SortOptions& opts,
+                                                   const Settings& settings)
         : _settings(settings)
     {
+        namespace str = mongoutils::str;
+
         // This should be checked by consumers, but if we get here don't allow writes.
         massert(16946, "Attempting to use external sort from mongos. This is not allowed.",
-                !cmdLine.isMongos());
+                !isMongos());
+
+        massert(17148, "Attempting to use external sort without setting SortOptions::tempDir",
+                !opts.tempDir.empty());
 
         {
             StringBuilder sb;
-            // TODO use tmpPath rather than dbpath/_tmp
-            sb << dbpath << "/_tmp" << "/extsort." << sorter::nextFileNumber();
+            sb << opts.tempDir << "/extsort." << sorter::nextFileNumber();
             _fileName = sb.str();
         }
 
-        boost::filesystem::create_directories(dbpath + "/_tmp/");
+        boost::filesystem::create_directories(opts.tempDir);
 
-        _file.open(_fileName.c_str(), ios::binary | ios::out);
+        _file.open(_fileName.c_str(), std::ios::binary | std::ios::out);
         massert(16818, str::stream() << "error opening file \"" << _fileName << "\": "
                                      << sorter::myErrnoWithDescription(),
                 _file.good());
@@ -652,7 +793,7 @@ namespace mongo {
         _fileDeleter = boost::make_shared<sorter::FileDeleter>(_fileName);
 
         // throw on failure
-        _file.exceptions(ios::failbit | ios::badbit | ios::eofbit);
+        _file.exceptions(std::ios::failbit | std::ios::badbit | std::ios::eofbit);
     }
 
     template <typename Key, typename Value>
@@ -666,13 +807,25 @@ namespace mongo {
 
     template <typename Key, typename Value>
     void SortedFileWriter<Key, Value>::spill() {
-        const int32_t size = _buffer.len();
-        if (size == 0)
+        namespace str = mongoutils::str;
+
+        if (_buffer.len() == 0)
             return;
 
+        std::string compressed;
+        snappy::Compress(_buffer.buf(), _buffer.len(), &compressed);
+        verify(compressed.size() <= size_t(std::numeric_limits<int32_t>::max()));
+
         try {
-            _file.write(reinterpret_cast<const char*>(&size), sizeof(size));
-            _file.write(_buffer.buf(), size);
+            if (compressed.size() < size_t(_buffer.len()/10*9)) {
+                const int32_t size = -int32_t(compressed.size()); // negative means compressed
+                _file.write(reinterpret_cast<const char*>(&size), sizeof(size));
+                _file.write(compressed.data(), compressed.size());
+            } else {
+                const int32_t size = _buffer.len();
+                _file.write(reinterpret_cast<const char*>(&size), sizeof(size));
+                _file.write(_buffer.buf(), _buffer.len());
+            }
         } catch (const std::exception&) {
             msgasserted(16821, str::stream() << "error writing to file \"" << _fileName << "\": "
                                              << sorter::myErrnoWithDescription());
@@ -709,7 +862,10 @@ namespace mongo {
 
         // This should be checked by consumers, but if it isn't try to fail early.
         massert(16947, "Attempting to use external sort from mongos. This is not allowed.",
-                !(cmdLine.isMongos() && opts.extSortAllowed));
+                !(isMongos() && opts.extSortAllowed));
+
+        massert(17149, "Attempting to use external sort without setting SortOptions::tempDir",
+                !(opts.extSortAllowed && opts.tempDir.empty()));
 
         switch (opts.limit) {
             case 0:  return new sorter::NoLimitSorter<Key, Value, Comparator>(opts, comp, settings);

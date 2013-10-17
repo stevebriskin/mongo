@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/modifier_pull.h"
@@ -20,11 +32,14 @@
 #include "mongo/bson/mutable/algorithm.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/ops/field_checker.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/db/ops/path_support.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
     namespace mb = mutablebson;
+    namespace str = mongoutils::str;
 
     struct ModifierPull::PreparedState {
 
@@ -41,7 +56,7 @@ namespace mongo {
         mb::Document& doc;
 
         // Index in _fieldRef for which an Element exist in the document.
-        int32_t idxFound;
+        size_t idxFound;
 
         // Element corresponding to _fieldRef[0.._idxFound].
         mb::Element elemFound;
@@ -60,14 +75,17 @@ namespace mongo {
         : ModifierInterface()
         , _fieldRef()
         , _posDollar(0)
-        , _matchExpression()
+        , _exprElt()
+        , _exprObj()
+        , _matchExpr()
+        , _matcherOnPrimitive(false)
         , _preparedState() {
     }
 
     ModifierPull::~ModifierPull() {
     }
 
-    Status ModifierPull::init(const BSONElement& modExpr) {
+    Status ModifierPull::init(const BSONElement& modExpr, const Options& opts) {
         // Perform standard field name and updateable checks.
         _fieldRef.parse(modExpr.fieldName());
         Status status = fieldchecker::isUpdatable(_fieldRef);
@@ -80,20 +98,41 @@ namespace mongo {
         size_t foundCount;
         bool foundDollar = fieldchecker::isPositional(_fieldRef, &_posDollar, &foundCount);
         if (foundDollar && foundCount > 1) {
-            return Status(ErrorCodes::BadValue, "too many positional($) elements found.");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "Too many positional (i.e. '$') elements found in path '"
+                                        << _fieldRef.dottedField() << "'");
         }
 
-        // The matcher wants this as a BSONObj, not a BSONElement. Ignore the field name (the
-        // matcher does too).
-        BSONObjBuilder builder;
-        builder.appendAs(modExpr, StringData());
-        _exprObj = builder.obj();
+        _exprElt = modExpr;
 
-        // Try to parse this into a match expression.
-        StatusWithMatchExpression parseResult = MatchExpressionParser::parse(_exprObj);
-        if (parseResult.isOK())
-            _matchExpression.reset(parseResult.getValue());
-        return parseResult.getStatus();
+        // If the element in the mod is actually an object or a regular expression, we need to
+        // build a matcher, instead of just doing an equality comparision.
+        if ((_exprElt.type() == mongo::Object) || (_exprElt.type() == mongo::RegEx)) {
+            if (_exprElt.type() == Object) {
+                _exprObj = _exprElt.embeddedObject();
+
+                // If not is not a query operator, then it is a primitive.
+                _matcherOnPrimitive = (_exprObj.firstElement().getGtLtOp() != 0);
+
+                // If the object is primitive then wrap it up into an object.
+                if (_matcherOnPrimitive)
+                    _exprObj = BSON( "" << _exprObj );
+            }
+            else {
+                // For a regex, we also need to wrap and treat like a primitive.
+                _matcherOnPrimitive = true;
+                _exprObj = _exprElt.wrap("");
+            }
+
+            // Build the matcher around the object we built above.
+            StatusWithMatchExpression parseResult = MatchExpressionParser::parse(_exprObj);
+            if (!parseResult.isOK())
+                return parseResult.getStatus();
+
+            _matchExpr.reset(parseResult.getValue());
+        }
+
+        return Status::OK();
     }
 
     Status ModifierPull::prepare(mb::Element root,
@@ -131,10 +170,9 @@ namespace mongo {
         execInfo->fieldRef[0] = &_fieldRef;
 
         if (!_preparedState->elemFound.ok() ||
-            _preparedState->idxFound < static_cast<int32_t>(_fieldRef.numParts() - 1)) {
+            _preparedState->idxFound < (_fieldRef.numParts() - 1)) {
             // If no target element exists, then there is nothing to do here.
             _preparedState->noOp = execInfo->noOp = true;
-            execInfo->inPlace = true;
             return Status::OK();
         }
 
@@ -147,16 +185,13 @@ namespace mongo {
         // If the array is empty, there is nothing to pull, so this is a noop.
         if (!_preparedState->elemFound.hasChildren()) {
             _preparedState->noOp = execInfo->noOp = true;
-            execInfo->inPlace = true;
             return Status::OK();
         }
 
         // Walk the values in the array
         mb::Element cursor = _preparedState->elemFound.leftChild();
         while (cursor.ok()) {
-            dassert(cursor.hasValue());
-            const BSONElement value = cursor.getValue();
-            if (_matchExpression->matchesSingleElement(value))
+            if (isMatch(cursor))
                 _preparedState->elementsToRemove.push_back(cursor);
             cursor = cursor.rightSibling();
         }
@@ -164,7 +199,6 @@ namespace mongo {
         // If we didn't find any elements to add, then this is a no-op, and therefore in place.
         if (_preparedState->elementsToRemove.empty()) {
             _preparedState->noOp = execInfo->noOp = true;
-            execInfo->inPlace = true;
         }
 
         return Status::OK();
@@ -174,7 +208,7 @@ namespace mongo {
         dassert(_preparedState->noOp == false);
 
         dassert(_preparedState->elemFound.ok() &&
-                _preparedState->idxFound == static_cast<int32_t>(_fieldRef.numParts() - 1));
+                _preparedState->idxFound == (_fieldRef.numParts() - 1));
 
         std::vector<mb::Element>::const_iterator where = _preparedState->elementsToRemove.begin();
         const std::vector<mb::Element>::const_iterator end = _preparedState->elementsToRemove.end();
@@ -184,25 +218,22 @@ namespace mongo {
         return Status::OK();
     }
 
-    Status ModifierPull::log(mb::Element logRoot) const {
+    Status ModifierPull::log(LogBuilder* logBuilder) const {
 
-        mb::Document& doc = logRoot.getDocument();
-
-        mb::Element opElement = doc.end();
-        mb::Element logElement = doc.end();
+        mb::Document& doc = logBuilder->getDocument();
 
         if (!_preparedState->elemFound.ok() ||
-            _preparedState->idxFound < static_cast<int32_t>(_fieldRef.numParts() - 1)) {
+            _preparedState->idxFound < (_fieldRef.numParts() - 1)) {
 
             // If we didn't find the element that we wanted to pull from, we log an unset for
             // that element.
 
-            opElement = doc.makeElementObject("$unset");
-            if (!opElement.ok()) {
-                return Status(ErrorCodes::InternalError, "cannot create log entry for $pull mod");
-            }
+            mb::Element logElement = doc.makeElementInt(_fieldRef.dottedField(), 1);
+            if (!logElement.ok())
+                return Status(ErrorCodes::InternalError,
+                              "cannot create log entry for $pull mod");
 
-            logElement = doc.makeElementInt(_fieldRef.dottedField(), 1);
+            return logBuilder->addToUnsets(logElement);
 
         } else {
 
@@ -215,13 +246,8 @@ namespace mongo {
             // We'd like to create an entry such as {$set: {<fieldname>: [<resulting aray>]}} under
             // 'logRoot'.  We start by creating the {$set: ...} Element.
 
-            opElement = doc.makeElementObject("$set");
-            if (!opElement.ok()) {
-                return Status(ErrorCodes::InternalError, "cannot create log entry for $pull mod");
-            }
-
             // Then we create the {<fieldname>:[]} Element, that is, an empty array.
-            logElement = doc.makeElementArray(_fieldRef.dottedField());
+            mb::Element logElement = doc.makeElementArray(_fieldRef.dottedField());
             if (!logElement.ok()) {
                 return Status(ErrorCodes::InternalError, "cannot create details for $pull mod");
             }
@@ -246,16 +272,31 @@ namespace mongo {
                 curr = curr.rightSibling();
             }
 
+            return logBuilder->addToSets(logElement);
+        }
+    }
+
+    bool ModifierPull::isMatch(mutablebson::ConstElement element) {
+
+        // TODO: We are assuming that 'element' hasValue is true. That might be OK if the
+        // conflict detection logic will prevent us from ever seeing a deserialized element,
+        // but are we sure about that?
+
+        dassert(element.hasValue());
+
+        if (!_matchExpr)
+            return (element.compareWithBSONElement(_exprElt, false) == 0);
+
+        if (_matcherOnPrimitive) {
+            // TODO: This is kinda slow.
+            BSONObj candidate = element.getValue().wrap("");
+            return _matchExpr->matchesBSON(candidate);
         }
 
-        // Now, we attach log element under the op element.
-        Status status = opElement.pushBack(logElement);
-        if (!status.isOK()) {
-            return status;
-        }
+        if (element.getType() != Object)
+            return false;
 
-        // And attach the result under the 'logRoot' Element provided by the caller.
-        return logRoot.pushBack(opElement);
+        return _matchExpr->matchesBSON(element.getValueObject());
     }
 
 } // namespace mongo

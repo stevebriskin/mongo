@@ -1,6 +1,7 @@
 /**
  * This tests using DB commands with authentication enabled when sharded.
  */
+var doTest = function() {
 
 var rsOpts = { oplogSize: 10, verbose : 2, useHostname : false };
 var st = new ShardingTest({ keyFile : 'jstests/libs/key1', shards : 2, chunksize : 1, config : 3,
@@ -23,19 +24,19 @@ var rwUser = 'rwUser';
 var roUser = 'roUser';
 var password = 'password';
 
-adminDB.addUser( rwUser, password, false, st.rs0.numNodes );
+adminDB.addUser({user: rwUser, pwd: password, roles: jsTest.basicUserRoles}, st.rs0.numNodes );
 
 assert( adminDB.auth( rwUser, password ) );
 adminDB.addUser( roUser, password, true );
-testDB.addUser( rwUser, password, false, st.rs0.numNodes );
-testDB.addUser( roUser, password, true, st.rs0.numNodes );
+testDB.addUser({user: rwUser, pwd: password, roles: jsTest.basicUserRoles}, st.rs0.numNodes );
+testDB.addUser({user: roUser, pwd: password, roles: jsTest.basicUserRoles}, st.rs0.numNodes );
 
 authenticatedConn = new Mongo( mongos.host );
 authenticatedConn.getDB( 'admin' ).auth( rwUser, password );
 
 // Add user to shards to prevent localhost connections from having automatic full access
-st.rs0.getPrimary().getDB( 'admin' ).addUser( 'user', 'password', false, 3 );
-st.rs1.getPrimary().getDB( 'admin' ).addUser( 'user', 'password', false, 3 );
+st.rs0.getPrimary().getDB( 'admin' ).addUser({user: 'user', pwd: 'password', roles: jsTest.basicUserRoles}, 3 );
+st.rs1.getPrimary().getDB( 'admin' ).addUser({user: 'user', pwd: 'password', roles: jsTest.basicUserRoles}, 3 );
 
 
 
@@ -311,3 +312,8 @@ adminDB.printShardingStatus();
 
 
 st.stop();
+}
+
+if (0) { // SERVER-10668
+    doTest();
+}

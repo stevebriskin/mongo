@@ -12,19 +12,34 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/ops/modifier_inc.h"
 
 #include "mongo/base/error_codes.h"
+#include "mongo/bson/mutable/algorithm.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/db/ops/field_checker.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/db/ops/path_support.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    using mongoutils::str::stream;
+    namespace mb = mutablebson;
+    namespace str = mongoutils::str;
 
     struct ModifierInc::PreparedState {
 
@@ -34,7 +49,6 @@ namespace mongo {
             , elemFound(doc.end())
             , boundDollar("")
             , newValue()
-            , inPlace(false)
             , noOp(false) {
         }
 
@@ -42,7 +56,7 @@ namespace mongo {
         mutablebson::Document& doc;
 
         // Index in _fieldRef for which an Element exist in the document.
-        int32_t idxFound;
+        size_t idxFound;
 
         // Element corresponding to _fieldRef[0.._idxFound].
         mutablebson::Element elemFound;
@@ -53,15 +67,13 @@ namespace mongo {
         // Value to be applied
         SafeNum newValue;
 
-        // This $inc is in-place?
-        bool inPlace;
-
         // This $inc is a no-op?
         bool noOp;
     };
 
-    ModifierInc::ModifierInc()
+    ModifierInc::ModifierInc(ModifierIncMode mode)
         : ModifierInterface ()
+        , _mode(mode)
         , _fieldRef()
         , _posDollar(0)
         , _val() {
@@ -70,7 +82,7 @@ namespace mongo {
     ModifierInc::~ModifierInc() {
     }
 
-    Status ModifierInc::init(const BSONElement& modExpr) {
+    Status ModifierInc::init(const BSONElement& modExpr, const Options& opts) {
 
         //
         // field name analysis
@@ -88,7 +100,9 @@ namespace mongo {
         size_t foundCount;
         bool foundDollar = fieldchecker::isPositional(_fieldRef, &_posDollar, &foundCount);
         if (foundDollar && foundCount > 1) {
-            return Status(ErrorCodes::BadValue, "too many positional($) elements found.");
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << "Too many positional (i.e. '$') elements found in path '"
+                                        << _fieldRef.dottedField() << "'");
         }
 
         //
@@ -99,7 +113,8 @@ namespace mongo {
             // TODO: Context for mod error messages would be helpful
             // include mod code, etc.
             return Status(ErrorCodes::BadValue,
-                          "Cannot increment with non-numeric argument");
+                          str::stream() << "Cannot increment with non-numeric argument: "
+                                        << modExpr);
         }
 
         _val = modExpr;
@@ -117,7 +132,10 @@ namespace mongo {
         // If we have a $-positional field, it is time to bind it to an actual field part.
         if (_posDollar) {
             if (matchedField.empty()) {
-                return Status(ErrorCodes::BadValue, "matched field not provided");
+                return Status(ErrorCodes::BadValue,
+                              str::stream() << "The positional operator did not find the match "
+                                               "needed from the query. Unexpanded update: "
+                                            << _fieldRef.dottedField());
             }
             _preparedState->boundDollar = matchedField.toString();
             _fieldRef.setPart(_posDollar, _preparedState->boundDollar);
@@ -156,40 +174,49 @@ namespace mongo {
         // If the field path is not fully present, then this mod cannot be in place, nor is a
         // noOp.
         if (!_preparedState->elemFound.ok() ||
-            _preparedState->idxFound < static_cast<int32_t>(_fieldRef.numParts() - 1)) {
+            _preparedState->idxFound < (_fieldRef.numParts() - 1)) {
+
+            // For multiplication, we treat ops against missing as yielding zero. We take
+            // advantage here of the promotion rules for SafeNum; the expression below will
+            // always yield a zero of the same type of operand that the user provided
+            // (e.g. double).
+            if (_mode == MODE_MUL)
+                _preparedState->newValue *= SafeNum(static_cast<int>(0));
+
             return Status::OK();
         }
 
         // If the value being $inc'ed is the same as the one already in the doc, than this is a
         // noOp.
-        if (!_preparedState->elemFound.isNumeric())
-            return Status(ErrorCodes::BadValue,
-                          "invalid attempt to increment a non-numeric field");
-
+        if (!_preparedState->elemFound.isNumeric()) {
+            mb::Element idElem = mb::findElementNamed(root.leftChild(), "_id");
+            return Status(
+                ErrorCodes::BadValue,
+                str::stream() << "Cannot apply $inc to a value of non-numeric type."
+                              << idElem.toString()
+                              << " has the field " <<  _preparedState->elemFound.getFieldName()
+                              << " of non-numeric type "
+                              << typeName(_preparedState->elemFound.getType()));
+        }
         const SafeNum currentValue = _preparedState->elemFound.getValueSafeNum();
 
         // Update newValue w.r.t to the current value of the found element.
-        _preparedState->newValue += currentValue;
+        if (_mode == MODE_INC)
+            _preparedState->newValue += currentValue;
+        else
+            _preparedState->newValue *= currentValue;
 
         // If the result of the addition is invalid, we must return an error.
-        if (!_preparedState->newValue.isValid())
+        if (!_preparedState->newValue.isValid()) {
             return Status(ErrorCodes::BadValue,
-                          "Failed to increment current value");
-
-        // If the values are identical (same type, same value), then this is a no-op, and
-        // therefore in-place as well.
-        if (_preparedState->newValue.isIdentical(currentValue)) {
-            _preparedState->noOp = execInfo->noOp = true;
-            _preparedState->inPlace = execInfo->inPlace = true;
-            return Status::OK();
+                          str::stream() << "Failed to apply $inc operations to current value: "
+                                        << currentValue.debugString());
         }
 
-        // If the types are the same, this can be done in place.
-        //
-        // TODO: Potentially, cases where $inc results in a mixed type of the same size could
-        // be in-place as well, but we don't currently handle them.
-        if (_preparedState->newValue.type() == currentValue.type()) {
-            _preparedState->inPlace = execInfo->inPlace = true;
+        // If the values are identical (same type, same value), then this is a no-op.
+        if (_preparedState->newValue.isIdentical(currentValue)) {
+            _preparedState->noOp = execInfo->noOp = true;
+            return Status::OK();
         }
 
         return Status::OK();
@@ -201,11 +228,9 @@ namespace mongo {
         // If there's no need to create any further field part, the $inc is simply a value
         // assignment.
         if (_preparedState->elemFound.ok() &&
-            _preparedState->idxFound == static_cast<int32_t>(_fieldRef.numParts() - 1)) {
+            _preparedState->idxFound == (_fieldRef.numParts() - 1)) {
             return _preparedState->elemFound.setValueSafeNum(_preparedState->newValue);
         }
-
-        dassert(_preparedState->inPlace == false);
 
         //
         // Complete document path logic
@@ -237,17 +262,13 @@ namespace mongo {
                                          elemToSet);
     }
 
-    Status ModifierInc::log(mutablebson::Element logRoot) const {
+    Status ModifierInc::log(LogBuilder* logBuilder) const {
 
         dassert(_preparedState->newValue.isValid());
 
         // We'd like to create an entry such as {$set: {<fieldname>: <value>}} under 'logRoot'.
         // We start by creating the {$set: ...} Element.
-        mutablebson::Document& doc = logRoot.getDocument();
-        mutablebson::Element setElement = doc.makeElementObject("$set");
-        if (!setElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot append log entry for $set mod");
-        }
+        mutablebson::Document& doc = logBuilder->getDocument();
 
         // Then we create the {<fieldname>: <value>} Element.
         mutablebson::Element logElement = doc.makeElementSafeNum(
@@ -255,17 +276,16 @@ namespace mongo {
             _preparedState->newValue);
 
         if (!logElement.ok()) {
-            return Status(ErrorCodes::InternalError, "cannot append details for $set mod");
+            return Status(ErrorCodes::InternalError,
+                          str::stream() << "Could not append entry to "
+                                        << (_mode == MODE_INC ? "$inc" : "$mul")
+                                        << " oplog entry: "
+                                        << "set '" << _fieldRef.dottedField() << "' -> "
+                                        << _preparedState->newValue.debugString() );
         }
 
-        // Now, we attach the {<fieldname>: <value>} Element under the {$set: ...} one.
-        Status status = setElement.pushBack(logElement);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        // And attach the result under the 'logRoot' Element provided.
-        return logRoot.pushBack(setElement);
+        // Now, we attach the {<fieldname>: <value>} Element under the {$set: ...} segment.
+        return logBuilder->addToSets(logElement);
     }
 
 } // namespace mongo

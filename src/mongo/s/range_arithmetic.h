@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #pragma once
@@ -50,13 +62,15 @@ namespace mongo {
      */
     struct KeyRange {
 
-        KeyRange( const std::string& ns_,
-                  const BSONObj& minKey_,
-                  const BSONObj& maxKey_,
-                  const BSONObj& keyPattern_ ) :
-                ns( ns_ ), minKey( minKey_ ), maxKey( maxKey_ ), keyPattern( keyPattern_ )
+        KeyRange( const std::string& ns,
+                  const BSONObj& minKey,
+                  const BSONObj& maxKey,
+                  const BSONObj& keyPattern ) :
+                ns( ns ), minKey( minKey ), maxKey( maxKey ), keyPattern( keyPattern )
         {
         }
+
+        KeyRange() {}
 
         std::string ns;
         BSONObj minKey;
@@ -128,5 +142,16 @@ namespace mongo {
     bool rangeMapContains( const RangeMap& ranges,
                            const BSONObj& inclusiveLower,
                            const BSONObj& exclusiveUpper );
+
+    /**
+     * String representation of [inclusiveLower, exclusiveUpper)
+     */
+    std::string rangeToString( const BSONObj& inclusiveLower,
+                               const BSONObj& exclusiveUpper );
+
+    /**
+     * String representation of overlapping ranges as a list "[range1),[range2),..."
+     */
+    std::string overlapToString( RangeVector overlap );
 
 }

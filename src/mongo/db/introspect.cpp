@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -21,12 +33,13 @@
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/principal_set.h"
+#include "mongo/db/auth/user_set.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database_holder.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/util/goodies.h"
 
 namespace {
@@ -39,7 +52,7 @@ namespace {
     void _appendUserInfo(const Client& c,
                          BSONObjBuilder& builder,
                          AuthorizationSession* authSession) {
-        PrincipalSet::NameIterator nameIter = authSession->getAuthenticatedPrincipalNames();
+        UserSet::NameIterator nameIter = authSession->getAuthenticatedUserNames();
 
         UserName bestUser;
         if (nameIter.more())
@@ -122,8 +135,8 @@ namespace {
 
         try {
             Lock::DBWrite lk( currentOp.getNS() );
-            if ( dbHolder()._isLoaded( nsToDatabase( currentOp.getNS() ) , dbpath ) ) {
-                Client::Context cx(currentOp.getNS(), dbpath);
+            if (dbHolder()._isLoaded(nsToDatabase(currentOp.getNS()), storageGlobalParams.dbpath)) {
+                Client::Context cx(currentOp.getNS(), storageGlobalParams.dbpath);
                 _profile(c, currentOp, profileBufBuilder);
             }
             else {
@@ -142,7 +155,7 @@ namespace {
         fassert(16372, db);
         const char* profileName = db->getProfilingNS();
         NamespaceDetails* details = db->namespaceIndex().details(profileName);
-        if (!details && (cmdLine.defaultProfile || force)) {
+        if (!details && (serverGlobalParams.defaultProfile || force)) {
             // system.profile namespace doesn't exist; create it
             log() << "creating profile collection: " << profileName << endl;
             string myerrmsg;

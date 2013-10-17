@@ -51,7 +51,6 @@ namespace {
 
 namespace mongo {
     // Symbols defined to build the binary correctly.
-    CmdLine cmdLine;
 
     bool inShutdown() {
         scoped_lock sl(shutDownMutex);
@@ -178,6 +177,7 @@ namespace mongo_test {
          * Helper method for running the server on a separate thread.
          */
         static void runServer(mongo::MessageServer* server) {
+            server->setupSockets();
             server->run();
         }
 
@@ -273,6 +273,7 @@ namespace mongo_test {
 
     private:
         static void runServer(mongo::MessageServer* server) {
+            server->setupSockets();
             server->run();
         }
 

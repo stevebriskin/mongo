@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -78,7 +90,7 @@ namespace mongo {
          * Returns a copy of the full dotted field in its current state (i.e., some parts may
          * have been replaced since the parse() call).
          */
-        std::string dottedField( size_t offset = 0 ) const;
+        StringData dottedField( size_t offsetFromStart = 0 ) const;
 
         /**
          * Compares the full dotted path represented by this FieldRef to other
@@ -105,11 +117,7 @@ namespace mongo {
          */
         size_t numParts() const { return _size; }
 
-        /**
-         * Returns the number of fields parts that were replaced so far. Replacing the same
-         * fields several times only counts for 1.
-         */
-        size_t numReplaced() const;
+        bool empty() const { return numParts() == 0; }
 
     private:
         // Dotted fields are most often not longer than four parts. We use a mixed structure
@@ -127,20 +135,29 @@ namespace mongo {
          */
         size_t appendPart(const StringData& part);
 
+        /**
+         * Re-assemble _dotted from components, including any replacements in _replacements,
+         * and update the StringData components in _fixed and _variable to refer to the parts
+         * of the new _dotted. This is used to make the storage for the current value of this
+         * FieldRef contiguous so it can be returned as a StringData from the dottedField
+         * method above.
+         */
+        void reserialize() const;
+
         // number of field parts stored
         size_t _size;
 
         // first kResevedAhead field components
-        StringData _fixed[kReserveAhead];
+        mutable StringData _fixed[kReserveAhead];
 
          // remaining field components
-        std::vector<StringData> _variable;
+        mutable std::vector<StringData> _variable;
 
-        // concatenation of null-terminated parts pointed to by _fixed and _variable
-        boost::scoped_array<char> _fieldBase;
+        // cached dotted name
+        mutable std::string _dotted;
 
         // back memory added with the setPart call pointed to by _fized and _variable
-        std::vector<std::string> _replacements;
+        mutable std::vector<std::string> _replacements;
     };
 
     inline bool operator==(const FieldRef& lhs, const FieldRef& rhs) {

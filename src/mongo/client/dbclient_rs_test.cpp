@@ -35,7 +35,6 @@
 
 namespace mongo {
     // Symbols defined to build the binary correctly.
-    CmdLine cmdLine;
 
     bool inShutdown() {
         return false;
@@ -91,7 +90,7 @@ namespace {
         }
 
         void tearDown() {
-            ReplicaSetMonitor::remove(_replSet->getSetName(), true);
+            ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
             // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
@@ -176,7 +175,7 @@ namespace {
         }
 
         void tearDown() {
-            ReplicaSetMonitor::remove(_replSet->getSetName(), true);
+            ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
             // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
@@ -249,7 +248,7 @@ namespace {
         }
 
         void tearDown() {
-            ReplicaSetMonitor::remove(_replSet->getSetName(), true);
+            ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
             // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
@@ -337,7 +336,7 @@ namespace {
         }
 
         void tearDown() {
-            ReplicaSetMonitor::remove(_replSet->getSetName(), true);
+            ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
             // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.
@@ -487,7 +486,7 @@ namespace {
 
         void tearDown() {
             ConnectionString::setConnectionHook(_originalConnectionHook);
-            ReplicaSetMonitor::remove(_replSet->getSetName(), true);
+            ReplicaSetMonitor::cleanup();
             _replSet.reset();
 
             // TODO: remove this after we remove replSetGetStatus from ReplicaSetMonitor.

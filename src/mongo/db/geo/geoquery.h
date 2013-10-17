@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
@@ -48,6 +60,7 @@ namespace mongo {
         bool supportsContains() const;
 
         bool hasS2Region() const;
+        bool hasFlatRegion() const;
 
         // Used by s2cursor only to generate a covering of the query object.
         // One region is not NULL and this returns it.
@@ -84,22 +97,49 @@ namespace mongo {
         shared_ptr<S2RegionUnion> _region;
     };
 
+    // TODO: Make a struct, turn parse stuff into something like
+    // static Status parseNearQuery(const BSONObj& obj, NearQuery** out);
     class NearQuery {
     public:
-        NearQuery() : minDistance(0), maxDistance(std::numeric_limits<double>::max()),
-                      fromRadians(false) {}
-        NearQuery(const string& f) : field(f), minDistance(0),
-                                     maxDistance(std::numeric_limits<double>::max()),
-                                     fromRadians(false) {}
-        bool parseFrom(const BSONObj &obj, double radius);
+        NearQuery()
+            : minDistance(0),
+              maxDistance(std::numeric_limits<double>::max()),
+              isNearSphere(false) { }
+
+        NearQuery(const string& f)
+            : field(f),
+              minDistance(0),
+              maxDistance(std::numeric_limits<double>::max()),
+              isNearSphere(false) { }
+
+        bool parseFrom(const BSONObj &obj);
         bool parseFromGeoNear(const BSONObj &obj, double radius);
+
+        // The name of the field that contains the geometry.
         string field;
+
+        // The starting point of the near search.
         PointWithCRS centroid;
-        // Min and max distance IN METERS from centroid that we're willing to search.
+
+        // Min and max distance from centroid that we're willing to search.
+        // Distance is in whatever units the centroid's CRS implies.
+        // If centroid.crs == FLAT these are radians.
+        // If centroid.crs == SPHERE these are meters.
         double minDistance;
         double maxDistance;
-        // Did we convert to this distance from radians?  (If so, we output distances in radians.)
-        bool fromRadians;
+
+        // It's either $near or $nearSphere.
+        bool isNearSphere;
+
+        string toString() const {
+            stringstream ss;
+            ss << " field=" << field;
+            return ss.str();
+        }
+
+    private:
+        bool parseLegacyQuery(const BSONObj &obj);
+        bool parseNewQuery(const BSONObj &obj);
     };
 
     // This represents either a $within or a $geoIntersects.
@@ -120,6 +160,10 @@ namespace mongo {
         bool hasS2Region() const;
         const S2Region& getRegion() const;
         string getField() const { return field; }
+
+        Predicate getPred() const { return predicate; }
+        const GeometryContainer& getGeometry() const { return geoContainer; }
+
     private:
         // Try to parse the provided object into the right place.
         bool parseLegacyQuery(const BSONObj &obj);

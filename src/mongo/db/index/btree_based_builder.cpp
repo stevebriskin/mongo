@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/index/btree_based_builder.h"
@@ -21,11 +33,12 @@
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/kill_current_op.h"
+#include "mongo/db/pdfile_private.h"
+#include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/sort_phase_one.h"
 #include "mongo/util/processinfo.h"
-#include "mongo/db/pdfile_private.h"
 
 namespace mongo {
 
@@ -147,25 +160,29 @@ namespace mongo {
                            int64_t nrecords,
                            ProgressMeter* progressMeter,
                            bool mayInterrupt, int idxNo) {
-        shared_ptr<Cursor> cursor = theDataFileMgr.findAll( ns );
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns));
         phaseOne->sortCmp.reset(getComparison(idx.version(), idx.keyPattern()));
         phaseOne->sorter.reset(new BSONObjExternalSorter(phaseOne->sortCmp.get()));
         phaseOne->sorter->hintNumObjects( nrecords );
         auto_ptr<IndexDescriptor> desc(CatalogHack::getDescriptor(d, idxNo));
         auto_ptr<BtreeBasedAccessMethod> iam(CatalogHack::getBtreeBasedIndex(desc.get()));
-        while ( cursor->ok() ) {
+        BSONObj o;
+        DiskLoc loc;
+        Runner::RunnerState state;
+        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&o, &loc))) {
             RARELY killCurrentOp.checkForInterrupt( !mayInterrupt );
-            BSONObj o = cursor->current();
-            DiskLoc loc = cursor->currLoc();
             BSONObjSet keys;
             iam->getKeys(o, &keys);
             phaseOne->addKeys(keys, loc, mayInterrupt);
-            cursor->advance();
             progressMeter->hit();
-            if ( logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(2) ) && phaseOne->n % 10000 == 0 ) {
+            if (logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(2))
+                && phaseOne->n % 10000 == 0 ) {
                 printMemInfo( "\t iterating objects" );
             }
         }
+
+        uassert(17050, "Internal error reading docs from collection", Runner::RUNNER_EOF == state);
+
     }
 
     uint64_t BtreeBasedBuilder::fastBuildIndex(const char* ns, NamespaceDetails* d,

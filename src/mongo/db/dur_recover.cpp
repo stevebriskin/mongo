@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -24,7 +36,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
-#include "mongo/db/cmdline.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/database.h"
 #include "mongo/db/db.h"
@@ -37,6 +48,7 @@
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/storage/durable_mapped_file.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/util/bufreader.h"
 #include "mongo/util/checksum.h"
 #include "mongo/util/compress.h"
@@ -194,7 +206,7 @@ namespace mongo {
                 ss << fileNo;
 
             // relative name -> full path name
-            boost::filesystem::path full(dbpath);
+            boost::filesystem::path full(storageGlobalParams.dbpath);
             full /= ss.str();
             return full.string();
         }
@@ -337,8 +349,10 @@ namespace mongo {
         }
 
         void RecoveryJob::applyEntries(const vector<ParsedJournalEntry> &entries) {
-            bool apply = (cmdLine.durOptions & CmdLine::DurScanOnly) == 0;
-            bool dump = cmdLine.durOptions & CmdLine::DurDumpJournal;
+            bool apply = (storageGlobalParams.durOptions &
+                          StorageGlobalParams::DurScanOnly) == 0;
+            bool dump = storageGlobalParams.durOptions &
+                        StorageGlobalParams::DurDumpJournal;
             if( dump )
                 log() << "BEGIN section" << endl;
 
@@ -445,7 +459,8 @@ namespace mongo {
                         uasserted(13536, str::stream() << "journal version number mismatch " << h._version);
                     }
                     fileId = h.fileId;
-                    if(cmdLine.durOptions & CmdLine::DurDumpJournal) { 
+                    if (storageGlobalParams.durOptions &
+                        StorageGlobalParams::DurDumpJournal) {
                         log() << "JHeader::fileId=" << fileId << endl;
                     }
                 }
@@ -455,7 +470,8 @@ namespace mongo {
                     JSectHeader h;
                     br.peek(h);
                     if( h.fileId != fileId ) {
-                        if( debug || (cmdLine.durOptions & CmdLine::DurDumpJournal) ) {
+                        if (debug || (storageGlobalParams.durOptions &
+                                      StorageGlobalParams::DurDumpJournal)) {
                             log() << "Ending processFileBuffer at differing fileId want:" << fileId << " got:" << h.fileId << endl;
                             log() << "  sect len:" << h.sectionLen() << " seqnum:" << h.seqNumber << endl;
                         }
@@ -473,7 +489,7 @@ namespace mongo {
                 }
             }
             catch( BufReader::eof& ) {
-                if( cmdLine.durOptions & CmdLine::DurDumpJournal )
+                if (storageGlobalParams.durOptions & StorageGlobalParams::DurDumpJournal)
                     log() << "ABRUPT END" << endl;
                 return true; // abrupt end
             }
@@ -522,8 +538,10 @@ namespace mongo {
 
             close();
 
-            if( cmdLine.durOptions & CmdLine::DurScanOnly ) {
-                uasserted(13545, str::stream() << "--durOptions " << (int) CmdLine::DurScanOnly << " (scan only) specified");
+            if (storageGlobalParams.durOptions & StorageGlobalParams::DurScanOnly) {
+                uasserted(13545, str::stream() << "--durOptions "
+                                               << (int) StorageGlobalParams::DurScanOnly
+                                               << " (scan only) specified");
             }
 
             log() << "recover cleaning up" << endl;
@@ -534,7 +552,7 @@ namespace mongo {
         }
 
         void _recover() {
-            verify( cmdLine.dur );
+            verify(storageGlobalParams.dur);
 
             boost::filesystem::path p = getJournalDir();
             if( !exists(p) ) {

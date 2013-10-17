@@ -15,24 +15,36 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 namespace mongo {
 
     inline StringData NamespaceString::db() const {
-        return _dotIndex == string::npos ?
+        return _dotIndex == std::string::npos ?
             StringData() :
             StringData( _ns.c_str(), _dotIndex );
     }
 
     inline StringData NamespaceString::coll() const {
-        return _dotIndex == string::npos ?
+        return _dotIndex == std::string::npos ?
             StringData() :
             StringData( _ns.c_str() + _dotIndex + 1, _ns.size() - 1 - _dotIndex );
     }
 
     inline bool NamespaceString::normal(const StringData& ns) {
-        if ( ns.find( '$' ) == string::npos )
+        if ( ns.find( '$' ) == std::string::npos )
             return true;
         return oplog(ns);
     }
@@ -42,42 +54,78 @@ namespace mongo {
     }
 
     inline bool NamespaceString::special(const StringData& ns) {
-        return !normal(ns) || ns.find( ".system." ) != string::npos;
+        return !normal(ns) || ns.substr(ns.find('.')).startsWith(".system.");
     }
 
-    inline bool NamespaceString::validDBName( const StringData& dbin ) {
-        // XXX
-        string db = dbin.toString();
-
+    inline bool NamespaceString::validDBName( const StringData& db ) {
         if ( db.size() == 0 || db.size() > 64 )
             return false;
+
+        for (StringData::const_iterator iter = db.begin(), end = db.end(); iter != end; ++iter) {
+            switch (*iter) {
+            case '\0':
+            case '/':
+            case '\\':
+            case '.':
+            case ' ':
+            case '"':
+                return false;
 #ifdef _WIN32
-        // We prohibit all FAT32-disallowed characters on Windows
-        size_t good = strcspn( db.c_str() , "/\\. \"*<>:|?" );
-#else
-        // For non-Windows platforms we are much more lenient
-        size_t good = strcspn( db.c_str() , "/\\. \"" );
+            // We prohibit all FAT32-disallowed characters on Windows
+            case '*':
+            case '<':
+            case '>':
+            case ':':
+            case '|':
+            case '?':
+                return false;
 #endif
-        return good == db.size();
+            default:
+                continue;
+            }
+        }
+        return true;
     }
 
-    inline bool NamespaceString::validCollectionName(const StringData& ns){
+    inline bool NamespaceString::validCollectionComponent(const StringData& ns){
         size_t idx = ns.find( '.' );
-        if ( idx == string::npos )
+        if ( idx == std::string::npos )
             return false;
 
-        if ( idx + 1 >= ns.size() )
-            return false;
-
-        return normal( ns );
+        return validCollectionName(ns.substr(idx + 1)) || oplog(ns);
     }
 
+    inline bool NamespaceString::validCollectionName(const StringData& coll){
+        if (coll.empty())
+            return false;
+
+        return coll.find('$') == std::string::npos;
+
+    }
+
+    inline NamespaceString::NamespaceString() : _ns(), _dotIndex(0) {}
     inline NamespaceString::NamespaceString( const StringData& nsIn ) {
         _ns = nsIn.toString(); // copy to our buffer
         _dotIndex = _ns.find( '.' );
     }
 
-    inline int nsDBHash( const string& ns ) {
+    inline NamespaceString::NamespaceString( const StringData& dbName,
+                                             const StringData& collectionName )
+        : _ns(dbName.size() + collectionName.size() + 1, '\0') {
+
+        dassert(dbName.find('.') == std::string::npos);
+        dassert(collectionName.empty() || collectionName[0] != '.');
+        std::string::iterator it = std::copy(dbName.begin(), dbName.end(), _ns.begin());
+        *it = '.';
+        ++it;
+        it = std::copy(collectionName.begin(), collectionName.end(), it);
+        _dotIndex = dbName.size();
+        dassert(it == _ns.end());
+        dassert(_ns[_dotIndex] == '.');
+        dassert(_ns.find('\0') == std::string::npos);
+    }
+
+    inline int nsDBHash( const std::string& ns ) {
         int hash = 7;
         for ( size_t i = 0; i < ns.size(); i++ ) {
             if ( ns[i] == '.' )
@@ -88,7 +136,7 @@ namespace mongo {
         return hash;
     }
 
-    inline bool nsDBEquals( const string& a, const string& b ) {
+    inline bool nsDBEquals( const std::string& a, const std::string& b ) {
         for ( size_t i = 0; i < a.size(); i++ ) {
 
             if ( a[i] == '.' ) {
@@ -121,12 +169,12 @@ namespace mongo {
     }
 
     /* future : this doesn't need to be an inline. */
-    inline string NamespaceString::getSisterNS( const StringData& local ) const {
+    inline std::string NamespaceString::getSisterNS( const StringData& local ) const {
         verify( local.size() && local[0] != '.' );
         return db().toString() + "." + local.toString();
     }
 
-    inline string NamespaceString::getSystemIndexesCollection() const {
+    inline std::string NamespaceString::getSystemIndexesCollection() const {
         return db().toString() + ".system.indexes";
     }
 

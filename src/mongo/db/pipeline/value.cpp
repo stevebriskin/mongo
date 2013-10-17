@@ -12,6 +12,18 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
 #include "mongo/pch.h"
@@ -21,12 +33,53 @@
 #include <boost/functional/hash.hpp>
 
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pipeline/builder.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
     using namespace mongoutils;
+
+    void ValueStorage::verifyRefCountingIfShould() const {
+        switch (type) {
+        case MinKey:
+        case MaxKey:
+        case jstOID:
+        case Date:
+        case Timestamp:
+        case EOO:
+        case jstNULL:
+        case Undefined:
+        case Bool:
+        case NumberInt:
+        case NumberLong:
+        case NumberDouble:
+            // the above types never reference external data
+            verify(!refCounter);
+            break;
+
+        case String:
+        case RegEx:
+        case Code:
+        case Symbol:
+            // the above types reference data when not using short-string optimization
+            verify(refCounter == !shortStr);
+            break;
+
+        case BinData: // TODO this should probably support short-string optimization
+        case Array: // TODO this should probably support empty-is-NULL optimization
+        case DBRef:
+        case CodeWScope:
+            // the above types always reference external data.
+            verify(refCounter);
+            verify(bool(genericRCPtr));
+            break;
+
+        case Object:
+            // Objects either hold a NULL ptr or should be ref-counting
+            verify(refCounter == bool(genericRCPtr));
+            break;
+        }
+    }
 
     void ValueStorage::putString(const StringData& s) {
         // Note: this also stores data portion of BinData
@@ -77,51 +130,6 @@ namespace mongo {
 
     // not in header because document is fwd declared
     Value::Value(const BSONObj& obj) : _storage(Object, Document(obj)) {}
-
-    Value::Value(BSONType theType): _storage(theType) {
-        switch(theType) {
-        case EOO:
-        case Undefined:
-        case jstNULL:
-        case Object: // empty
-            break;
-
-        case Array: // empty
-            _storage.putVector(new RCVector());
-            break;
-
-        case Bool:
-            _storage.boolValue = false;
-            break;
-
-        case NumberDouble:
-            _storage.doubleValue = 0;
-            break;
-
-        case NumberInt:
-            _storage.intValue = 0;
-            break;
-
-        case NumberLong:
-            _storage.longValue = 0;
-            break;
-
-        case Date:
-            _storage.dateValue = 0;
-            break;
-
-        case Timestamp:
-            _storage.timestampValue = 0;
-            break;
-
-        default:
-            // nothing else is allowed
-            uassert(16001, str::stream() <<
-                    "can't create empty Value of type " << typeName(getType()), false);
-            break;
-        }
-    }
-
 
     Value::Value(const BSONElement& elem) : _storage(elem.type()) {
         switch(elem.type()) {
@@ -206,6 +214,14 @@ namespace mongo {
             _storage.putDBRef(BSONDBRef(elem.dbrefNS(), elem.dbrefOID()));
             break;
         }
+    }
+
+    Value::Value(const BSONArray& arr) : _storage(Array) {
+        intrusive_ptr<RCVector> vec (new RCVector);
+        BSONForEach(sub, arr) {
+            vec->vec.push_back(Value(sub));
+        }
+        _storage.putVector(vec.get());
     }
 
     Value Value::createIntOrLong(long long longValue) {
@@ -410,22 +426,7 @@ namespace mongo {
     }
 
     time_t Value::coerceToTimeT() const {
-        long long millis = coerceToDate();
-        if (millis < 0) {
-            // We want the division below to truncate toward -inf rather than 0
-            // eg Dec 31, 1969 23:59:58.001 should be -2 seconds rather than -1
-            // This is needed to get the correct values from coerceToTM
-            if ( -1999 / 1000 != -2) { // this is implementation defined
-                millis -= 1000-1;
-            }
-        }
-        const long long seconds = millis / 1000;
-
-        uassert(16421, "Can't handle date values outside of time_t range",
-               seconds >= std::numeric_limits<time_t>::min() &&
-               seconds <= std::numeric_limits<time_t>::max());
-
-        return static_cast<time_t>(seconds);
+        return millisToTimeT(coerceToDate());
     }
     tm Value::coerceToTm() const {
         // See implementation in Date_t.
@@ -726,7 +727,7 @@ namespace mongo {
         }
 
         case Object:
-            getDocument()->hash_combine(seed);
+            getDocument().hash_combine(seed);
             break;
 
         case Array: {
@@ -823,7 +824,7 @@ namespace mongo {
                                         : sizeof(RCString) + _storage.getString().size());
 
         case Object:
-            return sizeof(Value) + getDocument()->getApproximateSize();
+            return sizeof(Value) + getDocument().getApproximateSize();
 
         case Array: {
             size_t size = sizeof(Value);
@@ -885,7 +886,7 @@ namespace mongo {
         case Undefined: return out << "undefined";
         case Date: return out << tmToISODateString(val.coerceToTm());
         case Timestamp: return out << val.getTimestamp().toString();
-        case Object: return out << val.getDocument()->toString();
+        case Object: return out << val.getDocument().toString();
         case Array: {
             out << "[";
             const size_t n = val.getArray().size();

@@ -14,7 +14,7 @@
  */
 
 #include "mongo/platform/basic.h"
-#include "mongo/platform/cstdint.h"
+
 #include "mongo/util/time_support.h"
 
 #include <cstdio>
@@ -24,12 +24,18 @@
 #include <boost/thread/tss.hpp>
 #include <boost/thread/xtime.hpp>
 
+#include "mongo/platform/cstdint.h"
 #include "mongo/util/assert_util.h"
 
 #ifdef _WIN32
 #include <boost/date_time/filetime_functions.hpp>
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/timer.h"
+
+// NOTE(schwerin): MSVC's _snprintf is not a drop-in replacement for C99's snprintf().  In
+// particular, when the target buffer is too small, behaviors differ.  Consult the documentation
+// from MSDN and form the BSD or Linux man pages before using.
+#define snprintf _snprintf
 #endif
 
 namespace mongo {
@@ -54,25 +60,30 @@ namespace mongo {
 #endif
     }
 
+    std::string time_t_to_String(time_t t) {
+        char buf[64];
 #if defined(_WIN32)
-    void curTimeString(char* timeStr) {
-        boost::xtime xt;
-        boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
-        time_t_to_String(xt.sec, timeStr);
-
-        char* milliSecStr = timeStr + 19;
-        _snprintf(milliSecStr, 5, ".%03d", static_cast<int32_t>(xt.nsec / 1000000));
-    }
+        ctime_s(buf, sizeof(buf), &t);
 #else
-    void curTimeString(char* timeStr) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        time_t_to_String(tv.tv_sec, timeStr);
-
-        char* milliSecStr = timeStr + 19;
-        snprintf(milliSecStr, 5, ".%03d", static_cast<int32_t>(tv.tv_usec / 1000));
-    }
+        ctime_r(&t, buf);
 #endif
+        buf[24] = 0; // don't want the \n
+        return buf;
+    }
+
+    std::string time_t_to_String_short(time_t t) {
+        char buf[64];
+#if defined(_WIN32)
+        ctime_s(buf, sizeof(buf), &t);
+#else
+        ctime_r(&t, buf);
+#endif
+        buf[19] = 0;
+        if( buf[0] && buf[1] && buf[2] && buf[3] )
+            return buf + 4; // skip day of week
+        return buf;
+    }
+
 
     // uses ISO 8601 dates without trailing Z
     // colonsOk should be false when creating filenames
@@ -86,13 +97,126 @@ namespace mongo {
         return buf;
     }
 
+#define MONGO_ISO_DATE_FMT_NO_TZ "%Y-%m-%dT%H:%M:%S"
     string timeToISOString(time_t time) {
         struct tm t;
         time_t_to_Struct( time, &t );
 
-        const char* fmt = "%Y-%m-%dT%H:%M:%SZ";
+        const char* fmt = MONGO_ISO_DATE_FMT_NO_TZ "Z";
         char buf[32];
         fassert(16227, strftime(buf, sizeof(buf), fmt, &t) == 20);
+        return buf;
+    }
+
+    static inline std::string _dateToISOString(Date_t date, bool local) {
+        const int bufSize = 32;
+        char buf[bufSize];
+        struct tm t;
+        time_t_to_Struct(millisToTimeT(static_cast<long long>(date.millis)), &t, local);
+        int pos = strftime(buf, bufSize, MONGO_ISO_DATE_FMT_NO_TZ, &t);
+        fassert(16981, 0 < pos);
+        char* cur = buf + pos;
+        int bufRemaining = bufSize - pos;
+        pos = snprintf(cur, bufRemaining, ".%03d",
+                       extractMillisPortion(static_cast<long long>(date.millis)));
+        fassert(16982, bufRemaining > pos && pos > 0);
+        cur += pos;
+        bufRemaining -= pos;
+        if (local) {
+            fassert(16983, bufRemaining >= 6);
+#ifdef _WIN32
+            // NOTE(schwerin): The value stored by _get_timezone is the value one adds to local time
+            // to get UTC.  This is opposite of the ISO-8601 meaning of the timezone offset.
+            // NOTE(schwerin): Microsoft's timezone code always assumes US rules for daylight
+            // savings time.  We can do no better without completely reimplementing localtime_s and
+            // related time library functions.
+            long msTimeZone;
+            _get_timezone(&msTimeZone);
+            if (t.tm_isdst) msTimeZone -= 3600;
+            const bool tzIsWestOfUTC = msTimeZone > 0;
+            const long tzOffsetSeconds = msTimeZone* (tzIsWestOfUTC ? 1 : -1);
+            const long tzOffsetHoursPart = tzOffsetSeconds / 3600;
+            const long tzOffsetMinutesPart = (tzOffsetSeconds / 60) % 60;
+            snprintf(cur, 6, "%c%02ld%02ld",
+                     tzIsWestOfUTC ? '-' : '+',
+                     tzOffsetHoursPart,
+                     tzOffsetMinutesPart);
+#else
+            strftime(cur, bufRemaining, "%z", &t);
+#endif
+        }
+        else {
+            fassert(16984, bufRemaining >= 2);
+            *cur = 'Z';
+            ++cur;
+            *cur = '\0';
+        }
+        return buf;
+    }
+
+    std::string dateToISOStringUTC(Date_t date) {
+        return _dateToISOString(date, false);
+    }
+
+    std::string dateToISOStringLocal(Date_t date) {
+        return _dateToISOString(date, true);
+    }
+
+#undef MONGO_ISO_DATE_FMT_NO_TZ
+
+    void Date_t::toTm(tm* buf) {
+        time_t dtime = toTimeT();
+#if defined(_WIN32)
+        gmtime_s(buf, &dtime);
+#else
+        gmtime_r(&dtime, buf);
+#endif
+    }
+
+    std::string Date_t::toString() const {
+        return time_t_to_String(toTimeT());
+    }
+
+    time_t Date_t::toTimeT() const {
+        verify((long long)millis >= 0); // TODO when millis is signed, delete 
+        verify(((long long)millis/1000) < (std::numeric_limits<time_t>::max)());
+        return millis / 1000;
+    }
+
+    time_t millisToTimeT(long long millis) {
+        if (millis < 0) {
+            // We want the division below to truncate toward -inf rather than 0
+            // eg Dec 31, 1969 23:59:58.001 should be -2 seconds rather than -1
+            // This is needed to get the correct values from coerceToTM
+            if ( -1999 / 1000 != -2) { // this is implementation defined
+                millis -= 1000-1;
+            }
+        }
+        const long long seconds = millis / 1000;
+
+        uassert(16421, "Can't handle date values outside of time_t range",
+               seconds >= std::numeric_limits<time_t>::min() &&
+               seconds <= std::numeric_limits<time_t>::max());
+
+        return static_cast<time_t>(seconds);
+    }
+
+    int extractMillisPortion(long long millisSinceEpoch) {
+        const int ms = millisSinceEpoch % 1000LL;
+        // adding 1000 since dates before 1970 would have negative ms
+        return ms >= 0 ? ms : 1000 + ms;
+    }
+
+    std::string dateToCtimeString(Date_t date) {
+        time_t t = date.toTimeT();
+        char buf[64];
+#if defined(_WIN32)
+        ctime_s(buf, sizeof(buf), &t);
+#else
+        ctime_r(&t, buf);
+#endif
+        char* milliSecStr = buf + 19;
+        snprintf(milliSecStr, 5, ".%03d", static_cast<int32_t>(date.asInt64() % 1000));
         return buf;
     }
 
@@ -208,6 +332,15 @@ namespace mongo {
         unsigned long long lastErrorTimeMillis = _lastErrorTimeMillis;
         _lastErrorTimeMillis = currTimeMillis;
 
+        lastSleepMillis = getNextSleepMillis(lastSleepMillis, currTimeMillis, lastErrorTimeMillis);
+
+        // Store the last slept time
+        _lastSleepMillis = lastSleepMillis;
+        sleepmillis( lastSleepMillis );
+    }
+
+    int Backoff::getNextSleepMillis(int lastSleepMillis, unsigned long long currTimeMillis,
+                                    unsigned long long lastErrorTimeMillis) const {
         // Backoff logic
 
         // Get the time since the last error
@@ -227,9 +360,7 @@ namespace mongo {
         if( lastSleepMillis == 0 ) lastSleepMillis = 1;
         else lastSleepMillis = std::min( lastSleepMillis * 2, _maxSleepMillis );
 
-        // Store the last slept time
-        _lastSleepMillis = lastSleepMillis;
-        sleepmillis( lastSleepMillis );
+        return lastSleepMillis;
     }
 
     extern long long jsTime_virtual_skew;

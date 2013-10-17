@@ -16,24 +16,20 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
-
-#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/pch.h"
 
 #include "mongo/db/interrupt_status_mongod.h"
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document.h"
 #include "mongo/db/pipeline/expression_context.h"
-
-#include "dbtests.h"
+#include "mongo/dbtests/dbtests.h"
 
 namespace AccumulatorTests {
 
     class Base {
     protected:
         BSONObj fromDocument( const Document& document ) {
-            BSONObjBuilder bob;
-            document->toBson( &bob );
-            return bob.obj();
+            return document.toBson();
         }
         BSONObj fromValue( const Value& value ) {
             BSONObjBuilder bob;

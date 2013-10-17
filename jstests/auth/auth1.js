@@ -16,12 +16,13 @@ mro = new Mongo(m.host);
 dbRO = mro.getDB( "test" );
 tRO = dbRO[ baseName ];
 
-users = db.getCollection( "system.users" );
-users.remove( {} );
+db.dropAllUsers();
 
-db.addUser( "eliot" , "eliot" );
-db.addUser( "guest" , "guest", true );
-db.getSisterDB( "admin" ).addUser( "super", "super" );
+db.getSisterDB( "admin" ).addUser({user: "super", pwd: "super", roles: ["__system"] });
+db.getSisterDB("admin").auth("super", "super");
+db.addUser({user: "eliot" , pwd: "eliot", roles: jsTest.basicUserRoles });
+db.addUser({user: "guest" , pwd: "guest", roles: jsTest.readOnlyUserRoles});
+db.getSisterDB("admin").logout();
 
 assert.throws( function() { t.findOne() }, [], "read without login" );
 
@@ -68,14 +69,6 @@ tRO.save( {} ); // fail
 assert( dbRO.getLastError() , "B5: " + tojson( dbRO.getLastErrorObj() ) );
 assert.eq( 1000, tRO.count() , "B6" );
 
-// SERVER-4692 read-only users can't read system.users collection
-assert.throws(function(){dbRO.system.users.findOne()});
-assert.throws(function(){dbRO.system.users.count()});
-
-assert.eq( 2, db.system.users.count() , "B7" ); // rw connection
-assert.throws(function(){dbRO.addUser( "a", "b" )});
-assert.eq( 2, db.system.users.count() , "B8"); // rw connection
-
 assert.eq( 1000, tRO.group( p ).length , "C1" );
 
 var p = { key : { i : true } , 
@@ -93,6 +86,5 @@ db.getSiblingDB('admin').auth('super', 'super');
 assert.eq( 1000, db.eval( function() { return db[ "jstests_auth_auth1" ].count(); } ) , "D1" );
 db.eval( function() { db[ "jstests_auth_auth1" ].save( {i:1000} ) } );
 assert.eq( 1001, db.eval( function() { return db[ "jstests_auth_auth1" ].count(); } ) , "D2" );
-
 
 print("SUCCESS auth1.js");

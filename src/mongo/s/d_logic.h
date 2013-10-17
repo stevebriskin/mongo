@@ -13,6 +13,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 
@@ -64,32 +76,50 @@ namespace mongo {
         const ChunkVersion getVersion( const string& ns ) const;
 
         /**
-         * Uninstalls the metadata for a given collection. This should be used when the collection
-         * is dropped.
+         * If the metadata for 'ns' at this shard is at or above the requested version,
+         * 'reqShardVersion', returns OK and fills in 'latestShardVersion' with the latest shard
+         * version.  The latter is always greater or equal than 'reqShardVersion' if in the same
+         * epoch.
          *
-         * NOTE:
-         *   An existing collection with no chunks on this shard will have metadata on version 0,
-         *   which is different than a dropped collection, which will not have metadata.
+         * Otherwise, falls back to refreshMetadataNow.
          *
-         * TODO:
-         *   All collections should have metadata. (The non-sharded ones are a degenerate case of
-         *   one-chunk collections).
+         * This call blocks if there are more than N threads
+         * currently refreshing metadata. (N is the number of
+         * tickets in ShardingState::_configServerTickets,
+         * currently 3.)
          *
-         * @param ns the collection to be dropped
+         * Locking Note:
+         *   + Must NOT be called with the write lock because this call may go into the network,
+         *     and deadlocks may occur with shard-as-a-config.  Therefore, nothing here guarantees
+         *     that 'latestShardVersion' is indeed the current one on return.
          */
-        void resetVersion( const string& ns );
+        Status refreshMetadataIfNeeded( const string& ns,
+                                        const ChunkVersion& reqShardVersion,
+                                        ChunkVersion* latestShardVersion );
 
         /**
-         * Requests to access a collection at a certain version. If the collection's metadata is not
-         * at that version it will try to update itself to the newest version. The request is only
-         * granted if the version is the current or the newest one.
+         * Refreshes collection metadata by asking the config server for the latest information.
+         * Starts a new config server request.
          *
-         * @param ns collection to be accessed
-         * @param version (IN) the client believe this collection is on and (OUT) the version the
-         *  metadata is actually in
-         * @return true if the access can be allowed at the provided version
+         * Locking Notes:
+         *   + Must NOT be called with the write lock because this call may go into the network,
+         *     and deadlocks may occur with shard-as-a-config.  Therefore, nothing here guarantees
+         *     that 'latestShardVersion' is indeed the current one on return.
+         *
+         *   + Because this call must not be issued with the DBLock held, by the time the config
+         *     server sent us back the collection metadata information, someone else may have
+         *     updated the previously stored collection metadata.  There are cases when one can't
+         *     tell which of updated or loaded metadata are the freshest. There are also cases where
+         *     the data coming from configs do not correspond to a consistent snapshot.
+         *     In these cases, return RemoteChangeDetected. (This usually means this call needs to
+         *     be issued again, at caller discretion)
+         *
+         * @return OK if remote metadata successfully loaded (may or may not have been installed)
+         * @return RemoteChangeDetected if something changed while reloading and we may retry
+         * @return !OK if something else went wrong during reload
+         * @return latestShardVersion the version that is now stored for this collection
          */
-        bool trySetVersion( const string& ns , ChunkVersion& version );
+        Status refreshMetadataNow( const string& ns, ChunkVersion* latestShardVersion );
 
         void appendInfo( BSONObjBuilder& b );
 
@@ -110,6 +140,9 @@ namespace mongo {
          *
          * If it runs successfully, clients need to grab the new version to access the collection.
          *
+         * LOCKING NOTE:
+         * Only safe to do inside the
+         *
          * @param ns the collection
          * @param min max the chunk to eliminate from the current metadata
          * @param version at which the new metadata should be at
@@ -123,11 +156,14 @@ namespace mongo {
          * If it runs successfully, clients that became stale by the previous donateChunk will be
          * able to access the collection again.
          *
+         * Note: If a migration has aborted but not yet unregistered a pending chunk, replacing the
+         * metadata may leave the chunk as pending - this is not dangerous and should be rare, but
+         * will require a stepdown to fully recover.
+         *
          * @param ns the collection
-         * @param min max the chunk to reclaim and add to the current metadata
-         * @param version at which the new metadata should be at
+         * @param prevMetadata the previous metadata before we donated a chunk
          */
-        void undoDonateChunk( const string& ns , const BSONObj& min , const BSONObj& max , ChunkVersion version );
+        void undoDonateChunk( const string& ns, CollectionMetadataPtr prevMetadata );
 
         /**
          * Remembers a chunk range between 'min' and 'max' as a range which will have data migrated
@@ -141,6 +177,7 @@ namespace mongo {
         bool notePending( const string& ns,
                           const BSONObj& min,
                           const BSONObj& max,
+                          const OID& epoch,
                           string* errMsg );
 
         /**
@@ -177,6 +214,24 @@ namespace mongo {
         void splitChunk( const string& ns , const BSONObj& min , const BSONObj& max , const vector<BSONObj>& splitKeys ,
                          ChunkVersion version );
 
+        /**
+         * Creates and installs a new chunk metadata for a given collection by merging a range of
+         * chunks ['minKey', 'maxKey') into a single chunk with version 'mergedVersion'.
+         * The current metadata must overlap the range completely and minKey and maxKey must not
+         * divide an existing chunk.
+         *
+         * The merged chunk version must have a greater version than the current shard version,
+         * and if it has a greater major version clients will need to reload metadata.
+         *
+         * @param ns the collection
+         * @param minKey maxKey the range which should be merged
+         * @param newShardVersion the shard version the newly merged chunk should have
+         */
+        void mergeChunks( const string& ns,
+                          const BSONObj& minKey,
+                          const BSONObj& maxKey,
+                          ChunkVersion mergedVersion );
+
         bool inCriticalMigrateSection();
 
         /**
@@ -184,7 +239,23 @@ namespace mongo {
          */
         bool waitTillNotInCriticalSection( int maxSecondsToWait );
 
+        /**
+         * TESTING ONLY
+         * Uninstalls the metadata for a given collection.
+         */
+        void resetMetadata( const string& ns );
+
     private:
+
+        /**
+         * Refreshes collection metadata by asking the config server for the latest information.
+         * May or may not be based on a requested version.
+         */
+        Status doRefreshMetadata( const string& ns,
+                                  const ChunkVersion& reqShardVersion,
+                                  bool useRequestedVersion,
+                                  ChunkVersion* latestShardVersion );
+
         bool _enabled;
 
         string _configServer;

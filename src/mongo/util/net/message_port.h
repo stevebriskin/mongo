@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/sock.h"
 
@@ -36,17 +38,19 @@ namespace mongo {
 
         virtual HostAndPort remote() const = 0;
         virtual unsigned remotePort() const = 0;
-
-        long long connectionId() const { return _connectionId; }
-        void setConnectionId( long long connectionId );
-
-        void setX509SubjectName(const std::string& x509SubjectName){
+        virtual SockAddr remoteAddr() const = 0;
+        virtual SockAddr localAddr() const = 0;
+        
+        void setX509SubjectName(const std::string& x509SubjectName) {
             _x509SubjectName = x509SubjectName;
         }
 
-        std::string getX509SubjectName(){
+        std::string getX509SubjectName() {
             return _x509SubjectName;
         }
+
+        long long connectionId() const { return _connectionId; }
+        void setConnectionId( long long connectionId );
 
     public:
         // TODO make this private with some helpers
@@ -85,7 +89,7 @@ namespace mongo {
         void reply(Message& received, Message& response);
         bool call(Message& toSend, Message& response);
 
-        void say(Message& toSend, int responseTo = -1);
+        void say(Message& toSend, int responseTo = 0);
 
         /**
          * this is used for doing 'async' queries
@@ -98,17 +102,19 @@ namespace mongo {
          */
         bool recv( const Message& sent , Message& response );
 
-        void piggyBack( Message& toSend , int responseTo = -1 );
+        void piggyBack( Message& toSend , int responseTo = 0 );
 
         unsigned remotePort() const { return psock->remotePort(); }
         virtual HostAndPort remote() const;
+        virtual SockAddr remoteAddr() const;
+        virtual SockAddr localAddr() const;
 
         boost::shared_ptr<Socket> psock;
                 
         void send( const char * data , int len, const char *context ) {
             psock->send( data, len, context );
         }
-        void send( const vector< pair< char *, int > > &data, const char *context ) {
+        void send(const std::vector< std::pair< char *, int > > &data, const char *context) {
             psock->send( data, context );
         }
         bool connect(SockAddr& farEnd) {
@@ -120,8 +126,8 @@ namespace mongo {
          * When this function returns, further communication on this
          * MessagingPort will be encrypted.
          */
-        void secure( SSLManagerInterface* ssl ) {
-            psock->secure( ssl );
+        bool secure( SSLManagerInterface* ssl ) {
+            return psock->secure( ssl );
         }
 #endif
 
@@ -136,7 +142,7 @@ namespace mongo {
     private:
         
         PiggyBackData * piggyBackData;
-        
+
         // this is the parsed version of remote
         // mutable because its initialized only on call to remote()
         mutable HostAndPort _remoteParsed; 

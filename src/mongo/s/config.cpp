@@ -14,16 +14,26 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "pcrecpp.h"
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
-#include "mongo/client/model.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
@@ -95,10 +105,16 @@ namespace mongo {
 
         BSONObjBuilder val;
         val.append(CollectionType::ns(), ns);
-        val.appendDate(CollectionType::DEPRECATED_lastmod(), time(0));
+        val.appendDate(CollectionType::DEPRECATED_lastmod(), jsTime());
         val.appendBool(CollectionType::dropped(), _dropped);
-        if ( _cm )
+        if ( _cm ) {
+            // This also appends the lastmodEpoch.
             _cm->getInfo( val );
+        }
+        else {
+            // lastmodEpoch is a required field so we also need to do it here.
+            val.append(CollectionType::DEPRECATED_lastmodEpoch(), ChunkVersion::DROPPED().epoch());
+        }
 
         conn->update(CollectionType::ConfigNS, key, val.obj(), true);
         string err = conn->getLastError();
@@ -171,6 +187,25 @@ namespace mongo {
 
             log() << "enable sharding on: " << ns << " with shard key: " << fieldsAndOrder << endl;
 
+            // Record start in changelog
+            BSONObjBuilder collectionDetail;
+            collectionDetail.append("shardKey", fieldsAndOrder.key());
+            collectionDetail.append("collection", ns);
+            collectionDetail.append("primary", getPrimary().toString());
+            BSONArray a;
+            if (initShards == NULL)
+                a = BSONArray();
+            else {
+                BSONArrayBuilder b;
+                for (unsigned i = 0; i < initShards->size(); i++) {
+                    b.append((*initShards)[i].getName());
+                }
+                a = b.arr();
+            }
+            collectionDetail.append("initShards", a);
+            collectionDetail.append("numChunks", (int)(initPoints->size() + 1));
+            configServer.logChange("shardCollection.start", ns, collectionDetail.obj());
+
             ChunkManager* cm = new ChunkManager( ns, fieldsAndOrder, unique );
             cm->createFirstChunks( configServer.getPrimary().getConnString(),
                                    getPrimary(), initPoints, initShards );
@@ -203,6 +238,11 @@ namespace mongo {
             }
             sleepsecs( i );
         }
+
+        // Record finish in changelog
+        BSONObjBuilder finishDetail;
+        finishDetail.append("version", manager->getVersion().toString());
+        configServer.logChange("shardCollection", ns, finishDetail.obj());
 
         return manager;
     }
@@ -735,7 +775,15 @@ namespace mongo {
         }
 
         for ( set<string>::iterator i=hosts.begin(); i!=hosts.end(); i++ ) {
+
             string host = *i;
+
+            // If this is a CUSTOM connection string (for testing) don't do DNS resolution
+            string errMsg;
+            if ( ConnectionString::parse( host, errMsg ).type() == ConnectionString::CUSTOM ) {
+                continue;
+            }
+
             bool ok = false;
             for ( int x=10; x>0; x-- ) {
                 if ( ! hostbyname( host.c_str() ).empty() ) {
@@ -1017,7 +1065,7 @@ namespace mongo {
 
         if ( withPort ) {
             stringstream ss;
-            ss << name << ":" << CmdLine::ConfigServerPort;
+            ss << name << ":" << ServerGlobalParams::ConfigServerPort;
             return ss.str();
         }
 

@@ -12,11 +12,24 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/auth/role_graph.h"
 
 #include <algorithm>
+#include <vector>
 
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/role_name.h"
@@ -31,6 +44,7 @@ namespace {
 
     RoleGraph::RoleGraph() {};
     RoleGraph::RoleGraph(const RoleGraph& other) : _roleToSubordinates(other._roleToSubordinates),
+            _roleToIndirectSubordinates(other._roleToIndirectSubordinates),
             _roleToMembers(other._roleToMembers),
             _directPrivilegesForRole(other._directPrivilegesForRole),
             _allPrivilegesForRole(other._allPrivilegesForRole) {}
@@ -39,6 +53,7 @@ namespace {
     void RoleGraph::swap(RoleGraph& other) {
         using std::swap;
         swap(this->_roleToSubordinates, other._roleToSubordinates);
+        swap(this->_roleToIndirectSubordinates, other._roleToIndirectSubordinates);
         swap(this->_roleToMembers, other._roleToMembers);
         swap(this->_directPrivilegesForRole, other._directPrivilegesForRole);
         swap(this->_allPrivilegesForRole, other._allPrivilegesForRole);
@@ -48,24 +63,23 @@ namespace {
         lhs.swap(rhs);
     }
 
-    bool RoleGraph::roleExists(const RoleName& role) const {
+    bool RoleGraph::roleExists(const RoleName& role) {
+        _createBuiltinRoleIfNeeded(role);
+        return _roleExistsDontCreateBuiltin(role);
+    }
+
+    bool RoleGraph::_roleExistsDontCreateBuiltin(const RoleName& role) {
         EdgeSet::const_iterator edgeIt = _roleToSubordinates.find(role);
         if (edgeIt == _roleToSubordinates.end())
             return false;
         edgeIt = _roleToMembers.find(role);
-        massert(16825,
-                "Role found in forward edges but not all reverse edges map, this should not "
-                     "be possible",
-                edgeIt != _roleToMembers.end());
+        fassert(16825, edgeIt != _roleToMembers.end());
 
         RolePrivilegeMap::const_iterator strIt = _directPrivilegesForRole.find(role);
         if (strIt == _directPrivilegesForRole.end())
             return false;
         strIt = _allPrivilegesForRole.find(role);
-        massert(16826,
-                "Role found in direct privileges map but not all privileges map, this should not "
-                        "be possible",
-                strIt != _allPrivilegesForRole.end());
+        fassert(16826, strIt != _allPrivilegesForRole.end());
         return true;
     }
 
@@ -76,13 +90,19 @@ namespace {
                                 " already exists",
                           0);
         }
+
+        _createRoleDontCheckIfRoleExists(role);
+        return Status::OK();
+    }
+
+    void RoleGraph::_createRoleDontCheckIfRoleExists(const RoleName& role) {
         // Just reference the role in all the maps so that an entry gets created with empty
         // containers for the value.
         _roleToSubordinates[role];
+        _roleToIndirectSubordinates[role];
         _roleToMembers[role];
         _directPrivilegesForRole[role];
         _allPrivilegesForRole[role];
-        return Status::OK();
     }
 
     Status RoleGraph::deleteRole(const RoleName& role) {
@@ -92,42 +112,58 @@ namespace {
                                   " does not exist",
                           0);
         }
-        for (unordered_set<RoleName>::iterator it = _roleToSubordinates[role].begin();
-                it != _roleToSubordinates[role].end(); ++it) {
-            _roleToMembers[*it].erase(role);
+        if (isBuiltinRole(role)) {
+            return Status(ErrorCodes::InvalidRoleModification,
+                          mongoutils::str::stream() << "Cannot delete built-in role: " <<
+                                  role.getFullName(),
+                          0);
         }
-        for (unordered_set<RoleName>::iterator it = _roleToMembers[role].begin();
+
+        for (std::vector<RoleName>::iterator it = _roleToSubordinates[role].begin();
+                it != _roleToSubordinates[role].end(); ++it) {
+            _roleToMembers[*it].erase(std::find(_roleToMembers[*it].begin(),
+                                                _roleToMembers[*it].end(),
+                                                role));
+        }
+        for (std::vector<RoleName>::iterator it = _roleToMembers[role].begin();
                 it != _roleToMembers[role].end(); ++it) {
-            _roleToSubordinates[*it].erase(role);
+            _roleToSubordinates[*it].erase(std::find(_roleToSubordinates[*it].begin(),
+                                                     _roleToSubordinates[*it].end(),
+                                                     role));
         }
         _roleToSubordinates.erase(role);
+        _roleToIndirectSubordinates.erase(role);
         _roleToMembers.erase(role);
         _directPrivilegesForRole.erase(role);
         _allPrivilegesForRole.erase(role);
         return Status::OK();
     }
 
-    RoleNameIterator RoleGraph::getDirectSubordinates(const RoleName& role) const {
+    RoleNameIterator RoleGraph::getDirectSubordinates(const RoleName& role) {
         if (!roleExists(role))
             return RoleNameIterator(NULL);
-        const unordered_set<RoleName>& edges = _roleToSubordinates.find(role)->second;
-        return RoleNameIterator(new RoleNameSetIterator(edges.begin(), edges.end()));
+        return makeRoleNameIteratorForContainer(_roleToSubordinates[role]);
     }
 
-    RoleNameIterator RoleGraph::getDirectMembers(const RoleName& role) const {
+    RoleNameIterator RoleGraph::getIndirectSubordinates(const RoleName& role) {
         if (!roleExists(role))
             return RoleNameIterator(NULL);
-        const unordered_set<RoleName>& edges = _roleToMembers.find(role)->second;
-        return RoleNameIterator(new RoleNameSetIterator(edges.begin(), edges.end()));
+        return makeRoleNameIteratorForContainer(_roleToIndirectSubordinates[role]);
     }
 
-    const PrivilegeVector& RoleGraph::getDirectPrivileges(const RoleName& role) const {
+    RoleNameIterator RoleGraph::getDirectMembers(const RoleName& role) {
+        if (!roleExists(role))
+            return RoleNameIterator(NULL);
+        return makeRoleNameIteratorForContainer(_roleToMembers[role]);
+    }
+
+    const PrivilegeVector& RoleGraph::getDirectPrivileges(const RoleName& role) {
         if (!roleExists(role))
             return emptyPrivilegeVector;
         return _directPrivilegesForRole.find(role)->second;
     }
 
-    const PrivilegeVector& RoleGraph::getAllPrivileges(const RoleName& role) const {
+    const PrivilegeVector& RoleGraph::getAllPrivileges(const RoleName& role) {
         if (!roleExists(role))
             return emptyPrivilegeVector;
         return _allPrivilegesForRole.find(role)->second;
@@ -137,18 +173,28 @@ namespace {
         if (!roleExists(recipient)) {
             return Status(ErrorCodes::RoleNotFound,
                           mongoutils::str::stream() << "Role: " << recipient.getFullName() <<
-                                " does not exist",
-                          0);
+                                " does not exist");
+        }
+        if (isBuiltinRole(recipient)) {
+            return Status(ErrorCodes::InvalidRoleModification,
+                          mongoutils::str::stream() << "Cannot grant roles to built-in role: " <<
+                                  role.getFullName());
         }
         if (!roleExists(role)) {
             return Status(ErrorCodes::RoleNotFound,
                           mongoutils::str::stream() << "Role: " << role.getFullName() <<
-                                " does not exist",
-                          0);
+                                " does not exist");
         }
 
-        _roleToSubordinates[recipient].insert(role);
-        _roleToMembers[role].insert(recipient);
+        if (std::find(_roleToSubordinates[recipient].begin(),
+                      _roleToSubordinates[recipient].end(),
+                      role) ==
+                _roleToSubordinates[recipient].end()) {
+            // Only add role if it's not already present
+            _roleToSubordinates[recipient].push_back(role);
+            _roleToMembers[role].push_back(recipient);
+        }
+
         return Status::OK();
     }
 
@@ -159,6 +205,12 @@ namespace {
                                 " does not exist",
                           0);
         }
+        if (isBuiltinRole(recipient)) {
+            return Status(ErrorCodes::InvalidRoleModification,
+                          mongoutils::str::stream() << "Cannot remove roles from built-in role: " <<
+                                  role.getFullName(),
+                          0);
+        }
         if (!roleExists(role)) {
             return Status(ErrorCodes::RoleNotFound,
                           mongoutils::str::stream() << "Role: " << role.getFullName() <<
@@ -166,39 +218,56 @@ namespace {
                           0);
         }
 
-        if (!_roleToMembers[role].erase(recipient)) {
+        std::vector<RoleName>::iterator itToRm = std::find(_roleToMembers[role].begin(),
+                                                           _roleToMembers[role].end(),
+                                                           recipient);
+        if (itToRm != _roleToMembers[role].end()) {
+            _roleToMembers[role].erase(itToRm);
+        } else {
             return Status(ErrorCodes::RolesNotRelated,
                           mongoutils::str::stream() << recipient.getFullName() << " is not a member"
                                   " of " << role.getFullName(),
                           0);
         }
 
-        massert(16827,
-                mongoutils::str::stream() << role.getFullName() << " is not a subordinate"
-                        " of " << recipient.getFullName() << ", even though " <<
-                        recipient.getFullName() << " is a member of " << role.getFullName() <<
-                        ". This shouldn't be possible",
-                _roleToSubordinates[recipient].erase(role));
+        itToRm = std::find(_roleToSubordinates[recipient].begin(),
+                           _roleToSubordinates[recipient].end(),
+                           role);
+        fassert(16827, itToRm != _roleToSubordinates[recipient].end());
+        _roleToSubordinates[recipient].erase(itToRm);
         return Status::OK();
     }
 
-namespace {
-    // Helper function for adding a privilege to a privilege vector, de-duping the privilege if
-    // the vector already contains a privilege on the same resource.
-    void addPrivilegeToPrivilegeVector(PrivilegeVector& currentPrivileges,
-                                       const Privilege& privilegeToAdd) {
-        for (PrivilegeVector::iterator it = currentPrivileges.begin();
-                it != currentPrivileges.end(); ++it) {
-            Privilege& curPrivilege = *it;
-            if (curPrivilege.getResource() == privilegeToAdd.getResource()) {
-                curPrivilege.addActions(privilegeToAdd.getActions());
-                return;
-            }
+    Status RoleGraph::removeAllRolesFromRole(const RoleName& victim) {
+        typedef std::vector<RoleName> RoleNameVector;
+        if (!roleExists(victim)) {
+            return Status(ErrorCodes::RoleNotFound,
+                          mongoutils::str::stream() << "Role: " << victim.getFullName() <<
+                          " does not exist",
+                          0);
         }
-        // No privilege exists yet for this resource
-        currentPrivileges.push_back(privilegeToAdd);
+        if (isBuiltinRole(victim)) {
+            return Status(ErrorCodes::InvalidRoleModification,
+                          mongoutils::str::stream() << "Cannot remove roles from built-in role: " <<
+                          victim.getFullName(),
+                          0);
+        }
+
+        RoleNameVector& subordinatesOfVictim = _roleToSubordinates[victim];
+        for (RoleNameVector::const_iterator subordinateRole = subordinatesOfVictim.begin(),
+                 end = subordinatesOfVictim.end();
+             subordinateRole != end;
+             ++subordinateRole) {
+
+            RoleNameVector& membersOfSubordinate = _roleToMembers[*subordinateRole];
+            RoleNameVector::iterator toErase = std::find(
+                    membersOfSubordinate.begin(), membersOfSubordinate.end(), victim);
+            fassert(17173, toErase != membersOfSubordinate.end());
+            membersOfSubordinate.erase(toErase);
+        }
+        subordinatesOfVictim.clear();
+        return Status::OK();
     }
-} // namespace
 
     Status RoleGraph::addPrivilegeToRole(const RoleName& role, const Privilege& privilegeToAdd) {
         if (!roleExists(role)) {
@@ -207,10 +276,20 @@ namespace {
                                 " does not exist",
                           0);
         }
+        if (isBuiltinRole(role)) {
+            return Status(ErrorCodes::InvalidRoleModification,
+                          mongoutils::str::stream() << "Cannot grant privileges to built-in role: "
+                                  << role.getFullName(),
+                          0);
+        }
 
-        addPrivilegeToPrivilegeVector(_directPrivilegesForRole[role], privilegeToAdd);
+        _addPrivilegeToRoleNoChecks(role, privilegeToAdd);
         return Status::OK();
+    }
 
+    void RoleGraph::_addPrivilegeToRoleNoChecks(const RoleName& role,
+                                                const Privilege& privilegeToAdd) {
+        Privilege::addPrivilegeToPrivilegeVector(&_directPrivilegesForRole[role], privilegeToAdd);
     }
 
     // NOTE: Current runtime of this is O(n*m) where n is the size of the current PrivilegeVector
@@ -219,12 +298,22 @@ namespace {
     // could do this in O(n+m) instead.
     Status RoleGraph::addPrivilegesToRole(const RoleName& role,
                                           const PrivilegeVector& privilegesToAdd) {
+        if (!roleExists(role)) {
+            return Status(ErrorCodes::RoleNotFound,
+                          mongoutils::str::stream() << "Role: " << role.getFullName() <<
+                                " does not exist",
+                          0);
+        }
+        if (isBuiltinRole(role)) {
+            return Status(ErrorCodes::InvalidRoleModification,
+                          mongoutils::str::stream() << "Cannot grant privileges to built-in role: "
+                                  << role.getFullName(),
+                          0);
+        }
+
         for (PrivilegeVector::const_iterator it = privilegesToAdd.begin();
                 it != privilegesToAdd.end(); ++it) {
-            Status status = addPrivilegeToRole(role, *it);
-            if (!status.isOK()) {
-                return status;
-            }
+            _addPrivilegeToRoleNoChecks(role, *it);
         }
         return Status::OK();
     }
@@ -237,13 +326,19 @@ namespace {
                                 " does not exist",
                           0);
         }
+        if (isBuiltinRole(role)) {
+            return Status(
+                    ErrorCodes::InvalidRoleModification,
+                    mongoutils::str::stream() << "Cannot remove privileges from built-in role: " <<
+                            role.getFullName());
+        }
 
         PrivilegeVector& currentPrivileges = _directPrivilegesForRole[role];
         for (PrivilegeVector::iterator it = currentPrivileges.begin();
                 it != currentPrivileges.end(); ++it) {
 
             Privilege& curPrivilege = *it;
-            if (curPrivilege.getResource() == privilegeToRemove.getResource()) {
+            if (curPrivilege.getResourcePattern() == privilegeToRemove.getResourcePattern()) {
                 ActionSet curActions = curPrivilege.getActions();
 
                 if (!curActions.isSupersetOf(privilegeToRemove.getActions())) {
@@ -251,7 +346,8 @@ namespace {
                     return Status(ErrorCodes::PrivilegeNotFound,
                                   mongoutils::str::stream() << "Role: " << role.getFullName() <<
                                           " does not contain a privilege on " <<
-                                          privilegeToRemove.getResource() << " with actions: " <<
+                                          privilegeToRemove.getResourcePattern().toString() <<
+                                          " with actions: " <<
                                           privilegeToRemove.getActions().toString(),
                                   0);
                 }
@@ -265,18 +361,13 @@ namespace {
         }
         return Status(ErrorCodes::PrivilegeNotFound,
                       mongoutils::str::stream() << "Role: " << role.getFullName() << " does not "
-                             "contain any privileges on " << privilegeToRemove.getResource(),
+                      "contain any privileges on " <<
+                      privilegeToRemove.getResourcePattern().toString(),
                       0);
     }
 
     Status RoleGraph::removePrivilegesFromRole(const RoleName& role,
                                                const PrivilegeVector& privilegesToRemove) {
-        if (!roleExists(role)) {
-            return Status(ErrorCodes::RoleNotFound,
-                          mongoutils::str::stream() << "Role: " << role.getFullName() <<
-                                " does not exist",
-                          0);
-        }
         for (PrivilegeVector::const_iterator it = privilegesToRemove.begin();
                 it != privilegesToRemove.end(); ++it) {
             Status status = removePrivilegeFromRole(role, *it);
@@ -294,7 +385,34 @@ namespace {
                                 " does not exist",
                           0);
         }
+        if (isBuiltinRole(role)) {
+            return Status(
+                    ErrorCodes::InvalidRoleModification,
+                    mongoutils::str::stream() << "Cannot remove privileges from built-in role: " <<
+                            role.getFullName());
+        }
         _directPrivilegesForRole[role].clear();
+        return Status::OK();
+    }
+
+    Status RoleGraph::replaceRole(const RoleName& roleName,
+                                  const std::vector<RoleName>& roles,
+                                  const PrivilegeVector& privileges) {
+        Status status = removeAllPrivilegesFromRole(roleName);
+        if (status == ErrorCodes::RoleNotFound) {
+            fassert(17168, createRole(roleName));
+        }
+        else if (!status.isOK()) {
+            return status;
+        }
+        fassert(17169, removeAllRolesFromRole(roleName));
+        for (size_t i = 0; i < roles.size(); ++i) {
+            const RoleName& grantedRole = roles[i];
+            status = createRole(grantedRole);
+            fassert(17170, status.isOK() || status == ErrorCodes::DuplicateKey);
+            fassert(17171, addRoleToRole(roleName, grantedRole));
+        }
+        fassert(17172, addPrivilegesToRole(roleName, privileges));
         return Status::OK();
     }
 
@@ -363,17 +481,22 @@ namespace {
         // Need to clear out the "all privileges" vector for the current role, and re-fill it with
         // just the direct privileges for this role.
         PrivilegeVector& currentRoleAllPrivileges = _allPrivilegesForRole[currentRole];
-        const PrivilegeVector& currentRoleDirectPrivileges = _directPrivilegesForRole[currentRole];
-        currentRoleAllPrivileges.clear();
-        for (PrivilegeVector::const_iterator it = currentRoleDirectPrivileges.begin();
-                it != currentRoleDirectPrivileges.end(); ++it) {
-            currentRoleAllPrivileges.push_back(*it);
+        currentRoleAllPrivileges = _directPrivilegesForRole[currentRole];
+
+        // Need to do the same thing for the indirect roles
+        unordered_set<RoleName>& currentRoleIndirectRoles =
+                _roleToIndirectSubordinates[currentRole];
+        currentRoleIndirectRoles.clear();
+        const std::vector<RoleName>& currentRoleDirectRoles = _roleToSubordinates[currentRole];
+        for (std::vector<RoleName>::const_iterator it = currentRoleDirectRoles.begin();
+                it != currentRoleDirectRoles.end(); ++it) {
+            currentRoleIndirectRoles.insert(*it);
         }
 
-        // Recursively add children's privileges to current role's "all privileges" vector.
-        const unordered_set<RoleName>& children = _roleToSubordinates[currentRole];
-        for (unordered_set<RoleName>::const_iterator roleIt = children.begin();
-                roleIt != children.end(); ++roleIt) {
+        // Recursively add children's privileges to current role's "all privileges" vector, and
+        // children's roles to current roles's "indirect roles" vector.
+        for (std::vector<RoleName>::const_iterator roleIt = currentRoleDirectRoles.begin();
+                roleIt != currentRoleDirectRoles.end(); ++roleIt) {
             const RoleName& childRole = *roleIt;
             Status status = _recomputePrivilegeDataHelper(childRole, inProgressRoles, visitedRoles);
             if (status != Status::OK()) {
@@ -385,7 +508,15 @@ namespace {
             const PrivilegeVector& childsPrivileges = _allPrivilegesForRole[childRole];
             for (PrivilegeVector::const_iterator privIt = childsPrivileges.begin();
                     privIt != childsPrivileges.end(); ++privIt) {
-                addPrivilegeToPrivilegeVector(currentRoleAllPrivileges, *privIt);
+                Privilege::addPrivilegeToPrivilegeVector(&currentRoleAllPrivileges, *privIt);
+            }
+
+            // We also know that the "indirect roles" for the child is also correct, so we can add
+            // those roles to our "indirect roles" set.
+            const unordered_set<RoleName>& childsRoles = _roleToIndirectSubordinates[childRole];
+            for (unordered_set<RoleName>::const_iterator childsRoleIt = childsRoles.begin();
+                    childsRoleIt != childsRoles.end(); ++childsRoleIt) {
+                currentRoleIndirectRoles.insert(*childsRoleIt);
             }
         }
 

@@ -272,15 +272,18 @@
     <Filter Include="db\commands\write_commands">
       <UniqueIdentifier>{a0b1d842-53f5-424c-adce-12b7adaf09b4}</UniqueIdentifier>
     </Filter>
+    <Filter Include="db\query">
+      <UniqueIdentifier>{14071ec9-1e78-4463-bfee-593ddf265829}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="db\structure">
+      <UniqueIdentifier>{b01a07d0-5c5f-4f00-965e-a238453ffb45}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\client\connpool.h">
       <Filter>client</Filter>
     </ClInclude>
     <ClInclude Include="..\client\dbclient.h">
-      <Filter>client</Filter>
-    </ClInclude>
-    <ClInclude Include="..\client\model.h">
       <Filter>client</Filter>
     </ClInclude>
     <ClInclude Include="..\util\concurrency\list.h">
@@ -424,9 +427,6 @@
     <ClInclude Include="..\db\cmdline.h">
       <Filter>db\Header Files\a to d</Filter>
     </ClInclude>
-    <ClInclude Include="..\db\collection.h">
-      <Filter>db\Header Files\a to d</Filter>
-    </ClInclude>
     <ClInclude Include="..\db\commands.h">
       <Filter>db\Header Files\a to d</Filter>
     </ClInclude>
@@ -443,9 +443,6 @@
       <Filter>db\Header Files\a to d</Filter>
     </ClInclude>
     <ClInclude Include="..\db\database.h">
-      <Filter>db\Header Files\a to d</Filter>
-    </ClInclude>
-    <ClInclude Include="..\db\databaseholder.h">
       <Filter>db\Header Files\a to d</Filter>
     </ClInclude>
     <ClInclude Include="..\db\db.h">
@@ -523,9 +520,6 @@
     <ClInclude Include="..\db\ops\update.h">
       <Filter>db\ops</Filter>
     </ClInclude>
-    <ClInclude Include="..\db\collection.h">
-      <Filter>db\Header Files\a to d</Filter>
-    </ClInclude>
     <ClInclude Include="..\db\jsobjmanipulator.h">
       <Filter>db\Header Files\e to n</Filter>
     </ClInclude>
@@ -543,9 +537,6 @@
     </ClInclude>
     <ClInclude Include="..\db\dur_journal.h">
       <Filter>db\Header Files\a to d</Filter>
-    </ClInclude>
-    <ClInclude Include="..\db\mongommf.h">
-      <Filter>db\Header Files\e to n</Filter>
     </ClInclude>
     <ClInclude Include="..\util\logfile.h">
       <Filter>util\Header Files</Filter>
@@ -684,9 +675,6 @@
     </ClInclude>
     <ClInclude Include="..\platform\unordered_set.h">
       <Filter>platform</Filter>
-    </ClInclude>
-    <ClInclude Include="..\base\configuration_variable_manager.h">
-      <Filter>base</Filter>
     </ClInclude>
     <ClInclude Include="..\base\disallow_copying.h">
       <Filter>base</Filter>
@@ -983,9 +971,6 @@
       <Filter>util\Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\util\stringutils.h">
-      <Filter>util\Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="..\util\systeminfo.h">
       <Filter>util\Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\util\text.h">
@@ -2180,9 +2165,6 @@
     <ClInclude Include="..\db\repl\oplogreader.h">
       <Filter>db\repl</Filter>
     </ClInclude>
-    <ClInclude Include="..\db\repl\optime.h">
-      <Filter>db\repl</Filter>
-    </ClInclude>
     <ClInclude Include="..\db\repl\repl_reads_ok.h">
       <Filter>db\repl</Filter>
     </ClInclude>
@@ -2349,9 +2331,6 @@
       <Filter>db\Header Files\o to z</Filter>
     </ClInclude>
     <ClInclude Include="..\db\queryutil-inl.h">
-      <Filter>db\Header Files\o to z</Filter>
-    </ClInclude>
-    <ClInclude Include="..\db\record.h">
       <Filter>db\Header Files\o to z</Filter>
     </ClInclude>
     <ClInclude Include="..\db\restapi.h">
@@ -2691,9 +2670,6 @@
     <ClInclude Include="..\db\exec\plan_stage.h">
       <Filter>db\exec</Filter>
     </ClInclude>
-    <ClInclude Include="..\db\exec\simple_plan_runner.h">
-      <Filter>db\exec</Filter>
-    </ClInclude>
     <ClInclude Include="..\db\exec\skip.h">
       <Filter>db\exec</Filter>
     </ClInclude>
@@ -2752,6 +2728,90 @@
       <Filter>db\exec</Filter>
     </ClInclude>
     <ClInclude Include="..\db\exec\collection_scan_common.h">
+      <Filter>db\exec</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\database_holder.h">
+      <Filter>db\Header Files\a to d</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\storage\data_file.h">
+      <Filter>db\storage</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\storage\durable_mapped_file.h">
+      <Filter>db\storage</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\storage\extent.h">
+      <Filter>db\storage</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\storage\extent_manager.h">
+      <Filter>db\storage</Filter>
+    </ClInclude>
+    <ClInclude Include="..\bson\optime.h">
+      <Filter>bson</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\exec\merge_sort.h">
+      <Filter>db\exec</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\exec\sort.h">
+      <Filter>db\exec</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\ops\log_builder.h">
+      <Filter>db\ops</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\repl\sync_source_feedback.h">
+      <Filter>db\repl</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\exec\plan_stats.h">
+      <Filter>db\exec</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\multi_plan_runner.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\plan_ranker.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\query_solution.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\stage_types.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\auth\user_set.h">
+      <Filter>db\auth</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\cached_plan_runner.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\canonical_query.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\new_find.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\plan_cache.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\query_planner.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\runner.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\simple_plan_runner.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\stage_builder.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\query\index_bounds.h">
+      <Filter>db\query</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\structure\collection.h">
+      <Filter>db\structure</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\storage\record.h">
+      <Filter>db\storage</Filter>
+    </ClInclude>
+    <ClInclude Include="..\db\exec\filter.h">
       <Filter>db\exec</Filter>
     </ClInclude>
   </ItemGroup>
@@ -3162,9 +3222,6 @@
     <ClCompile Include="..\db\queryutil.cpp">
       <Filter>db\Source Files\o to z</Filter>
     </ClCompile>
-    <ClCompile Include="..\db\record.cpp">
-      <Filter>db\Source Files\o to z</Filter>
-    </ClCompile>
     <ClCompile Include="..\db\restapi.cpp">
       <Filter>db\Source Files\o to z</Filter>
     </ClCompile>
@@ -3294,9 +3351,6 @@
     <ClCompile Include="..\db\dur_preplogbuffer.cpp">
       <Filter>db\Source Files\a to d</Filter>
     </ClCompile>
-    <ClCompile Include="..\db\mongommf.cpp">
-      <Filter>db\Source Files\e to n</Filter>
-    </ClCompile>
     <ClCompile Include="..\util\logfile.cpp">
       <Filter>util\Source Files</Filter>
     </ClCompile>
@@ -3335,9 +3389,6 @@
     </ClCompile>
     <ClCompile Include="..\db\repl\manager.cpp">
       <Filter>db\repl</Filter>
-    </ClCompile>
-    <ClCompile Include="..\client\model.cpp">
-      <Filter>client</Filter>
     </ClCompile>
     <ClCompile Include="..\util\net\listen.cpp">
       <Filter>util\net</Filter>
@@ -3432,9 +3483,6 @@
     <ClCompile Include="..\util\histogram.cpp">
       <Filter>util\Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="jsobjhashingtests.cpp">
-      <Filter>dbtests</Filter>
-    </ClCompile>
     <ClCompile Include="..\db\hasher.cpp">
       <Filter>db\Source Files\e to n</Filter>
     </ClCompile>
@@ -3455,9 +3503,6 @@
     </ClCompile>
     <ClCompile Include="..\util\safe_num.cpp">
       <Filter>util\Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="..\base\configuration_variable_manager.cpp">
-      <Filter>base</Filter>
     </ClCompile>
     <ClCompile Include="..\base\global_initializer.cpp">
       <Filter>base</Filter>
@@ -3645,9 +3690,6 @@
     <ClCompile Include="stacktests.cpp">
       <Filter>dbtests</Filter>
     </ClCompile>
-    <ClCompile Include="..\db\pipeline\accumulator.cpp">
-      <Filter>db\pipeline\Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="..\db\pipeline\accumulator_add_to_set.cpp">
       <Filter>db\pipeline\Source Files</Filter>
     </ClCompile>
@@ -3755,9 +3797,6 @@
     </ClCompile>
     <ClCompile Include="..\db\interrupt_status_mongod.cpp">
       <Filter>db\Source Files\e to n</Filter>
-    </ClCompile>
-    <ClCompile Include="..\util\systeminfo_win32.cpp">
-      <Filter>util\Source Files</Filter>
     </ClCompile>
     <ClCompile Include="..\base\string_data.cpp">
       <Filter>base</Filter>
@@ -4681,9 +4720,6 @@
     <ClCompile Include="..\db\repl\oplogreader.cpp">
       <Filter>db\repl</Filter>
     </ClCompile>
-    <ClCompile Include="..\db\repl\optime.cpp">
-      <Filter>db\repl</Filter>
-    </ClCompile>
     <ClCompile Include="..\db\repl\repl_reads_ok.cpp">
       <Filter>db\repl</Filter>
     </ClCompile>
@@ -4908,9 +4944,6 @@
     </ClCompile>
     <ClCompile Include="..\db\auth\privilege_set_test.cpp">
       <Filter>db\auth</Filter>
-    </ClCompile>
-    <ClCompile Include="..\base\configuration_variable_manager_test.cpp">
-      <Filter>base</Filter>
     </ClCompile>
     <ClCompile Include="..\base\counter_test.cpp">
       <Filter>base</Filter>
@@ -5302,6 +5335,87 @@
     <ClCompile Include="query_stage_collscan.cpp">
       <Filter>dbtests</Filter>
     </ClCompile>
+    <ClCompile Include="..\db\database_holder.cpp">
+      <Filter>db\Source Files\a to d</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\storage\data_file.cpp">
+      <Filter>db\storage</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\storage\durable_mapped_file.cpp">
+      <Filter>db\storage</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\storage\extent.cpp">
+      <Filter>db\storage</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\storage\extent_manager.cpp">
+      <Filter>db\storage</Filter>
+    </ClCompile>
+    <ClCompile Include="..\bson\optime.cpp">
+      <Filter>bson</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\exec\merge_sort.cpp">
+      <Filter>db\exec</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\exec\sort.cpp">
+      <Filter>db\exec</Filter>
+    </ClCompile>
+    <ClCompile Include="query_stage_merge_sort.cpp">
+      <Filter>dbtests</Filter>
+    </ClCompile>
+    <ClCompile Include="query_stage_sort.cpp">
+      <Filter>dbtests</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\ops\log_builder.cpp">
+      <Filter>db\ops</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\ops\log_builder_test.cpp">
+      <Filter>db\ops</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\repl\sync_source_feedback.cpp">
+      <Filter>db\repl</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\query\multi_plan_runner.cpp">
+      <Filter>db\query</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\query\plan_ranker.cpp">
+      <Filter>db\query</Filter>
+    </ClCompile>
+    <ClCompile Include="query_multi_plan_runner.cpp">
+      <Filter>dbtests</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\auth\user_set.cpp">
+      <Filter>db\auth</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\auth\user_set_test.cpp">
+      <Filter>db\auth</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\query\new_find.cpp">
+      <Filter>db\query</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\query\index_bounds.cpp">
+      <Filter>db\query</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\query\index_bounds_test.cpp">
+      <Filter>db\query</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\storage\record.cpp">
+      <Filter>db\storage</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\query\canonical_query.cpp">
+      <Filter>db\query</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\query\query_planner.cpp">
+      <Filter>db\query</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\query\stage_builder.cpp">
+      <Filter>db\query</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\commands\cleanup_orphaned_cmd.cpp">
+      <Filter>db\commands</Filter>
+    </ClCompile>
+    <ClCompile Include="..\db\pipeline\document_source_merge_cursors.cpp">
+      <Filter>db\pipeline\Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <None Include="btreetests.inl">
@@ -5510,6 +5624,9 @@
     </None>
     <None Include="..\db\SConscript">
       <Filter>db</Filter>
+    </None>
+    <None Include="..\db\query\SConscript">
+      <Filter>db\query</Filter>
     </None>
   </ItemGroup>
 </Project>

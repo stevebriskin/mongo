@@ -12,6 +12,18 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
 #pragma once
@@ -22,18 +34,14 @@
 #include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/value.h"
 #include "mongo/util/intrusive_counter.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
     class BSONArrayBuilder;
     class BSONElement;
     class BSONObjBuilder;
-    class Builder;
-    class Document;
-    class MutableDocument;
     class DocumentSource;
-    class ExpressionContext;
-    class Value;
 
     // TODO: Look into merging with ExpressionContext and possibly ObjectCtx.
     /// The state used as input to Expressions
@@ -81,16 +89,17 @@ namespace mongo {
         virtual intrusive_ptr<Expression> optimize() = 0;
 
         /**
-           Add this expression's field dependencies to the set
-
-           Expressions are trees, so this is often recursive.
-
-           @param deps output parameter
-           @param path path to self if all ancestors are ExpressionObjects.
-                       Top-level ExpressionObject gets pointer to empty vector.
-                       If any other Expression is an ancestor, or in other cases
-                       where {a:1} inclusion objects aren't allowed, they get
-                       NULL.
+         * Add this expression's field dependencies to the set
+         *
+         * Expressions are trees, so this is often recursive.
+         *
+         * @param deps Fully qualified paths to depended-on fields are added to this set.
+         *             Empty string means need full document.
+         * @param path path to self if all ancestors are ExpressionObjects.
+         *             Top-level ExpressionObject gets pointer to empty vector.
+         *             If any other Expression is an ancestor, or in other cases
+         *             where {a:1} inclusion objects aren't allowed, they get
+         *             NULL.
          */
         virtual void addDependencies(set<string>& deps, vector<string>* path=NULL) const = 0;
 
@@ -103,26 +112,6 @@ namespace mongo {
          * parsable by parseOperand().
          */
         virtual Value serialize() const = 0;
-
-        /*
-          Convert the expression into a BSONObj that corresponds to the
-          db.collection.find() predicate language.  This is intended for
-          use by DocumentSourceFilter.
-
-          This is more limited than the full expression language supported
-          by all available expressions in a DocumentSource processing
-          pipeline, and will fail with an assertion if an attempt is made
-          to go outside the bounds of the recognized patterns, which don't
-          include full computed expressions.  There are other methods available
-          on DocumentSourceFilter which can be used to analyze a filter
-          predicate and break it up into appropriate expressions which can
-          be translated within these constraints.  As a result, the default
-          implementation is to fail with an assertion; only a subset of
-          operators will be able to fulfill this request.
-
-          @param pBuilder the builder to add the expression to.
-         */
-        virtual void toMatcherBson(BSONObjBuilder *pBuilder) const;
 
         /// Evaluate expression with specified inputs and return result.
         Value evaluate(const Document& root) const { return evaluate(Variables(root)); }
@@ -153,36 +142,29 @@ namespace mongo {
         };
 
         /*
-          Parse a BSONElement Object.  The object could represent a functional
+          Parse BSON Object.  The object could represent a functional
           expression or a Document expression.
 
-          @param pBsonElement the element representing the object
+          @param obj the object to parse
           @param pCtx a MiniCtx representing the options above
           @returns the parsed Expression
          */
-        static intrusive_ptr<Expression> parseObject(
-            BSONElement *pBsonElement, ObjectCtx *pCtx);
+        static intrusive_ptr<Expression> parseObject(BSONObj obj, ObjectCtx *pCtx);
 
         /*
           Parse a BSONElement Object which has already been determined to be
           functional expression.
-
-          @param pOpName the name of the (prefix) operator
-          @param pBsonElement the BSONElement to parse
-          @returns the parsed Expression
         */
-        static intrusive_ptr<Expression> parseExpression(
-            const char *pOpName, BSONElement *pBsonElement);
+        static intrusive_ptr<Expression> parseExpression(BSONElement exprElement);
 
 
         /*
           Parse a BSONElement which is an operand in an Expression.
 
-          @param pBsonElement the expected operand's BSONElement
+          @param exprElement the expected operand's BSONElement
           @returns the parsed operand, as an Expression
          */
-        static intrusive_ptr<Expression> parseOperand(
-            BSONElement *pBsonElement);
+        static intrusive_ptr<Expression> parseOperand(BSONElement exprElement);
 
         /*
           Produce a field path string with the field prefix removed.
@@ -225,6 +207,7 @@ namespace mongo {
     };
 
 
+    /// Inherit from ExpressionVariadic or ExpressionFixedArity instead of directly from this class.
     class ExpressionNary :
         public Expression {
     public:
@@ -240,23 +223,8 @@ namespace mongo {
         */
         virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
 
-        /*
-          Return a factory function that will make Expression nodes of
-          the same type as this.  This will be used to create constant
-          expressions for constant folding for optimize().  Only return
-          a factory function if this operator is both associative and
-          commutative.  The default implementation returns NULL; optimize()
-          will recognize that and stop.
-
-          Note that ExpressionNary::optimize() promises that if it uses this
-          to fold constants, then if optimize() returns an ExpressionNary,
-          any remaining constant will be the last one in vpOperand.  Derived
-          classes may take advantage of this to do further optimizations in
-          their optimize().
-
-          @returns pointer to a factory function or NULL
-         */
-        virtual intrusive_ptr<ExpressionNary> (*getFactory() const)();
+        // TODO split this into two functions
+        virtual bool isAssociativeAndCommutative() const { return false; }
 
         /*
           Get the name of the operator.
@@ -267,92 +235,87 @@ namespace mongo {
         */
         virtual const char *getOpName() const = 0;
 
+        /// Allow subclasses the opportunity to validate arguments at parse time.
+        virtual void validateArguments(const ExpressionVector& args) const {}
+
+        static ExpressionVector parseArguments(BSONElement bsonExpr);
+
     protected:
-        ExpressionNary();
+        ExpressionNary() {}
 
         ExpressionVector vpOperand;
+    };
 
-        /*
-          Checks the current size of vpOperand; if the size equal to or
-          greater than maxArgs, fires a user assertion indicating that this
-          operator cannot have this many arguments.
+    /// Inherit from ExpressionVariadic or ExpressionFixedArity instead of directly from this class.
+    template <typename SubClass>
+    class ExpressionNaryBase : public ExpressionNary {
+    public:
+        static intrusive_ptr<Expression> parse(BSONElement bsonExpr) {
+            intrusive_ptr<ExpressionNaryBase> expr = new SubClass();
+            ExpressionVector args = parseArguments(bsonExpr);
+            expr->validateArguments(args);
+            expr->vpOperand = args;
+            return expr;
+        }
+    };
 
-          The equal is there because this is intended to be used in
-          addOperand() to check for the limit *before* adding the requested
-          argument.
+    /// Inherit from this class if your expression takes a variable number of arguments.
+    template <typename SubClass>
+    class ExpressionVariadic : public ExpressionNaryBase<SubClass> {
+    };
 
-          @param maxArgs the maximum number of arguments the operator accepts
-        */
-        void checkArgLimit(unsigned maxArgs) const;
-
-        /*
-          Checks the current size of vpOperand; if the size is not equal to
-          reqArgs, fires a user assertion indicating that this must have
-          exactly reqArgs arguments.
-
-          This is meant to be used in evaluateInternal(), *before* the evaluation
-          takes place.
-
-          @param reqArgs the number of arguments this operator requires
-        */
-        void checkArgCount(unsigned reqArgs) const;
+    /// Inherit from this class if your expression takes a fixed number of arguments.
+    template <typename SubClass, int NArgs>
+    class ExpressionFixedArity : public ExpressionNaryBase<SubClass> {
+    public:
+        virtual void validateArguments(const Expression::ExpressionVector& args) const {
+            uassert(16020, mongoutils::str::stream()
+                        << "Expression " << this->getOpName() << " takes exactly " << NArgs
+                        << " arguments. " << args.size() << " were passed in.",
+                    args.size() == NArgs);
+                    
+        }
     };
 
 
-    class ExpressionAdd :
-        public ExpressionNary {
+    class ExpressionAdd : public ExpressionVariadic<ExpressionAdd> {
     public:
         // virtuals from Expression
-        virtual ~ExpressionAdd();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-
-        // virtuals from ExpressionNary
-        virtual intrusive_ptr<ExpressionNary> (*getFactory() const)();
-
-        /*
-          Create an expression that finds the sum of n operands.
-
-          @returns addition expression
-         */
-        static intrusive_ptr<ExpressionNary> create();
+        virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
 
-    class ExpressionAnd :
-        public ExpressionNary {
+    class ExpressionAllElementsTrue : public ExpressionFixedArity<ExpressionAllElementsTrue, 1> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(const Variables& vars) const;
+        virtual const char *getOpName() const;
+    };
+
+
+    class ExpressionAnd : public ExpressionVariadic<ExpressionAnd> {
     public:
         // virtuals from Expression
-        virtual ~ExpressionAnd();
         virtual intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void toMatcherBson(BSONObjBuilder *pBuilder) const;
-
-        // virtuals from ExpressionNary
-        virtual intrusive_ptr<ExpressionNary> (*getFactory() const)();
-
-        /*
-          Create an expression that finds the conjunction of n operands.
-          The conjunction uses short-circuit logic; the expressions are
-          evaluated in the order they were added to the conjunction, and
-          the evaluation stops and returns false on the first operand that
-          evaluates to false.
-
-          @returns conjunction expression
-         */
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionAnd();
+        virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
 
-    class ExpressionCoerceToBool :
-        public Expression {
+    class ExpressionAnyElementTrue : public ExpressionFixedArity<ExpressionAnyElementTrue, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionCoerceToBool();
+        virtual Value evaluateInternal(const Variables& vars) const;
+        virtual const char *getOpName() const;
+    };
+
+
+    class ExpressionCoerceToBool : public Expression {
+    public:
+        // virtuals from ExpressionNary
         virtual intrusive_ptr<Expression> optimize();
         virtual void addDependencies(set<string>& deps, vector<string>* path=NULL) const;
         virtual Value evaluateInternal(const Variables& vars) const;
@@ -361,6 +324,7 @@ namespace mongo {
         static intrusive_ptr<ExpressionCoerceToBool> create(
             const intrusive_ptr<Expression> &pExpression);
 
+
     private:
         ExpressionCoerceToBool(const intrusive_ptr<Expression> &pExpression);
 
@@ -368,79 +332,50 @@ namespace mongo {
     };
 
 
-    class ExpressionCompare :
-        public ExpressionNary {
+    class ExpressionCompare : public ExpressionFixedArity<ExpressionCompare, 2> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionCompare();
-        virtual intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
 
-        /*
-          Shorthands for creating various comparisons expressions.
-          Provide for conformance with the uniform function pointer signature
-          required for parsing.
+        static intrusive_ptr<Expression> parse(BSONElement bsonExpr);
 
-          These create a particular comparison operand, without any
-          operands.  Those must be added via ExpressionNary::addOperand().
-        */
-        static intrusive_ptr<ExpressionNary> createCmp();
-        static intrusive_ptr<ExpressionNary> createEq();
-        static intrusive_ptr<ExpressionNary> createNe();
-        static intrusive_ptr<ExpressionNary> createGt();
-        static intrusive_ptr<ExpressionNary> createGte();
-        static intrusive_ptr<ExpressionNary> createLt();
-        static intrusive_ptr<ExpressionNary> createLte();
-
-    private:
-        friend class ExpressionFieldRange;
         ExpressionCompare(CmpOp cmpOp);
 
+    private:
         CmpOp cmpOp;
     };
 
 
-    class ExpressionConcat : public ExpressionNary {
+    class ExpressionConcat : public ExpressionVariadic<ExpressionConcat> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionConcat();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-
-        static intrusive_ptr<ExpressionNary> create();
     };
 
 
-    class ExpressionCond : public ExpressionNary {
+    class ExpressionCond : public ExpressionFixedArity<ExpressionCond, 3> {
+        typedef ExpressionFixedArity<ExpressionCond, 3> Base;
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionCond();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
 
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionCond();
+        static intrusive_ptr<Expression> parse(BSONElement expr);
     };
 
 
-    class ExpressionConstant :
-        public Expression {
+    class ExpressionConstant : public Expression {
     public:
         // virtuals from Expression
-        virtual ~ExpressionConstant();
         virtual intrusive_ptr<Expression> optimize();
         virtual void addDependencies(set<string>& deps, vector<string>* path=NULL) const;
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
         virtual Value serialize() const;
 
-        static intrusive_ptr<ExpressionConstant> createFromBsonElement(
-            BSONElement *pBsonElement);
+        static intrusive_ptr<Expression> parse(BSONElement bsonExpr);
         static intrusive_ptr<ExpressionConstant> create(const Value& pValue);
 
         /*
@@ -451,82 +386,47 @@ namespace mongo {
         Value getValue() const;
 
     private:
-        ExpressionConstant(BSONElement *pBsonElement);
         ExpressionConstant(const Value& pValue);
 
         Value pValue;
     };
 
 
-    class ExpressionDayOfMonth :
-        public ExpressionNary {
+    class ExpressionDayOfMonth : public ExpressionFixedArity<ExpressionDayOfMonth, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionDayOfMonth();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionDayOfMonth();
     };
 
 
-    class ExpressionDayOfWeek :
-        public ExpressionNary {
+    class ExpressionDayOfWeek : public ExpressionFixedArity<ExpressionDayOfWeek, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionDayOfWeek();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionDayOfWeek();
     };
 
 
-    class ExpressionDayOfYear :
-        public ExpressionNary {
+    class ExpressionDayOfYear : public ExpressionFixedArity<ExpressionDayOfYear, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionDayOfYear();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionDayOfYear();
     };
 
 
-    class ExpressionDivide :
-        public ExpressionNary {
+    class ExpressionDivide : public ExpressionFixedArity<ExpressionDivide, 2> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionDivide();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionDivide();
     };
 
 
-    class ExpressionFieldPath :
-        public Expression {
+    class ExpressionFieldPath : public Expression {
     public:
         // virtuals from Expression
-        virtual ~ExpressionFieldPath();
         virtual intrusive_ptr<Expression> optimize();
         virtual void addDependencies(set<string>& deps, vector<string>* path=NULL) const;
         virtual Value evaluateInternal(const Variables& vars) const;
@@ -585,126 +485,31 @@ namespace mongo {
     };
 
 
-    class ExpressionFieldRange :
-        public Expression {
+    class ExpressionHour : public ExpressionFixedArity<ExpressionHour, 1> {
     public:
-        // virtuals from expression
-        virtual ~ExpressionFieldRange();
-        virtual intrusive_ptr<Expression> optimize();
-        virtual void addDependencies(set<string>& deps, vector<string>* path=NULL) const;
+        // virtuals from ExpressionNary
         virtual Value evaluateInternal(const Variables& vars) const;
-        virtual Value serialize() const;
-        virtual void toMatcherBson(BSONObjBuilder *pBuilder) const;
-
-        /*
-          Create a field range expression.
-
-          Field ranges are meant to match up with classic Matcher semantics,
-          and therefore are conjunctions.  For example, these appear in
-          mongo shell predicates in one of these forms:
-          { a : C } -> (a == C) // degenerate "point" range
-          { a : { $lt : C } } -> (a < C) // open range
-          { a : { $gt : C1, $lte : C2 } } -> ((a > C1) && (a <= C2)) // closed
-
-          When initially created, a field range only includes one end of
-          the range.  Additional points may be added via intersect().
-
-          Note that NE and CMP are not supported.
-
-          @param pFieldPath the field path for extracting the field value
-          @param cmpOp the comparison operator
-          @param pValue the value to compare against
-          @returns the newly created field range expression
-         */
-        static intrusive_ptr<ExpressionFieldRange> create(
-            const intrusive_ptr<ExpressionFieldPath> &pFieldPath,
-            CmpOp cmpOp, const Value& pValue);
-
-        /*
-          Add an intersecting range.
-
-          This can be done any number of times after creation.  The
-          range is internally optimized for each new addition.  If the new
-          intersection extends or reduces the values within the range, the
-          internal representation is adjusted to reflect that.
-
-          Note that NE and CMP are not supported.
-
-          @param cmpOp the comparison operator
-          @param pValue the value to compare against
-         */
-        void intersect(CmpOp cmpOp, const Value& pValue);
-
-    private:
-        ExpressionFieldRange(const intrusive_ptr<ExpressionFieldPath> &pFieldPath,
-                             CmpOp cmpOp,
-                             const Value& pValue);
-
-        intrusive_ptr<ExpressionFieldPath> pFieldPath;
-
-        class Range {
-        public:
-            Range(CmpOp cmpOp, const Value& pValue);
-            Range(const Range &rRange);
-
-            Range *intersect(const Range *pRange) const;
-            bool contains(const Value& pValue) const;
-
-            Range(const Value& pBottom, bool bottomOpen,
-                  const Value& pTop, bool topOpen);
-
-            bool bottomOpen;
-            bool topOpen;
-            Value pBottom;
-            Value pTop;
-        };
-
-        scoped_ptr<Range> pRange;
+        virtual const char *getOpName() const;
     };
 
 
-    class ExpressionHour :
-        public ExpressionNary {
+    class ExpressionIfNull : public ExpressionFixedArity<ExpressionIfNull, 2> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionHour();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionHour();
-    };
-
-
-    class ExpressionIfNull :
-        public ExpressionNary {
-    public:
-        // virtuals from ExpressionNary
-        virtual ~ExpressionIfNull();
-        virtual Value evaluateInternal(const Variables& vars) const;
-        virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionIfNull();
     };
 
 
     class ExpressionLet : public Expression {
     public:
         // virtuals from Expression
-        virtual ~ExpressionLet();
         virtual intrusive_ptr<Expression> optimize();
         virtual Value serialize() const;
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual void addDependencies(set<string>& deps, vector<string>* path=NULL) const;
 
-        static intrusive_ptr<ExpressionLet> parse(BSONElement expr);
+        static intrusive_ptr<Expression> parse(BSONElement expr);
 
         typedef map<string, intrusive_ptr<Expression> > VariableMap;
 
@@ -718,13 +523,12 @@ namespace mongo {
     class ExpressionMap : public Expression {
     public:
         // virtuals from Expression
-        virtual ~ExpressionMap();
         virtual intrusive_ptr<Expression> optimize();
         virtual Value serialize() const;
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual void addDependencies(set<string>& deps, vector<string>* path=NULL) const;
 
-        static intrusive_ptr<ExpressionMap> parse(BSONElement expr);
+        static intrusive_ptr<Expression> parse(BSONElement expr);
 
     private:
         ExpressionMap(const string& varName, // name of variable to set
@@ -736,114 +540,58 @@ namespace mongo {
         intrusive_ptr<Expression> _each;
     };
 
-    class ExpressionMillisecond :
-        public ExpressionNary {
+    class ExpressionMillisecond : public ExpressionFixedArity<ExpressionMillisecond, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionMillisecond();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char* getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression>& pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionMillisecond();
     };
 
 
-    class ExpressionMinute :
-        public ExpressionNary {
+    class ExpressionMinute : public ExpressionFixedArity<ExpressionMinute, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionMinute();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionMinute();
     };
 
 
-    class ExpressionMod :
-        public ExpressionNary {
+    class ExpressionMod : public ExpressionFixedArity<ExpressionMod, 2> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionMod();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionMod();
     };
     
 
-    class ExpressionMultiply :
-        public ExpressionNary {
+    class ExpressionMultiply : public ExpressionVariadic<ExpressionMultiply> {
     public:
         // virtuals from Expression
-        virtual ~ExpressionMultiply();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-
-        // virtuals from ExpressionNary
-        virtual intrusive_ptr<ExpressionNary> (*getFactory() const)();
-
-        /*
-          Create an expression that finds the product of n operands.
-
-          @returns multiplication expression
-         */
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionMultiply();
+        virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
 
-    class ExpressionMonth :
-        public ExpressionNary {
+    class ExpressionMonth : public ExpressionFixedArity<ExpressionMonth, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionMonth();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionMonth();
     };
 
 
-    class ExpressionNot :
-        public ExpressionNary {
+    class ExpressionNot : public ExpressionFixedArity<ExpressionNot, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionNot();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionNot();
     };
 
 
-    class ExpressionObject :
-        public Expression {
+    class ExpressionObject : public Expression {
     public:
         // virtuals from Expression
-        virtual ~ExpressionObject();
         virtual intrusive_ptr<Expression> optimize();
         virtual bool isSimple();
         virtual void addDependencies(set<string>& deps, vector<string>* path=NULL) const;
@@ -951,160 +699,129 @@ namespace mongo {
     };
 
 
-    class ExpressionOr :
-        public ExpressionNary {
+    class ExpressionOr : public ExpressionVariadic<ExpressionOr> {
     public:
         // virtuals from Expression
-        virtual ~ExpressionOr();
         virtual intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void toMatcherBson(BSONObjBuilder *pBuilder) const;
-
-        // virtuals from ExpressionNary
-        virtual intrusive_ptr<ExpressionNary> (*getFactory() const)();
-
-        /*
-          Create an expression that finds the conjunction of n operands.
-          The conjunction uses short-circuit logic; the expressions are
-          evaluated in the order they were added to the conjunction, and
-          the evaluation stops and returns false on the first operand that
-          evaluates to false.
-
-          @returns conjunction expression
-         */
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionOr();
+        virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
 
-    class ExpressionSecond :
-        public ExpressionNary {
+    class ExpressionSecond : public ExpressionFixedArity<ExpressionSecond, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionSecond();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionSecond();
     };
 
 
-    class ExpressionStrcasecmp :
-        public ExpressionNary {
+    class ExpressionSetDifference : public ExpressionFixedArity<ExpressionSetDifference, 2> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionStrcasecmp();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionStrcasecmp();
     };
 
 
-    class ExpressionSubstr :
-        public ExpressionNary {
+    class ExpressionSetEquals : public ExpressionVariadic<ExpressionSetEquals> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionSubstr();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionSubstr();
+        virtual void validateArguments(const ExpressionVector& args) const;
     };
 
 
-    class ExpressionSubtract :
-        public ExpressionNary {
+    class ExpressionSetIntersection : public ExpressionVariadic<ExpressionSetIntersection> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionSubtract();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionSubtract();
+        virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
 
-    class ExpressionToLower :
-        public ExpressionNary {
+    class ExpressionSetIsSubset : public ExpressionFixedArity<ExpressionSetIsSubset, 2> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionToLower();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionToLower();
     };
 
 
-    class ExpressionToUpper :
-        public ExpressionNary {
+    class ExpressionSetUnion : public ExpressionVariadic<ExpressionSetUnion> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionToUpper();
+        // virtual intrusive_ptr<Expression> optimize();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionToUpper();
+        virtual bool isAssociativeAndCommutative() const { return true; }
     };
 
 
-    class ExpressionWeek :
-        public ExpressionNary {
+    class ExpressionSize : public ExpressionFixedArity<ExpressionSize, 1> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionWeek();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
-
-        static intrusive_ptr<ExpressionNary> create();
-
-    private:
-        ExpressionWeek();
     };
 
 
-    class ExpressionYear :
-        public ExpressionNary {
+    class ExpressionStrcasecmp : public ExpressionFixedArity<ExpressionStrcasecmp, 2> {
     public:
         // virtuals from ExpressionNary
-        virtual ~ExpressionYear();
         virtual Value evaluateInternal(const Variables& vars) const;
         virtual const char *getOpName() const;
-        virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
+    };
 
-        static intrusive_ptr<ExpressionNary> create();
 
-    private:
-        ExpressionYear();
+    class ExpressionSubstr : public ExpressionFixedArity<ExpressionSubstr, 3> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(const Variables& vars) const;
+        virtual const char *getOpName() const;
+    };
+
+
+    class ExpressionSubtract : public ExpressionFixedArity<ExpressionSubtract, 2> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(const Variables& vars) const;
+        virtual const char *getOpName() const;
+    };
+
+
+    class ExpressionToLower : public ExpressionFixedArity<ExpressionToLower, 1> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(const Variables& vars) const;
+        virtual const char *getOpName() const;
+    };
+
+
+    class ExpressionToUpper : public ExpressionFixedArity<ExpressionToUpper, 1> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(const Variables& vars) const;
+        virtual const char *getOpName() const;
+    };
+
+
+    class ExpressionWeek : public ExpressionFixedArity<ExpressionWeek, 1> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(const Variables& vars) const;
+        virtual const char *getOpName() const;
+    };
+
+
+    class ExpressionYear : public ExpressionFixedArity<ExpressionYear, 1> {
+    public:
+        // virtuals from ExpressionNary
+        virtual Value evaluateInternal(const Variables& vars) const;
+        virtual const char *getOpName() const;
     };
 }
 

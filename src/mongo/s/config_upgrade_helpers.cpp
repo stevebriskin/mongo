@@ -12,18 +12,35 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include "mongo/s/config_upgrade_helpers.h"
 
 #include "mongo/client/connpool.h"
+#include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/cluster_client_internal.h"
+#include "mongo/s/type_config_version.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
 
     using mongoutils::str::stream;
+
+    // Custom field used in upgrade state to determine if/where we failed on last upgrade
+    const BSONField<bool> inCriticalSectionField("inCriticalSection", false);
 
     Status checkIdsTheSame(const ConnectionString& configLoc, const string& nsA, const string& nsB)
     {
@@ -357,4 +374,117 @@ namespace mongo {
     string genBackupSuffix(const OID& lastUpgradeId) {
         return "-backup-" + lastUpgradeId.toString();
     }
+
+    Status preUpgradeCheck(const ConnectionString& configServer,
+                           const VersionType& lastVersionInfo,
+                           string minMongosVersion) {
+        if (lastVersionInfo.isUpgradeIdSet() && lastVersionInfo.getUpgradeId().isSet()) {
+            //
+            // Another upgrade failed, so cleanup may be necessary
+            //
+
+            BSONObj lastUpgradeState = lastVersionInfo.getUpgradeState();
+
+            bool inCriticalSection;
+            string errMsg;
+            if (!FieldParser::extract(lastUpgradeState,
+                                      inCriticalSectionField,
+                                      &inCriticalSection,
+                                      &errMsg)) {
+                return Status(ErrorCodes::FailedToParse, causedBy(errMsg));
+            }
+
+            if (inCriticalSection) {
+                // Note: custom message must be supplied by caller
+                return Status(ErrorCodes::ManualInterventionRequired, "");
+            }
+        }
+
+        //
+        // Check the versions of other mongo processes in the cluster before upgrade.
+        // We can't upgrade if there are active pre-v2.4 processes in the cluster
+        //
+        return checkClusterMongoVersions(configServer, string(minMongosVersion));
+    }
+
+    Status startConfigUpgrade(const string& configServer,
+                              int currentVersion,
+                              const OID& upgradeID) {
+        BSONObjBuilder setUpgradeIdObj;
+        setUpgradeIdObj << VersionType::upgradeId(upgradeID);
+        setUpgradeIdObj << VersionType::upgradeState(BSONObj());
+
+        try {
+            ScopedDbConnection conn(configServer, 30);
+            conn->update(VersionType::ConfigNS,
+                         BSON("_id" << 1 << VersionType::currentVersion(currentVersion)),
+                         BSON("$set" << setUpgradeIdObj.done()));
+            _checkGLE(conn);
+            conn.done();
+        }
+        catch (const DBException& e) {
+            return e.toStatus("could not initialize version info for upgrade");
+        }
+
+        return Status::OK();
+    }
+
+    Status enterConfigUpgradeCriticalSection(const string& configServer, int currentVersion) {
+        BSONObjBuilder setUpgradeStateObj;
+        setUpgradeStateObj.append(VersionType::upgradeState(), BSON(inCriticalSectionField(true)));
+
+        try {
+            ScopedDbConnection conn(configServer, 30);
+            conn->update(VersionType::ConfigNS,
+                         BSON("_id" << 1 << VersionType::currentVersion(currentVersion)),
+                         BSON("$set" << setUpgradeStateObj.done()));
+            _checkGLE(conn);
+            conn.done();
+        }
+        catch (const DBException& e) {
+
+            // No cleanup message here since we're not sure if we wrote or not, and
+            // not dangerous either way except to prevent further updates (at which point
+            // the message is printed)
+            return e.toStatus("could not update version info to enter critical update section");
+        }
+
+        log() << "entered critical section for config upgrade" << endl;
+        return Status::OK();
+    }
+
+
+    Status commitConfigUpgrade(const string& configServer,
+                               int currentVersion,
+                               int minCompatibleVersion,
+                               int newVersion) {
+
+        // Note: DO NOT CLEAR the config version unless bumping the minCompatibleVersion,
+        // we want to save the excludes that were set.
+
+        BSONObjBuilder setObj;
+        setObj << VersionType::minCompatibleVersion(minCompatibleVersion);
+        setObj << VersionType::version_DEPRECATED(minCompatibleVersion);
+        setObj << VersionType::currentVersion(newVersion);
+
+        BSONObjBuilder unsetObj;
+        unsetObj.append(VersionType::upgradeId(), 1);
+        unsetObj.append(VersionType::upgradeState(), 1);
+
+        try {
+            ScopedDbConnection conn(configServer, 30);
+            conn->update(VersionType::ConfigNS,
+                         BSON("_id" << 1 << VersionType::currentVersion(currentVersion)),
+                         BSON("$set" << setObj.done() << "$unset" << unsetObj.done()));
+            _checkGLE(conn);
+            conn.done();
+        }
+        catch (const DBException& e) {
+            return e.toStatus("could not write new version info and "
+                              "exit critical upgrade section");
+        }
+
+        return Status::OK();
+    }
+
 }

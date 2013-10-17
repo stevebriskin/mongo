@@ -3,7 +3,7 @@
 var stddb = db;
 var db = db.getSisterDB("profile3");
 
-db.system.users.remove({});
+db.dropAllUsers();
 t = db.profile3;
 t.drop();
 
@@ -16,7 +16,7 @@ profileCursor = function( query ) {
 
 try {
     username = "jstests_profile3_user";
-    db.addUser( username, "password", false, 1 );
+    db.addUser({user: username, pwd: "password", roles: jsTest.basicUserRoles});
     db.auth( username, "password" );
     
     db.setProfilingLevel(0);

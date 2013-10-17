@@ -17,6 +17,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -30,10 +42,10 @@
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/auth/principal.h"
 #include "mongo/db/auth/privilege.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/auth/user.h"
 #include "mongo/db/background.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/db.h"
 #include "mongo/db/instance.h"
@@ -74,26 +86,22 @@ namespace mongo {
             ss << "<pre>";
             ss << mongodVersion() << '\n';
             ss << "git hash: " << gitVersion() << '\n';
+            ss << openSSLVersion("OpenSSL version: ", "\n");
             ss << "sys info: " << sysInfo() << '\n';
-            ss << "uptime: " << time(0)-cmdLine.started << " seconds\n";
+            ss << "uptime: " << time(0)-serverGlobalParams.started << " seconds\n";
             ss << "</pre>";
         }
 
-        void _authorizePrincipal(const std::string& principalName, bool readOnly) {
-            Principal* principal = new Principal(UserName(principalName, "local"));
-            ActionSet actions = getGlobalAuthorizationManager()->getActionsForOldStyleUser(
-                    "admin", readOnly);
-
-            AuthorizationSession* authorizationSession = cc().getAuthorizationSession();
-            authorizationSession->addAuthorizedPrincipal(principal);
-            Status status = authorizationSession->acquirePrivilege(
-                    Privilege(PrivilegeSet::WILDCARD_RESOURCE, actions), principal->getName());
-            verify (status == Status::OK());
+        void _authorizePrincipal(const UserName& userName) {
+            Status status = cc().getAuthorizationSession()->addAndAuthorizeUser(userName);
+            uassertStatusOK(status);
         }
 
         bool allowed( const char * rq , vector<string>& headers, const SockAddr &from ) {
             if ( from.isLocalHost() || !_webUsers->haveAdminUsers() ) {
-                _authorizePrincipal("RestUser", false);
+                // TODO(spencer): should the above check use "&&" not "||"?  Currently this is much
+                // more permissive than the server's localhost auth bypass.
+                cc().getAuthorizationSession()->grantInternalAuthorization();
                 return true;
             }
 
@@ -111,9 +119,22 @@ namespace mongo {
                     parms[name] = val;
                 }
 
-                BSONObj user = _webUsers->getAdminUser( parms["username"] );
-                if ( ! user.isEmpty() ) {
-                    string ha1 = user["pwd"].str();
+                // Only users in the admin DB are visible by the webserver
+                UserName userName(parms["username"], "admin");
+                User* user;
+                AuthorizationManager& authzManager =
+                        cc().getAuthorizationSession()->getAuthorizationManager();
+                Status status = authzManager.acquireUser(userName, &user);
+                if (!status.isOK()) {
+                    if (status.code() != ErrorCodes::UserNotFound) {
+                        uasserted(17051, status.reason());
+                    }
+                } else {
+                    uassert(17090,
+                            "External users don't have a password",
+                            !user->getCredentials().isExternal);
+                    string ha1 = user->getCredentials().password;
+                    authzManager.releaseUser(user);
                     string ha2 = md5simpledigest( (string)"GET" + ":" + parms["uri"] );
 
                     stringstream r;
@@ -131,11 +152,7 @@ namespace mongo {
                     string r1 = md5simpledigest( r.str() );
 
                     if ( r1 == parms["response"] ) {
-                        std::string principalName = user["user"].str();
-                        bool readOnly = user[ "readOnly" ].isBoolean() &&
-                                user[ "readOnly" ].boolean();
-
-                        _authorizePrincipal(principalName, readOnly);
+                        _authorizePrincipal(userName);
                         return true;
                     }
                 }
@@ -181,12 +198,13 @@ namespace mongo {
 
                     DbWebHandler * handler = DbWebHandler::findHandler( url );
                     if ( handler ) {
-                        if ( handler->requiresREST( url ) && ! cmdLine.rest ) {
+                        if (handler->requiresREST(url) && !serverGlobalParams.rest) {
                             _rejectREST( responseMsg , responseCode , headers );
                         }
                         else {
                             string callback = params.getStringField("jsonp");
-                            uassert(13453, "server not started with --jsonp", callback.empty() || cmdLine.jsonp);
+                            uassert(13453, "server not started with --jsonp",
+                                    callback.empty() || serverGlobalParams.jsonp);
 
                             handler->handle( rq , url , params , responseMsg , responseCode , headers , from );
 
@@ -199,7 +217,7 @@ namespace mongo {
                 }
 
 
-                if ( ! cmdLine.rest ) {
+                if (!serverGlobalParams.rest) {
                     _rejectREST( responseMsg , responseCode , headers );
                     return;
                 }
@@ -224,7 +242,7 @@ namespace mongo {
             string dbname;
             {
                 stringstream z;
-                z << cmdLine.binaryName << ' ' << prettyHostName();
+                z << serverGlobalParams.binaryName << ' ' << prettyHostName();
                 dbname = z.str();
             }
             ss << start(dbname) << h2(dbname);
@@ -341,7 +359,7 @@ namespace mongo {
     };
 
     MONGO_INITIALIZER(WebStatusLogPlugin)(InitializerContext*) {
-        if (cmdLine.isHttpInterfaceEnabled) {
+        if (serverGlobalParams.isHttpInterfaceEnabled) {
             new LogPlugin;
         }
         return Status::OK();
@@ -547,8 +565,9 @@ namespace mongo {
     void webServerThread(const AdminAccess* adminAccess) {
         boost::scoped_ptr<const AdminAccess> adminAccessPtr(adminAccess); // adminAccess is owned here
         Client::initThread("websvr");
-        const int p = cmdLine.port + 1000;
-        DbWebServer mini(cmdLine.bind_ip, p, adminAccessPtr.get());
+        const int p = serverGlobalParams.port + 1000;
+        DbWebServer mini(serverGlobalParams.bind_ip, p, adminAccessPtr.get());
+        mini.setupSockets();
         mini.initAndListen();
         cc().shutdown();
     }

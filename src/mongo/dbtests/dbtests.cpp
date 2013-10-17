@@ -17,7 +17,7 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/base/initializer.h"
 #include "mongo/db/commands.h"
@@ -27,8 +27,15 @@
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework.h"
 #include "mongo/util/exception_filter_win32.h"
+#include "mongo/util/gcov.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/text.h"
+
+namespace mongo {
+    // This specifies default dbpath for our testing framework
+    const std::string default_test_dbpath = "/tmp/unittest";
+} // namespace mongo
+
 
 int dbtestsMain( int argc, char** argv, char** envp ) {
     static StaticObserver StaticObserver;
@@ -37,7 +44,7 @@ int dbtestsMain( int argc, char** argv, char** envp ) {
     Command::testCommandsEnabled = 1;
     mongo::runGlobalInitializersOrDie(argc, argv, envp);
     StartupTest::runTests();
-    return mongo::dbtests::runDbTests( argc, argv, "/tmp/unittest" );
+    return mongo::dbtests::runDbTests(argc, argv);
 }
 
 #if defined(_WIN32)
@@ -54,6 +61,7 @@ int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
 #else
 int main(int argc, char* argv[], char** envp) {
     int exitCode = dbtestsMain(argc, argv, envp);
+    flushForGcov();
     ::_exit(exitCode);
 }
 #endif

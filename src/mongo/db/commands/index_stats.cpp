@@ -492,7 +492,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::indexStats);
-            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
 
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg,
@@ -500,7 +500,7 @@ namespace mongo {
 
             string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
             const NamespaceDetails* nsd = nsdetails(ns);
-            if (!cmdLine.quiet) {
+            if (!serverGlobalParams.quiet) {
                 MONGO_TLOG(0) << "CMD: indexStats " << ns << endl;
             }
             if (!nsd) {
@@ -544,7 +544,7 @@ namespace mongo {
     };
 
     MONGO_INITIALIZER(IndexStatsCmd)(InitializerContext* context) {
-        if (cmdLine.experimental.indexStatsCmdEnabled) {
+        if (serverGlobalParams.experimental.indexStatsCmdEnabled) {
             // Leaked intentionally: a Command registers itself when constructed.
             new IndexStatsCmd();
         }

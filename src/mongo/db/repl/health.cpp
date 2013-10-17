@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -19,7 +31,6 @@
 #include "mongo/db/repl/health.h"
 
 #include "mongo/client/connpool.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/repl/bgsync.h"
@@ -178,7 +189,7 @@ namespace mongo {
         const bo fields;
 
         /** todo fix we might want an so timeout here */
-        OplogReader reader(false);
+        OplogReader reader;
 
         if (reader.connect(m->fullName()) == false) {
             ss << "couldn't connect to " << m->fullName();
@@ -308,7 +319,7 @@ namespace mongo {
             s << tr() << td(_self->fullName() + " (me)") <<
               td(_self->id()) <<
               td("1") <<  //up
-              td(ago(cmdLine.started)) <<
+              td(ago(serverGlobalParams.started)) <<
               td("") << // last heartbeat
               td(ToString(_self->config().votes)) <<
               td(ToString(_self->config().priority)) <<
@@ -348,6 +359,15 @@ namespace mongo {
         return 0;
     }
 
+    Member* ReplSetImpl::getMutableMember(unsigned id) {
+        if( _self && id == _self->id() ) return _self;
+
+        for( Member *m = head(); m; m = m->next() )
+            if( m->id() == id )
+                return m;
+        return 0;
+    }
+
     Member* ReplSetImpl::findByName(const std::string& hostname) const {
         if (_self && hostname == _self->fullName()) {
             return _self;
@@ -378,6 +398,24 @@ namespace mongo {
         return closest;
     }
 
+    const OpTime ReplSetImpl::lastOtherElectableOpTime() const {
+        OpTime closest(0,0);
+
+        for( Member *m = _members.head(); m; m=m->next() ) {
+            if (!m->hbinfo().up()) {
+                continue;
+            }
+
+            if (m->hbinfo().opTime > closest && m->config().potentiallyHot()) {
+                log() << m->fullName() << " is now closest at "
+                      <<  m->hbinfo().opTime << endl;
+                closest = m->hbinfo().opTime;
+            }
+        }
+
+        return closest;
+    }
+
     void ReplSetImpl::_summarizeStatus(BSONObjBuilder& b) const {
         vector<BSONObj> v;
 
@@ -394,7 +432,7 @@ namespace mongo {
             bb.append("health", 1.0);
             bb.append("state", (int)myState.s);
             bb.append("stateStr", myState.toString());
-            bb.append("uptime", (unsigned)(time(0) - cmdLine.started));
+            bb.append("uptime", (unsigned)(time(0) - serverGlobalParams.started));
             if (!_self->config().arbiterOnly) {
                 bb.appendTimestamp("optime", lastOpTimeWritten.asDate());
                 bb.appendDate("optimeDate", lastOpTimeWritten.getSecs() * 1000LL);

@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
@@ -24,6 +36,7 @@
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
+#include "mongo/db/ops/log_builder.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/unittest/unittest.h"
 
@@ -32,6 +45,7 @@ namespace {
     using mongo::Array;
     using mongo::BSONObj;
     using mongo::fromjson;
+    using mongo::LogBuilder;
     using mongo::ModifierInterface;
     using mongo::ModifierUnset;
     using mongo::Status;
@@ -46,7 +60,8 @@ namespace {
 
         explicit Mod(BSONObj modObj) {
             _modObj = modObj;
-            ASSERT_OK(_mod.init(_modObj["$unset"].embeddedObject().firstElement()));
+            ASSERT_OK(_mod.init(_modObj["$unset"].embeddedObject().firstElement(),
+                                ModifierInterface::Options::normal()));
         }
 
         Status prepare(Element root,
@@ -59,8 +74,8 @@ namespace {
             return _mod.apply();
         }
 
-        Status log(Element logRoot) const {
-            return _mod.log(logRoot);
+        Status log(LogBuilder* logBuilder) const {
+            return _mod.log(logBuilder);
         }
 
         ModifierUnset& mod() { return _mod; }
@@ -84,7 +99,6 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
     }
 
@@ -96,10 +110,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{b: 2}"), doc);
     }
 
@@ -111,10 +125,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace); // TODO turn in-place on for this.
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled()); // TODO turn in-place on for this.
         ASSERT_EQUALS(fromjson("{x: 0}"), doc);
     }
 
@@ -126,10 +140,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace); // TODO turn in-place on for this.
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled()); // TODO turn in-place on for this.
         ASSERT_EQUALS(fromjson("{}"), doc);
     }
 
@@ -141,10 +155,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{c: 2}"), doc);
     }
 
@@ -157,11 +171,11 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a");
-        ASSERT_FALSE(execInfo.inPlace); // TODO turn in-place on for this.
         ASSERT_FALSE(execInfo.noOp);
 
         Document logDoc;
-        ASSERT_OK(modUnset.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(modUnset.log(&logBuilder));
         ASSERT_EQUALS(modUnset.modObj(), logDoc);
     }
 
@@ -177,7 +191,6 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.b");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
     }
 
@@ -189,10 +202,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.b");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{a:{}, c:2}"), doc);
     }
 
@@ -204,10 +217,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.b");
-        ASSERT_FALSE(execInfo.inPlace); // TODO turn in-place on for this.
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled()); // TODO turn in-place on for this.
         ASSERT_EQUALS(fromjson("{x: 0, a:{}}"), doc);
     }
 
@@ -219,10 +232,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.b");
-        ASSERT_FALSE(execInfo.inPlace); // TODO turn in-place on for this.
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled()); // TODO turn in-place on for this.
         ASSERT_EQUALS(fromjson("{a: {}}"), doc);
     }
 
@@ -238,7 +251,6 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
     }
 
@@ -250,10 +262,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{a:[null,1,2]}"), doc);
     }
 
@@ -265,10 +277,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0");
-        ASSERT_FALSE(execInfo.inPlace); // TODO turn in-place on for this.
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled()); // TODO turn in-place on for this.
         ASSERT_EQUALS(fromjson("{b:1, a:[null]}"), doc);
     }
 
@@ -281,10 +293,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{a:[null], b:1}"), doc);
     }
 
@@ -296,10 +308,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0.b");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{a:[{}]}"), doc);
     }
 
@@ -311,10 +323,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{a:[null]}"), doc);
     }
 
@@ -326,7 +338,8 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "", &execInfo));
 
         Document logDoc;
-        ASSERT_OK(modUnset.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(modUnset.log(&logBuilder));
         ASSERT_EQUALS(modUnset.modObj(), logDoc);
     }
 
@@ -342,7 +355,6 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "1", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.1.b");
-        ASSERT_TRUE(execInfo.inPlace);
         ASSERT_TRUE(execInfo.noOp);
     }
 
@@ -362,10 +374,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "0", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0.b");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{a: [{}, {c:1}]}"), doc);
     }
 
@@ -377,10 +389,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "0", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0");
-        ASSERT_FALSE(execInfo.inPlace);
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
         ASSERT_EQUALS(fromjson("{a: [null, {c:1}]}"), doc);
     }
 
@@ -392,10 +404,10 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "0", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0.b");
-        ASSERT_FALSE(execInfo.inPlace); // TODO turn in-place on for this.
         ASSERT_FALSE(execInfo.noOp);
 
         ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled()); // TODO turn in-place on for this.
         ASSERT_EQUALS(fromjson("{b:1, a:[{}]}"), doc);
     }
 
@@ -407,12 +419,32 @@ namespace {
         ASSERT_OK(modUnset.prepare(doc.root(), "0", &execInfo));
 
         ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0.b");
-        ASSERT_FALSE(execInfo.inPlace); // TODO turn in-place on for this.
         ASSERT_FALSE(execInfo.noOp);
 
         Document logDoc;
-        ASSERT_OK(modUnset.log(logDoc.root()));
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(modUnset.log(&logBuilder));
         ASSERT_EQUALS(fromjson("{$unset: {'a.0.b': 1}}"), logDoc);
+    }
+
+    TEST(LegacyData, CanUnsetInvalidField) {
+        Document doc(fromjson("{b:1, a:[{$b:1}]}"));
+        Mod modUnset(fromjson("{$unset: {'a.$.$b': 1}}"));
+
+        ModifierInterface::ExecInfo execInfo;
+        ASSERT_OK(modUnset.prepare(doc.root(), "0", &execInfo));
+
+        ASSERT_EQUALS(execInfo.fieldRef[0]->dottedField(), "a.0.$b");
+        ASSERT_FALSE(execInfo.noOp);
+
+        ASSERT_OK(modUnset.apply());
+        ASSERT_FALSE(doc.isInPlaceModeEnabled());
+        ASSERT_EQUALS(fromjson("{b:1, a:[{}]}"), doc);
+
+        Document logDoc;
+        LogBuilder logBuilder(logDoc.root());
+        ASSERT_OK(modUnset.log(&logBuilder));
+        ASSERT_EQUALS(fromjson("{$unset: {'a.0.$b': 1}}"), logDoc);
     }
 
 

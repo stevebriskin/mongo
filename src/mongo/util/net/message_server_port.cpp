@@ -22,7 +22,6 @@
 #ifndef USE_ASIO
 
 
-#include "mongo/db/cmdline.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/util/concurrency/ticketholder.h"
@@ -126,6 +125,10 @@ namespace mongo {
             Listener::setAsTimeTracker();
         }
 
+        virtual void setupSockets() {
+            Listener::setupSockets();
+        }
+
         void run() {
             initAndListen();
         }
@@ -187,10 +190,6 @@ namespace mongo {
 
                 otherSide = p->psock->remoteString();
 
-#ifdef MONGO_SSL
-                std::string x509SubjectName = p->psock->doSSLHandshake();
-                inPort->setX509SubjectName(x509SubjectName);
-#endif 
                 handler->connected( p.get() );
 
                 while ( ! inShutdown() ) {
@@ -198,7 +197,7 @@ namespace mongo {
                     p->psock->clearCounters();
 
                     if ( ! p->recv(m) ) {
-                        if( !cmdLine.quiet ){
+                        if (!serverGlobalParams.quiet) {
                             int conns = Listener::globalTicketHolder.used()-1;
                             const char* word = (conns == 1 ? " connection" : " connections");
                             log() << "end connection " << otherSide << " (" << conns << word << " now open)" << endl;

@@ -47,6 +47,8 @@ namespace mongo {
         ASSERT( NamespaceString::special( "a.$.b" ) );
         ASSERT( NamespaceString::special( "a.system.foo" ) );
         ASSERT( !NamespaceString::special( "a.foo" ) );
+        ASSERT( !NamespaceString::special( "a.foo.system.bar" ) );
+        ASSERT( !NamespaceString::special( "a.systemfoo" ) );
     }
 
     TEST( NamespaceStringTest, DatabaseValidNames ) {
@@ -54,17 +56,38 @@ namespace mongo {
         ASSERT( !NamespaceString::validDBName( "foo/bar" ) );
         ASSERT( !NamespaceString::validDBName( "foo bar" ) );
         ASSERT( !NamespaceString::validDBName( "foo.bar" ) );
+        ASSERT( !NamespaceString::validDBName( "foo.bar" ) );
+        ASSERT( !NamespaceString::validDBName( "foo\\bar" ) );
+        ASSERT( !NamespaceString::validDBName( "foo\"bar" ) );
+#ifdef _WIN32
+        ASSERT( !NamespaceString::validDBName( "foo*bar" ) );
+        ASSERT( !NamespaceString::validDBName( "foo<bar" ) );
+        ASSERT( !NamespaceString::validDBName( "foo>bar" ) );
+        ASSERT( !NamespaceString::validDBName( "foo:bar" ) );
+        ASSERT( !NamespaceString::validDBName( "foo|bar" ) );
+        ASSERT( !NamespaceString::validDBName( "foo?bar" ) );
+#endif
 
         ASSERT( NamespaceString::normal( "asdads" ) );
         ASSERT( !NamespaceString::normal( "asda$ds" ) );
         ASSERT( NamespaceString::normal( "local.oplog.$main" ) );
     }
 
+    TEST( NamespaceStringTest, CollectionComponentValidNames ) {
+        ASSERT( NamespaceString::validCollectionComponent( "a.b" ) );
+        ASSERT( NamespaceString::validCollectionComponent( "a.b" ) );
+        ASSERT( !NamespaceString::validCollectionComponent( "a." ) );
+        ASSERT( NamespaceString::validCollectionComponent( "a.b." ) ); // TODO: should this change?
+    }
+
     TEST( NamespaceStringTest, CollectionValidNames ) {
+        ASSERT( NamespaceString::validCollectionName( "a" ) );
         ASSERT( NamespaceString::validCollectionName( "a.b" ) );
-        ASSERT( NamespaceString::validCollectionName( "a.b" ) );
-        ASSERT( !NamespaceString::validCollectionName( "a." ) );
+        ASSERT( NamespaceString::validCollectionName( "a." ) ); // TODO: should this change?
         ASSERT( NamespaceString::validCollectionName( "a.b." ) ); // TODO: should this change?
+        ASSERT( !NamespaceString::validCollectionName( "$a" ) );
+        ASSERT( !NamespaceString::validCollectionName( "a$b" ) );
+        ASSERT( !NamespaceString::validCollectionName( "" ) );
     }
 
     TEST( NamespaceStringTest, DBHash ) {

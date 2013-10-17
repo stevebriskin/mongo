@@ -503,7 +503,7 @@ namespace mongo {
     /** Typically one uses the QUERY(...) macro to construct a Query object.
         Example: QUERY( "age" << 33 << "school" << "UCLA" )
     */
-#define QUERY(x) mongo::Query( BSON(x) )
+#define QUERY(x) ::mongo::Query( BSON(x) )
 
     // Useful utilities for namespaces
     /** @return the database name portion of an ns string */
@@ -700,7 +700,9 @@ namespace mongo {
                             bool j = false,
                             int w = 0,
                             int wtimeout = 0);
-        // Same as above but defaults to using admin DB
+        /**
+         * Same as the form of getLastError that takes a dbname, but just uses the admin DB.
+         */
         string getLastError(bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
 
         /** Get error result from the last write operation (insert/update/delete) on this connection.
@@ -715,7 +717,9 @@ namespace mongo {
                                              bool j = false,
                                              int w = 0,
                                              int wtimeout = 0);
-        // Same as above but defaults to using admin DB
+        /**
+         * Same as the form of getLastErrorDetailed that takes a dbname, but just uses the admin DB.
+         */
         virtual BSONObj getLastErrorDetailed(bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
 
         /** Can be called with the returned value from getLastErrorDetailed to extract an error string. 
@@ -1136,7 +1140,7 @@ namespace mongo {
            Connect timeout is fixed, but short, at 5 seconds.
          */
         DBClientConnection(bool _autoReconnect=false, DBClientReplicaSet* cp=0, double so_timeout=0) :
-            clientSet(cp), _failed(false), autoReconnect(_autoReconnect), lastReconnectTry(0), _so_timeout(so_timeout) {
+            clientSet(cp), _failed(false), autoReconnect(_autoReconnect), autoReconnectBackoff(1000, 2000), _so_timeout(so_timeout) {
             _numConnections++;
         }
 
@@ -1277,7 +1281,7 @@ namespace mongo {
         boost::scoped_ptr<SockAddr> server;
         bool _failed;
         const bool autoReconnect;
-        time_t lastReconnectTry;
+        Backoff autoReconnectBackoff;
         HostAndPort _server; // remember for reconnects
         string _serverString;
         void _checkConnection();

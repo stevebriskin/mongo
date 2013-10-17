@@ -33,10 +33,7 @@
 
 #endif // not _WIN32
 
-#ifdef MONGO_SSL
-#include <openssl/ssl.h>
-#endif
-
+#include <boost/scoped_ptr.hpp>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,7 +46,13 @@
 
 namespace mongo {
 
+#ifdef MONGO_SSL
     class SSLManagerInterface;
+    class SSLConnection;
+#endif
+
+    extern const int portSendFlags;
+    extern const int portRecvFlags;
 
     const int SOCK_FAMILY_UNKNOWN_ERROR=13078;
 
@@ -201,7 +204,6 @@ namespace mongo {
 
         bool connect(SockAddr& farEnd);
         void close();
-        
         void send( const char * data , int len, const char *context );
         void send( const std::vector< std::pair< char *, int > > &data, const char *context );
 
@@ -216,16 +218,27 @@ namespace mongo {
         std::string remoteString() const { return _remote.toString(); }
         unsigned remotePort() const { return _remote.getPort(); }
 
+        SockAddr localAddr() const { return _local; }
+
         void clearCounters() { _bytesIn = 0; _bytesOut = 0; }
         long long getBytesIn() const { return _bytesIn; }
         long long getBytesOut() const { return _bytesOut; }
-        
+        int rawFD() const { return _fd; }
+
         void setTimeout( double secs );
         bool isStillConnected();
 
+        void setHandshakeReceived() {
+            _awaitingHandshake = false;
+        }
+
+        bool isAwaitingHandshake() {
+            return _awaitingHandshake;
+        }
+
 #ifdef MONGO_SSL
         /** secures inline */
-        void secure( SSLManagerInterface* ssl );
+        bool secure( SSLManagerInterface* ssl );
 
         void secureAccepted( SSLManagerInterface* ssl );
 #endif
@@ -235,9 +248,13 @@ namespace mongo {
          * are desired. SSL_accept() waits until the remote host calls
          * SSL_connect(). The return value is the subject name of any
          * client certificate provided during the handshake.
+         *
+         * @firstBytes is the first bytes received on the socket used
+         * to detect the connection SSL, @len is the number of bytes
+         *
          * This function may throw SocketException.
          */
-        std::string doSSLHandshake();
+        std::string doSSLHandshake(const char* firstBytes = NULL, int len = 0);
         
         /**
          * @return the time when the socket was opened.
@@ -246,23 +263,24 @@ namespace mongo {
             return _fdCreationMicroSec;
         }
 
+        void handleRecvError(int ret, int len);
+        MONGO_COMPILER_NORETURN void handleSendError(int ret, const char* context);
+
     private:
         void _init();
 
         /** sends dumbly, just each buffer at a time */
         void _send( const std::vector< std::pair< char *, int > > &data, const char *context );
 
-        /** raw send, same semantics as ::send */
-        int _send( const char * data , int len );
+        /** raw send, same semantics as ::send with an additional context parameter */
+        int _send( const char * data , int len , const char * context );
 
         /** raw recv, same semantics as ::recv */
         int _recv( char * buf , int max );
 
-        void _handleRecvError(int ret, int len, int* retries);
-        MONGO_COMPILER_NORETURN void _handleSendError(int ret, const char* context);
-
         int _fd;
         uint64_t _fdCreationMicroSec;
+        SockAddr _local;
         SockAddr _remote;
         double _timeout;
 
@@ -271,10 +289,13 @@ namespace mongo {
         time_t _lastValidityCheckAtSecs;
 
 #ifdef MONGO_SSL
-        SSL* _ssl;
+        boost::scoped_ptr<SSLConnection> _sslConnection;
         SSLManagerInterface* _sslManager;
 #endif
         logger::LogSeverity _logLevel; // passed to log() when logging errors
+ 
+        /** true until the first packet has been received or an outgoing connect has been made */
+        bool _awaitingHandshake;
 
     };
 

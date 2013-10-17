@@ -12,11 +12,24 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/index_update.h"
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/background.h"
 #include "mongo/db/btreebuilder.h"
 #include "mongo/db/clientcursor.h"
@@ -27,8 +40,11 @@
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/namespace_details.h"
 #include "mongo/db/pdfile_private.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/query/runner_yield_policy.h"
 #include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/structure/collection.h"
 #include "mongo/util/processinfo.h"
 
 namespace mongo {
@@ -132,11 +148,11 @@ namespace mongo {
 
             unsigned long long n = 0;
             unsigned long long numDropped = 0;
-            auto_ptr<ClientCursor> cc;
-            {
-                shared_ptr<Cursor> c = theDataFileMgr.findAll(ns);
-                cc.reset( new ClientCursor(QueryOption_NoCursorTimeout, c, ns) );
-            }
+
+            auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns));
+            // We're not delegating yielding to the runner because we need to know when a yield
+            // happens.
+            RunnerYieldPolicy yieldPolicy;
 
             std::string idxName = idx.indexName();
             int idxNo = IndexBuildsInProgress::get(ns, idxName);
@@ -145,46 +161,41 @@ namespace mongo {
             // flipped, see insert_makeIndex) or even an empty IndexDetails, so nothing below should
             // depend on idx. idxNo should be recalculated after each yield.
 
-            while ( cc->ok() ) {
-                BSONObj js = cc->current();
+            BSONObj js;
+            DiskLoc loc;
+            while (Runner::RUNNER_ADVANCED == runner->getNext(&js, &loc)) {
                 try {
-                    {
-                        if ( !dupsAllowed && dropDups ) {
-                            LastError::Disabled led( lastError.get() );
-                            addKeysToIndex(ns, d, idxNo, js, cc->currLoc(), dupsAllowed);
-                        }
-                        else {
-                            addKeysToIndex(ns, d, idxNo, js, cc->currLoc(), dupsAllowed);
-                        }
+                    if ( !dupsAllowed && dropDups ) {
+                        LastError::Disabled led( lastError.get() );
+                        addKeysToIndex(ns, d, idxNo, js, loc, dupsAllowed);
                     }
-                    cc->advance();
+                    else {
+                        addKeysToIndex(ns, d, idxNo, js, loc, dupsAllowed);
+                    }
                 }
                 catch( AssertionException& e ) {
                     if( e.interrupted() ) {
                         killCurrentOp.checkForInterrupt();
                     }
 
-                    if ( dropDups ) {
-                        DiskLoc toDelete = cc->currLoc();
-                        bool ok = cc->advance();
-                        ClientCursor::YieldData yieldData;
-                        massert( 16093, "after yield cursor deleted" , cc->prepareToYield( yieldData ) );
-                        theDataFileMgr.deleteRecord( d, ns, toDelete.rec(), toDelete, false, true , true );
-                        if( !cc->recoverFromYield( yieldData ) ) {
-                            cc.release();
-                            if( !ok ) {
-                                /* we were already at the end. normal. */
+                    // TODO: Does exception really imply dropDups exception?
+                    if (dropDups) {
+                        bool runnerEOF = runner->isEOF();
+                        runner->saveState();
+                        theDataFileMgr.deleteRecord(d, ns, loc.rec(), loc, false, true, true);
+                        if (!runner->restoreState()) {
+                            // Runner got killed somehow.  This probably shouldn't happen.
+                            if (runnerEOF) {
+                                // Quote: "We were already at the end.  Normal.
+                                // TODO: Why is this normal?
                             }
                             else {
                                 uasserted(12585, "cursor gone during bg index; dropDups");
                             }
                             break;
                         }
-
-                        // Recalculate idxNo if we yielded
-                        idxNo = IndexBuildsInProgress::get(ns, idxName);
-                        // This index must still be around, because this is thread that would clean
-                        // it up
+                        // We deleted a record, but we didn't actually yield the dblock.
+                        // TODO: Why did the old code assume we yielded the lock?
                         numDropped++;
                     }
                     else {
@@ -192,24 +203,23 @@ namespace mongo {
                         throw;
                     }
                 }
+
                 n++;
                 progress.hit();
 
                 getDur().commitIfNeeded();
+                if (yieldPolicy.shouldYield()) {
+                    if (!yieldPolicy.yieldAndCheckIfOK(runner.get())) {
+                        uasserted(12584, "cursor gone during bg index");
+                        break;
+                    }
 
-                if ( cc->yieldSometimes( ClientCursor::WillNeed ) ) {
                     progress.setTotalWhileRunning( d->numRecords() );
-
                     // Recalculate idxNo if we yielded
                     idxNo = IndexBuildsInProgress::get(ns, idxName);
                 }
-                else {
-                    idxNo = -1;
-                    cc.release();
-                    uasserted(12584, "cursor gone during bg index");
-                    break;
-                }
             }
+
             progress.finished();
             if ( dropDups )
                 log() << "\t backgroundIndexBuild dupsToDrop: " << numDropped << endl;
@@ -226,8 +236,12 @@ namespace mongo {
             bgJobsInProgress.insert(d);
         }
         void done(const char *ns) {
-            NamespaceDetailsTransient::get(ns).addedIndex(); // clear query optimizer cache
             Lock::assertWriteLocked(ns);
+
+            // clear query optimizer cache
+            Collection* collection = cc().database()->getCollection( ns );
+            if ( collection )
+                collection->infoCache()->addedIndex();
         }
 
     public:
@@ -237,7 +251,9 @@ namespace mongo {
 
             // clear cached things since we are changing state
             // namely what fields are indexed
-            NamespaceDetailsTransient::get(ns.c_str()).addedIndex();
+            Collection* collection = cc().database()->getCollection( ns );
+            if ( collection )
+                collection->infoCache()->addedIndex();
 
             unsigned long long n = 0;
 
@@ -267,15 +283,18 @@ namespace mongo {
                       IndexDetails& idx,
                       bool mayInterrupt) {
 
-        bool background = idx.info.obj()["background"].trueValue();
+        BSONObj idxInfo = idx.info.obj();
 
-        MONGO_TLOG(0) << "build index " << ns << ' ' << idx.keyPattern() << ( background ? " background" : "" ) << endl;
+        MONGO_TLOG(0) << "build index on: " << ns << " properties: " << idxInfo.jsonString() << endl;
+
+        audit::logCreateIndex( currentClient.get(), &idxInfo, idx.indexName(), ns );
+
         Timer t;
         unsigned long long n;
 
         verify( Lock::isWriteLocked(ns) );
 
-        if( inDBRepair || !background ) {
+        if( inDBRepair || !idxInfo["background"].trueValue() ) {
             int idxNo = IndexBuildsInProgress::get(ns.c_str(), idx.info.obj()["name"].valuestr());
             n = BtreeBasedBuilder::fastBuildIndex(ns.c_str(), d, idx, mayInterrupt, idxNo);
             verify( !idx.head.isNull() );
@@ -316,14 +335,14 @@ namespace mongo {
         theDataFileMgr.insert(system_indexes.c_str(), o.objdata(), o.objsize(), mayInterrupt, true);
     }
 
-    bool dropIndexes(NamespaceDetails *d, const char *ns, const char *name, string &errmsg, BSONObjBuilder &anObjBuilder, bool mayDeleteIdIndex) {
+    bool dropIndexes(NamespaceDetails *d, const StringData& ns, const StringData& name, string &errmsg, BSONObjBuilder &anObjBuilder, bool mayDeleteIdIndex) {
         BackgroundOperation::assertNoBgOpInProgForNs(ns);
 
         /* there may be pointers pointing at keys in the btree(s).  kill them. */
         ClientCursor::invalidate(ns);
 
         // delete a specific index or all?
-        if ( *name == '*' && name[1] == 0 ) {
+        if ( name == "*" ) {
             // this should be covered by assertNoBgOpInProgForNs above, but being paranoid
             verify( d->getCompletedIndexCount() == d->getTotalIndexCount() );
 
