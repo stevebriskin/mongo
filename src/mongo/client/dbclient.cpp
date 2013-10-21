@@ -15,10 +15,11 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/client/auth_helpers.h"
 #include "mongo/client/constants.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/dbclientcursor.h"
@@ -26,16 +27,12 @@
 #include "mongo/client/syncclusterconnection.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/namespace-inl.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/s/stale_exception.h"  // for RecvStaleConfigException
 #include "mongo/util/assert_util.h"
 #include "mongo/util/md5.hpp"
-
-#ifdef MONGO_SSL
-// TODO: Remove references to cmdline from the client.
-#include "mongo/db/cmdline.h"
-#endif  // defined MONGO_SSL
+#include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_options.h"
 
 namespace mongo {
 
@@ -435,10 +432,9 @@ namespace mongo {
     }
 
     unsigned long long DBClientWithCommands::count(const string &myns, const BSONObj& query, int options, int limit, int skip ) {
-        NamespaceString ns(myns);
         BSONObj cmd = _countCmd( myns , query , options , limit , skip );
         BSONObj res;
-        if( !runCommand(ns.db.c_str(), cmd, res, options) )
+        if( !runCommand(nsToDatabase(myns), cmd, res, options) )
             uasserted(11010,string("count fails:") + res.toString());
         return res["n"].numberLong();
     }
@@ -446,7 +442,7 @@ namespace mongo {
     BSONObj DBClientWithCommands::_countCmd(const string &myns, const BSONObj& query, int options, int limit, int skip ) {
         NamespaceString ns(myns);
         BSONObjBuilder b;
-        b.append( "count" , ns.coll );
+        b.append( "count" , ns.coll() );
         b.append( "query" , query );
         if ( limit )
             b.append( "limit" , limit );
@@ -526,16 +522,7 @@ namespace mongo {
     BSONObj getnoncecmdobj = fromjson("{getnonce:1}");
 
     string DBClientWithCommands::createPasswordDigest( const string & username , const string & clearTextPassword ) {
-        md5digest d;
-        {
-            md5_state_t st;
-            md5_init(&st);
-            md5_append(&st, (const md5_byte_t *) username.data(), username.length());
-            md5_append(&st, (const md5_byte_t *) ":mongo:", 7 );
-            md5_append(&st, (const md5_byte_t *) clearTextPassword.data(), clearTextPassword.length());
-            md5_finish(&st, d);
-        }
-        return digestToString( d );
+        return auth::createPasswordDigest(username, clearTextPassword);
     }
 
     void DBClientWithCommands::_auth(const BSONObj& params) {
@@ -547,11 +534,11 @@ namespace mongo {
         if (mechanism == StringData("MONGODB-CR", StringData::LiteralTag())) {
             std::string userSource;
             uassertStatusOK(bsonExtractStringField(params,
-                                                   saslCommandPrincipalSourceFieldName,
+                                                   saslCommandUserSourceFieldName,
                                                    &userSource));
             std::string user;
             uassertStatusOK(bsonExtractStringField(params,
-                                                   saslCommandPrincipalFieldName,
+                                                   saslCommandUserFieldName,
                                                    &user));
             std::string password;
             uassertStatusOK(bsonExtractStringField(params,
@@ -567,12 +554,40 @@ namespace mongo {
                     errmsg,
                     _authMongoCR(userSource, user, password, errmsg, digestPassword));
         }
+#ifdef MONGO_SSL
+        else if (mechanism == StringData("MONGODB-X509", StringData::LiteralTag())){
+            std::string userSource;
+            uassertStatusOK(bsonExtractStringField(params,
+                                                   saslCommandUserSourceFieldName,
+                                                   &userSource));
+            std::string user;
+            uassertStatusOK(bsonExtractStringField(params,
+                                                   saslCommandUserFieldName,
+                                                   &user));
+
+            uassert(ErrorCodes::AuthenticationFailed,
+                    "Please enable SSL on the client-side to use the MONGODB-X509 "
+                    "authentication mechanism.",
+                    getSSLManager() != NULL);
+
+            uassert(ErrorCodes::AuthenticationFailed,
+                    "Username \"" + user + 
+                    "\" does not match the provided client certificate user \"" +
+                    getSSLManager()->getClientSubjectName() + "\"",
+                    user ==  getSSLManager()->getClientSubjectName());
+ 
+            std::string errmsg;
+            uassert(ErrorCodes::AuthenticationFailed,
+                    errmsg,
+                    _authX509(userSource, user, errmsg));
+        }
+#endif
         else if (saslClientAuthenticate != NULL) {
-            uassertStatusOK(saslClientAuthenticate(this, params, NULL));
+            uassertStatusOK(saslClientAuthenticate(this, params));
         }
         else {
             uasserted(ErrorCodes::BadValue,
-                      "SASL authentication support not compiled into client library.");
+                      mechanism + " mechanism support not compiled into client library.");
         }
     };
 
@@ -587,8 +602,8 @@ namespace mongo {
                                     bool digestPassword) {
         try {
             _auth(BSON(saslCommandMechanismFieldName << "MONGODB-CR" <<
-                       saslCommandPrincipalSourceFieldName << dbname <<
-                       saslCommandPrincipalFieldName << username <<
+                       saslCommandUserSourceFieldName << dbname <<
+                       saslCommandUserFieldName << username <<
                        saslCommandPasswordFieldName << password_text <<
                        saslCommandDigestPasswordFieldName << digestPassword));
             return true;
@@ -640,6 +655,23 @@ namespace mongo {
             authCmd = b.done();
         }
 
+        if( runCommand(dbname, authCmd, info) ) {
+            return true;
+        }
+
+        errmsg = info.toString();
+        return false;
+    }
+
+    bool DBClientWithCommands::_authX509(const string&dbname,
+                                              const string &username,
+                                              string& errmsg){
+        BSONObj authCmd;
+        BSONObjBuilder cmdBuilder;
+        cmdBuilder << "authenticate" << 1 << "mechanism" << "MONGODB-X509" << "user" << username;
+        authCmd = cmdBuilder.done();
+
+        BSONObj info;
         if( runCommand(dbname, authCmd, info) ) {
             return true;
         }
@@ -769,7 +801,7 @@ namespace mongo {
         string ns = db + ".system.namespaces";
         auto_ptr<DBClientCursor> c = query( ns.c_str() , BSONObj() );
         while ( c->more() ) {
-            string name = c->next()["name"].valuestr();
+            string name = c->nextSafe()["name"].valuestr();
             if ( name.find( "$" ) != string::npos )
                 continue;
             names.push_back( name );
@@ -778,7 +810,6 @@ namespace mongo {
     }
 
     bool DBClientWithCommands::exists( const string& ns ) {
-        list<string> names;
 
         string db = nsGetDB( ns ) + ".system.namespaces";
         BSONObj q = BSON( "name" << ns );
@@ -793,7 +824,7 @@ namespace mongo {
             /* note we remember the auth info before we attempt to auth -- if the connection is broken, we will
                then have it for the next autoreconnect attempt.
             */
-            authCache[params[saslCommandPrincipalSourceFieldName].str()] = params.getOwned();
+            authCache[params[saslCommandUserSourceFieldName].str()] = params.getOwned();
         }
 
         DBClientBase::_auth(params);
@@ -861,14 +892,20 @@ namespace mongo {
         }
 
 #ifdef MONGO_SSL
-        if ( cmdLine.sslOnNormalPorts ) {
-            p->secure( sslManager() );
+        int sslModeVal = sslGlobalParams.sslMode.load();
+        if (sslModeVal == SSLGlobalParams::SSLMode_sendAcceptSSL ||
+            sslModeVal == SSLGlobalParams::SSLMode_sslOnly) {
+            return p->secure( sslManager() );
         }
 #endif
 
         return true;
     }
 
+    void DBClientConnection::logout(const string& dbname, BSONObj& info){
+        authCache.erase(dbname);
+        runCommand(dbname, BSON("logout" << 1), info);
+    }
 
     inline bool DBClientConnection::runCommand(const string &dbname,
                                                const BSONObj& cmd,
@@ -888,15 +925,13 @@ namespace mongo {
     void DBClientConnection::_checkConnection() {
         if ( !_failed )
             return;
-        if ( lastReconnectTry && time(0)-lastReconnectTry < 2 ) {
-            // we wait a little before reconnect attempt to avoid constant hammering.
-            // but we throw we don't want to try to use a connection in a bad state
-            throw SocketException( SocketException::FAILED_STATE , toString() );
-        }
+
         if ( !autoReconnect )
             throw SocketException( SocketException::FAILED_STATE , toString() );
 
-        lastReconnectTry = time(0);
+        // Don't hammer reconnects, backoff if needed
+        autoReconnectBackoff.nextSleepMillis();
+
         LOG(_logLevel) << "trying reconnect to " << _serverString << endl;
         string errmsg;
         _failed = false;
@@ -913,9 +948,9 @@ namespace mongo {
             } catch (UserException& ex) {
                 if (ex.getCode() != ErrorCodes::AuthenticationFailed)
                     throw;
-                LOG(_logLevel) << "reconnect: auth failed db:" <<
-                    i->second[saslCommandPrincipalSourceFieldName] <<
-                    " user:" << i->second[saslCommandPrincipalFieldName] << ' ' <<
+                LOG(_logLevel) << "reconnect: auth failed " <<
+                    i->second[saslCommandUserSourceFieldName] <<
+                    i->second[saslCommandUserFieldName] << ' ' <<
                     ex.what() << std::endl;
             }
         }
@@ -1149,9 +1184,8 @@ namespace mongo {
         say( toSend );
     }
 
-    
     auto_ptr<DBClientCursor> DBClientWithCommands::getIndexes( const string &ns ) {
-        return query( Namespace( ns.c_str() ).getSisterNS( "system.indexes" ).c_str() , BSON( "ns" << ns ) );
+        return query( NamespaceString( ns ).getSystemIndexesCollection() , BSON( "ns" << ns ) );
     }
 
     void DBClientWithCommands::dropIndex( const string& ns , BSONObj keys ) {
@@ -1162,7 +1196,7 @@ namespace mongo {
     void DBClientWithCommands::dropIndex( const string& ns , const string& indexName ) {
         BSONObj info;
         if ( ! runCommand( nsToDatabase( ns ) ,
-                           BSON( "deleteIndexes" << NamespaceString( ns ).coll << "index" << indexName ) ,
+                           BSON( "deleteIndexes" << nsToCollectionSubstring(ns) << "index" << indexName ) ,
                            info ) ) {
             LOG(_logLevel) << "dropIndex failed: " << info << endl;
             uassert( 10007 ,  "dropIndex failed" , 0 );
@@ -1172,9 +1206,12 @@ namespace mongo {
 
     void DBClientWithCommands::dropIndexes( const string& ns ) {
         BSONObj info;
-        uassert( 10008 ,  "dropIndexes failed" , runCommand( nsToDatabase( ns ) ,
-                 BSON( "deleteIndexes" << NamespaceString( ns ).coll << "index" << "*") ,
-                 info ) );
+        uassert( 10008,
+                 "dropIndexes failed",
+                 runCommand( nsToDatabase( ns ),
+                             BSON( "deleteIndexes" << nsToCollectionSubstring(ns) << "index" << "*"),
+                             info )
+                 );
         resetIndexCache();
     }
 
@@ -1189,7 +1226,7 @@ namespace mongo {
 
         for ( list<BSONObj>::iterator i=all.begin(); i!=all.end(); i++ ) {
             BSONObj o = *i;
-            insert( Namespace( ns.c_str() ).getSisterNS( "system.indexes" ).c_str() , o );
+            insert( NamespaceString( ns ).getSystemIndexesCollection() , o );
         }
 
     }
@@ -1259,7 +1296,7 @@ namespace mongo {
         if ( ttl > 0 )
             toSave.append( "expireAfterSeconds", ttl );
 
-        insert( Namespace( ns.c_str() ).getSisterNS( "system.indexes"  ).c_str() , toSave.obj() );
+        insert( NamespaceString( ns ).getSystemIndexesCollection() , toSave.obj() );
         return 1;
     }
 
@@ -1392,21 +1429,14 @@ namespace mongo {
 
 #ifdef MONGO_SSL
     static SimpleMutex s_mtx("SSLManager");
-    static SSLManager* s_sslMgr(NULL);
+    static SSLManagerInterface* s_sslMgr(NULL);
 
-    SSLManager* DBClientConnection::sslManager() {
+    SSLManagerInterface* DBClientConnection::sslManager() {
         SimpleMutex::scoped_lock lk(s_mtx);
         if (s_sslMgr) 
             return s_sslMgr;
-        const SSLParams params(cmdLine.sslPEMKeyFile, 
-                               cmdLine.sslPEMKeyPassword,
-                               cmdLine.sslCAFile,
-                               cmdLine.sslCRLFile,
-                               cmdLine.sslWeakCertificateValidation,
-                               cmdLine.sslFIPSMode);
-        s_sslMgr = new SSLManager(params);
+        s_sslMgr = getSSLManager();
         
-
         return s_sslMgr;
     }
 #endif

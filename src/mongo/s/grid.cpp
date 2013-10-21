@@ -14,33 +14,47 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
+
+#include "mongo/s/grid.h"
 
 #include "pcrecpp.h"
 #include <iomanip>
 
 #include "mongo/client/connpool.h"
 #include "mongo/db/json.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/mongos_options.h"
 #include "mongo/s/shard.h"
 #include "mongo/s/type_collection.h"
 #include "mongo/s/type_database.h"
 #include "mongo/s/type_settings.h"
 #include "mongo/s/type_shard.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/startup_test.h"
 #include "mongo/util/stringutils.h"
 
 namespace mongo {
 
-    DBConfigPtr Grid::getDBConfig( string database , bool create , const string& shardNameHint ) {
-        {
-            string::size_type i = database.find( "." );
-            if ( i != string::npos )
-                database = database.substr( 0 , i );
-        }
+    MONGO_FP_DECLARE(neverBalance);
+
+    DBConfigPtr Grid::getDBConfig( const StringData& ns , bool create , const string& shardNameHint ) {
+        string database = nsToDatabase( ns );
 
         if ( database == "config" )
             return configServerPtr;
@@ -291,7 +305,7 @@ namespace mongo {
                 vector<HostAndPort> hosts = servers.getServers();
                 for ( size_t i = 0 ; i < hosts.size() ; i++ ) {
                     if (!hosts[i].hasPort()) {
-                        hosts[i].setPort(CmdLine::DefaultDBPort);
+                        hosts[i].setPort(ServerGlobalParams::DefaultDBPort);
                     }
                     string host = hosts[i].toString(); // host:port
                     if ( hostSet.find( host ) == hostSet.end() ) {
@@ -421,6 +435,12 @@ namespace mongo {
             }
         }
 
+        // Record in changelog
+        BSONObjBuilder shardDetails;
+        shardDetails.append("name", *name);
+        shardDetails.append("host", servers.toString());
+        configServer.logChange("addShard", "", shardDetails.obj());
+
         return true;
     }
 
@@ -463,6 +483,9 @@ namespace mongo {
      * collection.
      */
     bool Grid::shouldBalance( const string& ns, BSONObj* balancerDocOut ) const {
+
+        // Allow disabling the balancer for testing
+        if ( MONGO_FAIL_POINT(neverBalance) ) return false;
 
         ScopedDbConnection conn(configServer.getPrimary().getConnString(), 30);
         BSONObj balancerDoc;
@@ -532,13 +555,10 @@ namespace mongo {
             return true;
         }
 
-        if ( logLevel ) {
-            stringstream ss;
-            ss << " now: " << now
-               << " startTime: " << startTime 
-               << " stopTime: " << stopTime;
-            log() << "_inBalancingWindow: " << ss.str() << endl;
-        }
+        LOG(1).stream() << "_inBalancingWindow: "
+                        << " now: " << now
+                        << " startTime: " << startTime
+                        << " stopTime: " << stopTime;
 
         // allow balancing if during the activeWindow
         // note that a window may be open during the night
@@ -595,7 +615,7 @@ namespace mongo {
     public:
         void run() {
             
-            if ( ! cmdLine.isMongos() )
+            if (!isMongos())
                 return;
 
             // T0 < T1 < now < T2 < T3 and Error

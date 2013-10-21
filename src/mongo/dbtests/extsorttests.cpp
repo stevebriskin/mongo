@@ -16,14 +16,18 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <boost/thread.hpp>
+
 #include "mongo/db/extsort.h"
-
+#include "mongo/db/index/btree_based_builder.h"
 #include "mongo/db/pdfile.h"
-#include "mongo/platform/cstdint.h"
-
 #include "mongo/dbtests/dbtests.h"
+#include "mongo/platform/cstdint.h"
+#include "mongo/unittest/temp_dir.h"
 
 namespace ExtSortTests {
+    using boost::make_shared;
+    using namespace sorter;
 
     bool isSolaris() {
 #ifdef __sunos__
@@ -35,13 +39,14 @@ namespace ExtSortTests {
 
     static const char* const _ns = "unittests.extsort";
     DBDirectClient _client;
-    IndexInterface& _arbitraryIndexInterface = *IndexDetails::iis[ time( 0 ) % 2 ];
+    ExternalSortComparison* _arbitrarySort = BtreeBasedBuilder::getComparison(time(0)%2, BSONObj());
+    ExternalSortComparison* _aFirstSort = BtreeBasedBuilder::getComparison(0, BSON("a" << 1));
 
     /** Sort four values. */
     class SortFour {
     public:
         void run() {
-            BSONObjExternalSorter sorter( _arbitraryIndexInterface );
+            BSONObjExternalSorter sorter( _arbitrarySort );
 
             sorter.add( BSON( "x" << 10 ), DiskLoc( 5, 1 ), false );
             sorter.add( BSON( "x" << 2 ), DiskLoc( 3, 1 ), false );
@@ -74,7 +79,7 @@ namespace ExtSortTests {
     class SortFourCheckDiskLoc {
     public:
         void run() {
-            BSONObjExternalSorter sorter( _arbitraryIndexInterface, BSONObj(), 10 );
+            BSONObjExternalSorter sorter( _arbitrarySort, 10 );
             sorter.add( BSON( "x" << 10 ), DiskLoc( 5, 11 ), false );
             sorter.add( BSON( "x" << 2 ), DiskLoc( 3, 1 ), false );
             sorter.add( BSON( "x" << 5 ), DiskLoc( 6, 1 ), false );
@@ -107,7 +112,7 @@ namespace ExtSortTests {
     class SortNone {
     public:
         void run() {
-            BSONObjExternalSorter sorter( _arbitraryIndexInterface, BSONObj(), 10 );
+            BSONObjExternalSorter sorter( _arbitrarySort, 10 );
             sorter.sort( false );
 
             auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
@@ -119,7 +124,7 @@ namespace ExtSortTests {
     class SortByDiskLock {
     public:
         void run() {
-            BSONObjExternalSorter sorter( _arbitraryIndexInterface );
+            BSONObjExternalSorter sorter( _arbitrarySort );
             sorter.add( BSON( "x" << 10 ), DiskLoc( 5, 4 ), false );
             sorter.add( BSON( "x" << 2 ), DiskLoc( 3, 0 ), false );
             sorter.add( BSON( "x" << 5 ), DiskLoc( 6, 2 ), false );
@@ -151,7 +156,7 @@ namespace ExtSortTests {
     class Sort1e4 {
     public:
         void run() {
-            BSONObjExternalSorter sorter( _arbitraryIndexInterface, BSONObj() , 2000 );
+            BSONObjExternalSorter sorter( _arbitrarySort, 2000 );
             for ( int i=0; i<10000; i++ ) {
                 sorter.add( BSON( "x" << rand() % 10000 ), DiskLoc( 5, i ), false );
             }
@@ -177,7 +182,7 @@ namespace ExtSortTests {
     public:
         void run() {
             const int total = 100000;
-            BSONObjExternalSorter sorter( _arbitraryIndexInterface, BSONObj() , total * 2 );
+            BSONObjExternalSorter sorter( _arbitrarySort, total * 2 );
             for ( int i=0; i<total; i++ ) {
                 sorter.add( BSON( "a" << "b" ), DiskLoc( 5, i ), false );
             }
@@ -204,7 +209,7 @@ namespace ExtSortTests {
     public:
         void run() {
             const int total = 1000 * 1000;
-            BSONObjExternalSorter sorter( _arbitraryIndexInterface, BSONObj() , total * 2 );
+            BSONObjExternalSorter sorter( _arbitrarySort, total * 2 );
             for ( int i=0; i<total; i++ ) {
                 sorter.add( BSON( "abcabcabcabd" << "basdasdasdasdasdasdadasdasd" << "x" << i ),
                             DiskLoc( 5, i ),
@@ -237,7 +242,7 @@ namespace ExtSortTests {
             b.appendNull("");
             BSONObj x = b.obj();
 
-            BSONObjExternalSorter sorter( _arbitraryIndexInterface );
+            BSONObjExternalSorter sorter( _arbitrarySort );
             sorter.add(x, DiskLoc(3,7), false);
             sorter.add(x, DiskLoc(4,7), false);
             sorter.add(x, DiskLoc(2,7), false);
@@ -248,7 +253,7 @@ namespace ExtSortTests {
 
             auto_ptr<BSONObjExternalSorter::Iterator> i = sorter.iterator();
             while( i->more() ) {
-                BSONObjExternalSorter::Data d = i->next();
+                ExternalSortDatum d = i->next();
             }
         }
     };
@@ -258,7 +263,7 @@ namespace ExtSortTests {
     public:
         void run() {
             // Create a sorter.
-            BSONObjExternalSorter sorter( IndexInterface::defaultVersion(), BSON( "a" << 1 ) );
+            BSONObjExternalSorter sorter(_aFirstSort);
             // Add keys to the sorter.
             int32_t nDocs = 130;
             for( int32_t i = 0; i < nDocs; ++i ) {
@@ -298,12 +303,12 @@ namespace ExtSortTests {
             theDataFileMgr.insertWithObjMod( _ns, newDoc );
             // Create a sorter with a max file size of only 10k, to trigger a file flush after a
             // relatively small number of inserts.
-            BSONObjExternalSorter sorter( IndexInterface::defaultVersion(),
-                                          BSON( "a" << 1 ),
-                                          10 * 1024 );
+            auto_ptr<ExternalSortComparison> cmp(BtreeBasedBuilder::getComparison(0,
+                BSON("a" << 1)));
+            BSONObjExternalSorter sorter(cmp.get(), 10 * 1024 );
             // Register a request to kill the current operation.
             cc().curop()->kill();
-            if ( _mayInterrupt && !isSolaris() ) { // This interrupt is unsupported on solaris.
+            if (_mayInterrupt) {
                 // When enough keys are added to fill the first file, an interruption will be
                 // triggered as the records are sorted for the file.
                 ASSERT_THROWS( addKeysUntilFileFlushed( &sorter, _mayInterrupt ), UserException );
@@ -341,7 +346,7 @@ namespace ExtSortTests {
             BSONObj newDoc;
             theDataFileMgr.insertWithObjMod( _ns, newDoc );
             // Create a sorter.
-            BSONObjExternalSorter sorter( IndexInterface::defaultVersion(), BSON( "a" << 1 ) );
+            BSONObjExternalSorter sorter(_aFirstSort);
             // Add keys to the sorter.
             int32_t nDocs = 130;
             for( int32_t i = 0; i < nDocs; ++i ) {
@@ -350,14 +355,15 @@ namespace ExtSortTests {
             ASSERT( sorter.getCurSizeSoFar() > 0 );
             // Register a request to kill the current operation.
             cc().curop()->kill();
-            if ( _mayInterrupt && !isSolaris() ) { // This interrupt is unsupported on solaris.
+            if (_mayInterrupt) {
                 // The sort is aborted due to the kill request.
-                ASSERT_THROWS( sorter.sort( _mayInterrupt ), UserException );
-                // TODO Check that an iterator cannot be retrieved because the keys are unsorted (Not
-                // currently implemented.)
-                if ( 0 ) {
-                    ASSERT_THROWS( sorter.iterator(), UserException );
-                }
+                ASSERT_THROWS( {
+                    sorter.sort( _mayInterrupt );
+                    auto_ptr<BSONObjExternalSorter::Iterator> iter = sorter.iterator();
+                    while (iter->more()) {
+                        iter->next();
+                    }
+                }, UserException );
             }
             else {
                 // Sort the keys.
@@ -374,6 +380,9 @@ namespace ExtSortTests {
     private:
         bool _mayInterrupt;
     };
+
+
+
 
     class ExtSortTests : public Suite {
     public:

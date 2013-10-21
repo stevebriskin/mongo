@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/pch.h"
@@ -21,8 +33,10 @@
 #include "mongo/db/ops/query.h"
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/client/dbclientinterface.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/kill_current_op.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/parsed_query.h"
 #include "mongo/db/pdfile.h"
@@ -30,14 +44,16 @@
 #include "mongo/db/query_optimizer.h"
 #include "mongo/db/query_optimizer_internal.h"
 #include "mongo/db/queryoptimizercursor.h"
+#include "mongo/db/query/new_find.h"
 #include "mongo/db/repl/finding_start_cursor.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_reads_ok.h"
-#include "mongo/db/replutil.h"
 #include "mongo/db/scanandorder.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/stale_exception.h"  // for SendStaleConfigException
 #include "mongo/server.h"
+#include "mongo/util/fail_point_service.h"
 
 namespace mongo {
 
@@ -45,6 +61,8 @@ namespace mongo {
        a little bit more than this, it is a threshold rather than a limit.
     */
     const int32_t MaxBytesToReturnToClientAtOnce = 4 * 1024 * 1024;
+
+    MONGO_FP_DECLARE(getMoreError);
 
     bool runCommands(const char *ns, BSONObj& jsobj, CurOp& curop, BufBuilder &b, BSONObjBuilder& anObjBuilder, bool fromRepl, int queryOptions) {
         try {
@@ -88,6 +106,17 @@ namespace mongo {
         return qr;
     }
 
+    static BSONObj extractKey(Cursor* c, const KeyPattern& usingKeyPattern ) {
+        KeyPattern currentIndex( c->indexKeyPattern() );
+        if ( usingKeyPattern.isCoveredBy( currentIndex ) && ! currentIndex.isSpecial() ){
+            BSONObj currKey = c->currKey();
+            BSONObj prettyKey = currKey.replaceFieldNames( currentIndex.toBSON() );
+            return usingKeyPattern.extractSingleKey( prettyKey );
+        }
+
+        return usingKeyPattern.extractSingleKey( c->current() );
+    }
+
     QueryResult* processGetMore(const char* ns,
                                 int ntoreturn,
                                 long long cursorid,
@@ -95,6 +124,28 @@ namespace mongo {
                                 int pass,
                                 bool& exhaust,
                                 bool* isCursorAuthorized ) {
+
+        if (isNewQueryFrameworkEnabled()) {
+            bool useNewSystem = false;
+
+            // Scoped to kill the pin after seeing if the runner's there.
+            {
+                // See if there's a runner.  We do this because some CCs may be cursors and some may
+                // be runners until we're done implementing all new functionality in the new
+                // system...
+                ClientCursorPin p(cursorid);
+                ClientCursor *cc = p.c();
+                if (NULL != cc && NULL != cc->getRunner()) {
+                    useNewSystem = true;
+                }
+            }
+
+            if (useNewSystem) {
+                return newGetMore(ns, ntoreturn, cursorid, curop, pass, exhaust,
+                                  isCursorAuthorized);
+            }
+        }
+
         exhaust = false;
 
         int bufSize = 512 + sizeof( QueryResult ) + MaxBytesToReturnToClientAtOnce;
@@ -105,13 +156,12 @@ namespace mongo {
         int start = 0;
         int n = 0;
 
-        Client::ReadContext ctx(ns);
+        scoped_ptr<Client::ReadContext> ctx(new Client::ReadContext(ns));
         // call this readlocked so state can't change
         replVerifyReadsOk();
 
-        ClientCursor::Pin p(cursorid);
+        ClientCursorPin p(cursorid);
         ClientCursor *cc = p.c();
-
 
         if ( unlikely(!cc) ) {
             LOGSOME << "getMore: cursorid not found " << ns << " " << cursorid << endl;
@@ -119,10 +169,26 @@ namespace mongo {
             resultFlags = ResultFlag_CursorNotFound;
         }
         else {
+            // Some internal users create a ClientCursor with a Runner.  Don't crash if this
+            // happens.  Instead, hand them off to the new framework.
+            if (NULL != cc->getRunner()) {
+                p.release();
+                return newGetMore(ns, ntoreturn, cursorid, curop, pass, exhaust, isCursorAuthorized);
+            }
+
             // check for spoofing of the ns such that it does not match the one originally there for the cursor
             uassert(14833, "auth error", str::equals(ns, cc->ns().c_str()));
 
             *isCursorAuthorized = true;
+
+            // This must be done after auth check to ensure proper cleanup.
+            uassert(16951, "failing getmore due to set failpoint",
+                    !MONGO_FAIL_POINT(getMoreError));
+
+            // If the operation that spawned this cursor had a time limit set, apply leftover
+            // time to this getmore.
+            curop.setMaxTimeMicros( cc->getLeftoverMaxTimeMicros() );
+            killCurrentOp.checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
             if ( pass == 0 )
                 cc->updateSlaveLocation( curop );
@@ -134,19 +200,29 @@ namespace mongo {
 
             start = cc->pos();
             Cursor *c = cc->c();
+
+            if (!c->requiresLock()) {
+                // make sure it won't be destroyed under us
+                fassert(16952, !c->shouldDestroyOnNSDeletion());
+                fassert(16953, !c->supportYields());
+                ctx.reset(); // unlocks
+            }
+
             c->recoverFromYield();
             DiskLoc last;
 
-            // This manager may be stale, but it's the state of chunking when the cursor was created.
-            ShardChunkManagerPtr manager = cc->getChunkManager();
+            // This metadata may be stale, but it's the state of chunking when the cursor was
+            // created.
+            CollectionMetadataPtr metadata = cc->getCollMetadata();
+            KeyPattern keyPattern( metadata ? metadata->getKeyPattern() : BSONObj() );
 
             while ( 1 ) {
                 if ( !c->ok() ) {
                     if ( c->tailable() ) {
-                        /* when a tailable cursor hits "EOF", ok() goes false, and current() is null.  however
-                           advance() can still be retries as a reactivation attempt.  when there is new data, it will
-                           return true.  that's what we are doing here.
-                           */
+                        // when a tailable cursor hits "EOF", ok() goes false, and current() is
+                        // null.  however advance() can still be retries as a reactivation attempt.
+                        // when there is new data, it will return true.  that's what we are doing
+                        // here.
                         if ( c->advance() )
                             continue;
 
@@ -173,8 +249,9 @@ namespace mongo {
                 // in some cases (clone collection) there won't be a matcher
                 if ( !c->currentMatches( &details ) ) {
                 }
-                else if ( manager && ! manager->belongsToMe( cc ) ){
-                    LOG(2) << "cursor skipping document in un-owned chunk: " << c->current() << endl;
+                else if ( metadata && !metadata->keyBelongsToMe( extractKey(c, keyPattern ) ) ) {
+                    LOG(2) << "cursor skipping document in un-owned chunk: " << c->current()
+                               << endl;
                 }
                 else {
                     if( c->getsetdup(c->currLoc()) ) {
@@ -184,7 +261,17 @@ namespace mongo {
                         last = c->currLoc();
                         n++;
 
-                        cc->fillQueryResultFromObj( b, &details );
+                        // Fill out the fields requested by the query.
+                        const Projection::KeyOnly *keyFieldsOnly = c->keyFieldsOnly();
+                        if ( keyFieldsOnly ) {
+                            fillQueryResultFromObj( b, 0, keyFieldsOnly->hydrate(
+                            c->currKey() ), &details );
+                        }
+                        else {
+                            DiskLoc loc = c->currLoc();
+                            fillQueryResultFromObj( b, cc->fields.get(), c->current(), &details,
+                                    ( ( cc->pq.get() && cc->pq->showDiskLoc() ) ? &loc : 0 ) );
+                        }
 
                         if ( ( ntoreturn && n >= ntoreturn ) || b.len() > MaxBytesToReturnToClientAtOnce ) {
                             c->advance();
@@ -212,9 +299,12 @@ namespace mongo {
                 else {
                     cc->c()->noteLocation();
                 }
-                cc->mayUpgradeStorage();
                 cc->storeOpForSlave( last );
                 exhaust = cc->queryOptions() & QueryOption_Exhaust;
+
+                // If the getmore had a time limit, remaining time is "rolled over" back to the
+                // cursor (for use by future getmore ops).
+                cc->setLeftoverMaxTimeMicros( curop.getRemainingMaxTimeMicros() );
             }
         }
 
@@ -535,7 +625,7 @@ namespace mongo {
     }
     
     void QueryResponseBuilder::init( const QueryPlanSummary &queryPlan, const BSONObj &oldPlan ) {
-        _chunkManager = newChunkManager();
+        _collMetadata = newCollMetadata();
         _explain = newExplainRecordingStrategy( queryPlan, oldPlan );
         _builder = newResponseBuildStrategy( queryPlan );
         _builder->resetBuf();
@@ -598,11 +688,11 @@ namespace mongo {
         return _builder->bufferedMatches();
     }
 
-    ShardChunkManagerPtr QueryResponseBuilder::newChunkManager() const {
-        if ( !shardingState.needShardChunkManager( _parsedQuery.ns() ) ) {
-            return ShardChunkManagerPtr();
+    CollectionMetadataPtr QueryResponseBuilder::newCollMetadata() const {
+        if ( !shardingState.needCollectionMetadata( _parsedQuery.ns() ) ) {
+            return CollectionMetadataPtr();
         }
-        return shardingState.getShardChunkManager( _parsedQuery.ns() );
+        return shardingState.getCollectionMetadata( _parsedQuery.ns() );
     }
 
     shared_ptr<ExplainRecordingStrategy> QueryResponseBuilder::newExplainRecordingStrategy
@@ -659,12 +749,13 @@ namespace mongo {
     }
 
     bool QueryResponseBuilder::chunkMatches( ResultDetails* resultDetails ) {
-        if ( !_chunkManager ) {
+        if ( !_collMetadata ) {
             return true;
         }
         // TODO: should make this covered at some point
         resultDetails->loadedRecord = true;
-        if ( _chunkManager->belongsToMe( _cursor->current() ) ) {
+        KeyPattern kp( _collMetadata->getKeyPattern() );
+        if ( _collMetadata->keyBelongsToMe( kp.extractSingleKey( _cursor->current() ) ) ) {
             return true;
         }
         resultDetails->chunkSkip = true;
@@ -680,7 +771,7 @@ namespace mongo {
                                     const BSONObj &query, const BSONObj &order,
                                     const shared_ptr<ParsedQuery> &pq_shared,
                                     const BSONObj &oldPlan,
-                                    const ConfigVersion &shardingVersionAtStart,
+                                    const ChunkVersion &shardingVersionAtStart,
                                     scoped_ptr<PageFaultRetryableSection>& parentPageFaultSection,
                                     scoped_ptr<NoPageFaultsAllowed>& noPageFault,
                                     Message &result ) {
@@ -707,7 +798,7 @@ namespace mongo {
                 ( QueryResponseBuilder::make( pq, cursor, queryPlan, oldPlan ) );
         bool saveClientCursor = false;
         OpTime slaveReadTill;
-        ClientCursor::Holder ccPointer( new ClientCursor( QueryOption_NoCursorTimeout, cursor,
+        ClientCursorHolder ccPointer( new ClientCursor( QueryOption_NoCursorTimeout, cursor,
                                                          ns ) );
         
         for( ; cursor->ok(); cursor->advance() ) {
@@ -782,7 +873,9 @@ namespace mongo {
             // we might be missing some data
             // and its safe to send this as mongos can resend
             // at this point
-            throw SendStaleConfigException( ns , "version changed during initial query", shardingVersionAtStart, shardingState.getVersion( ns ) );
+            throw SendStaleConfigException(ns, "version changed during initial query",
+                                           shardingVersionAtStart,
+                                           shardingState.getVersion(ns));
         }
         
         parentPageFaultSection.reset(0);
@@ -797,7 +890,7 @@ namespace mongo {
             ccPointer.reset( new ClientCursor( queryOptions, cursor, ns,
                                               jsobj.getOwned() ) );
             cursorid = ccPointer->cursorid();
-            DEV tlog(2) << "query has more, cursorid: " << cursorid << endl;
+            DEV { MONGO_TLOG(2) << "query has more, cursorid: " << cursorid << endl; }
             if ( cursor->supportYields() ) {
                 ClientCursor::YieldData data;
                 ccPointer->prepareToYield( data );
@@ -812,7 +905,10 @@ namespace mongo {
             }
             
             if ( !ccPointer->ok() && ccPointer->c()->tailable() ) {
-                DEV tlog() << "query has no more but tailable, cursorid: " << cursorid << endl;
+                DEV {
+                    MONGO_TLOG(0) << "query has no more but tailable, cursorid: " << cursorid <<
+                        endl;
+                }
             }
             
             if( queryOptions & QueryOption_Exhaust ) {
@@ -820,10 +916,15 @@ namespace mongo {
             }
             
             // Set attributes for getMore.
-            ccPointer->setChunkManager( queryResponseBuilder->chunkManager() );
+            ccPointer->setCollMetadata( queryResponseBuilder->collMetadata() );
             ccPointer->setPos( nReturned );
             ccPointer->pq = pq_shared;
             ccPointer->fields = pq.getFieldPtr();
+
+            // If the query had a time limit, remaining time is "rolled over" to the cursor (for
+            // use by future getmore ops).
+            ccPointer->setLeftoverMaxTimeMicros( curop.getRemainingMaxTimeMicros() );
+
             ccPointer.release();
         }
         
@@ -867,7 +968,7 @@ namespace mongo {
                     
                     BSONObj resObject; // put inside since we don't own the memory
                     
-                    Client::ReadContext ctx( ns , dbpath ); // read locks
+                    Client::ReadContext ctx(ns, storageGlobalParams.dbpath); // read locks
                     replVerifyReadsOk(&pq);
                     
                     bool found = Helpers::findById( currentClient, ns, query, resObject, &nsFound, &indexFound );
@@ -876,14 +977,17 @@ namespace mongo {
                         return false;
                     }
                     
-                    if ( shardingState.needShardChunkManager( ns ) ) {
-                        ShardChunkManagerPtr m = shardingState.getShardChunkManager( ns );
-                        if ( m && ! m->belongsToMe( resObject ) ) {
-                            // I have something this _id
-                            // but it doesn't belong to me
-                            // so return nothing
-                            resObject = BSONObj();
-                            found = false;
+                    if ( shardingState.needCollectionMetadata( ns ) ) {
+                        CollectionMetadataPtr m = shardingState.getCollectionMetadata( ns );
+                        if ( m ) {
+                            KeyPattern kp( m->getKeyPattern() );
+                            if ( !m->keyBelongsToMe( kp.extractSingleKey( resObject ) ) ) {
+                                // I have something this _id
+                                // but it doesn't belong to me
+                                // so return nothing
+                                resObject = BSONObj();
+                                found = false;
+                            }
                         }
                     }
                     
@@ -935,8 +1039,7 @@ namespace mongo {
         
         uassert( 16332 , "can't have an empty ns" , ns[0] );
 
-        if( logLevel >= 2 )
-            log() << "runQuery called " << ns << " " << jsobj << endl;
+        LOG(2) << "runQuery called " << ns << " " << jsobj << endl;
 
         curop.debug().ns = ns;
         curop.debug().ntoreturn = pq.getNumToReturn();
@@ -947,8 +1050,13 @@ namespace mongo {
         uassert( 16256, str::stream() << "Invalid ns [" << ns << "]", nsString.isValid() );
 
         // Run a command.
-        
-        if ( pq.couldBeCommand() ) {
+
+        if ( nsString.isCommand() ) {
+            int nToReturn = pq.getNumToReturn();
+            uassert( 16979, str::stream() << "bad numberToReturn (" << nToReturn
+                                          << ") for $cmd type ns - can only be 1 or -1",
+                     nToReturn == 1 || nToReturn == -1 );
+
             curop.markCommand();
             BufBuilder bb;
             bb.skip(sizeof(QueryResult));
@@ -990,6 +1098,17 @@ namespace mongo {
             uassert( 10110 , "bad query object", false);
         }
 
+        if (isNewQueryFrameworkEnabled()) {
+            // TODO: Copy prequel curop debugging into runNewQuery
+            CanonicalQuery* cq = NULL;
+            if (canUseNewSystem(q, &cq)) {
+                return newRunQuery(cq, curop, result);
+            }
+        }
+
+        // Handle query option $maxTimeMS (not used with commands).
+        curop.setMaxTimeMicros(static_cast<unsigned long long>(pq.getMaxTimeMS()) * 1000);
+        killCurrentOp.checkForInterrupt(); // May trigger maxTimeAlwaysTimeOut fail point.
 
         // Run a simple id query.
         if ( ! (explain || pq.showDiskLoc()) && isSimpleIdQuery( query ) && !pq.hasOption( QueryOption_CursorTailable ) ) {
@@ -1019,8 +1138,8 @@ namespace mongo {
             }
                 
             try {
-                Client::ReadContext ctx( ns , dbpath ); // read locks
-                const ConfigVersion shardingVersionAtStart = shardingState.getVersion( ns );
+                Client::ReadContext ctx(ns, storageGlobalParams.dbpath); // read locks
+                const ChunkVersion shardingVersionAtStart = shardingState.getVersion( ns );
                 
                 replVerifyReadsOk(&pq);
                 

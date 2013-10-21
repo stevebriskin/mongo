@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -21,30 +33,35 @@
 #include "mongo/db/ops/delete.h"
 
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/cc_by_loc.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/cursor.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/query_optimizer.h"
 #include "mongo/db/queryutil.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/structure/collection.h"
 #include "mongo/util/stacktrace.h"
 
 namespace mongo {
-    
+
     /* ns:      namespace, e.g. <database>.<collection>
        pattern: the "where" clause / criteria
        justOne: stop after 1 match
        god:     allow access to system namespaces, and don't yield
     */
-    long long deleteObjects(const char *ns, BSONObj pattern, bool justOne, bool logop, bool god, RemoveSaver * rs ) {
+    long long deleteObjects(const StringData& ns, BSONObj pattern, bool justOne, bool logop, bool god) {
         if( !god ) {
-            if ( strstr(ns, ".system.") ) {
+            if ( ns.find( ".system.") != string::npos ) {
                 /* note a delete from system.indexes would corrupt the db
                 if done here, as there are pointers into those objects in
                 NamespaceDetails.
                 */
-                uassert(12050, "cannot delete from system namespace", legalClientSystemNS( ns , true ) );
+                uassert(12050, "cannot delete from system namespace", legalClientSystemNS( ns, true ) );
             }
-            if ( strchr( ns , '$' ) ) {
+            if ( ns.find( '$' ) != string::npos ) {
                 log() << "cannot delete from collection with reserved $ in name: " << ns << endl;
-                uassert( 10100 ,  "cannot delete from collection with reserved $ in name", strchr(ns, '$') == 0 );
+                uasserted( 10100, "cannot delete from collection with reserved $ in name" );
             }
         }
 
@@ -52,8 +69,10 @@ namespace mongo {
             NamespaceDetails *d = nsdetails( ns );
             if ( ! d )
                 return 0;
-            uassert( 10101 ,  "can't remove from a capped collection" , ! d->isCapped() );
+            uassert( 10101, "can't remove from a capped collection", ! d->isCapped() );
         }
+
+        string nsForLoOp = ns.toString(); // XXX-ERH
 
         long long nDeleted = 0;
 
@@ -125,17 +144,16 @@ namespace mongo {
                     BSONObjBuilder b;
                     b.append( e );
                     bool replJustOne = true;
-                    logOp( "d", ns, b.done(), 0, &replJustOne );
+                    logOp( "d", nsForLoOp.c_str(), b.done(), 0, &replJustOne );
                 }
                 else {
                     problem() << "deleted object without id, not logging" << endl;
                 }
             }
 
-            if ( rs )
-                rs->goingToDelete( rloc.obj() /*cc->c->current()*/ );
+            //theDataFileMgr.deleteRecord(ns, rloc.rec(), rloc);
+            currentClient.get()->database()->getCollection( ns )->deleteDocument( rloc );
 
-            theDataFileMgr.deleteRecord(ns, rloc.rec(), rloc);
             nDeleted++;
             if ( foundAllResults ) {
                 break;

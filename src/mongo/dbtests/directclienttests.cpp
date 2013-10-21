@@ -17,13 +17,14 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
-#include "../db/db.h"
-#include "../db/instance.h"
-#include "../db/json.h"
-#include "../db/lasterror.h"
-#include "../util/timer.h"
-#include "dbtests.h"
+#include "mongo/pch.h"
+
+#include "mongo/db/db.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/json.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/util/timer.h"
 
 namespace DirectClientTests {
 
@@ -102,15 +103,21 @@ namespace DirectClientTests {
     public:
         virtual void run(){
             auto_ptr<DBClientCursor> cursor = client().query( "", Query(), 1 );
+            ASSERT(cursor->more());
             BSONObj result = cursor->next().getOwned();
             ASSERT( result.hasField( "$err" ));
+            ASSERT_EQUALS(result["code"].Int(), 16332);
         }
     };
 
     class BadNSGetMore : ClientBase {
     public:
         virtual void run(){
-            ASSERT( !client().getMore( "", 1, 1 )->more() );
+            auto_ptr<DBClientCursor> cursor = client().getMore("", 1, 1);
+            ASSERT(cursor->more());
+            BSONObj result = cursor->next().getOwned();
+            ASSERT(result.hasField("$err"));
+            ASSERT_EQUALS(result["code"].Int(), 16258);
         }
     };
 

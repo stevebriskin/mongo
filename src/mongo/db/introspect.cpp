@@ -14,18 +14,32 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
 
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/principal_set.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_set.h"
 #include "mongo/db/curop.h"
-#include "mongo/db/databaseholder.h"
+#include "mongo/db/database_holder.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/util/goodies.h"
 
 namespace {
@@ -35,10 +49,12 @@ namespace {
 namespace mongo {
 
 namespace {
-    void _appendUserInfo(const Client& c, BSONObjBuilder& builder, AuthorizationManager* authManager) {
-        PrincipalSet::NameIterator nameIter = authManager->getAuthenticatedPrincipalNames();
+    void _appendUserInfo(const Client& c,
+                         BSONObjBuilder& builder,
+                         AuthorizationSession* authSession) {
+        UserSet::NameIterator nameIter = authSession->getAuthenticatedUserNames();
 
-        PrincipalName bestUser;
+        UserName bestUser;
         if (nameIter.more())
             bestUser = *nameIter;
 
@@ -65,7 +81,7 @@ namespace {
     static void _profile(const Client& c, CurOp& currentOp, BufBuilder& profileBufBuilder) {
         Database *db = c.database();
         DEV verify( db );
-        const char *ns = db->profileName.c_str();
+        const char *ns = db->getProfilingNS();
 
         // build object
         BSONObjBuilder b(profileBufBuilder);
@@ -76,8 +92,8 @@ namespace {
         b.appendDate("ts", jsTime());
         b.append("client", c.clientAddress());
 
-        AuthorizationManager* authManager = c.getAuthorizationManager();
-        _appendUserInfo(c, b, authManager);
+        AuthorizationSession * authSession = c.getAuthorizationSession();
+        _appendUserInfo(c, b, authSession);
 
         BSONObj p = b.done();
 
@@ -90,7 +106,7 @@ namespace {
             BSONObjBuilder b(profileBufBuilder);
             b.appendDate("ts", jsTime());
             b.append("client", c.clientAddress() );
-            _appendUserInfo(c, b, authManager);
+            _appendUserInfo(c, b, authSession);
 
             b.append("err", "profile line too large (max is 100KB)");
 
@@ -119,8 +135,8 @@ namespace {
 
         try {
             Lock::DBWrite lk( currentOp.getNS() );
-            if ( dbHolder()._isLoaded( nsToDatabase( currentOp.getNS() ) , dbpath ) ) {
-                Client::Context cx(currentOp.getNS(), dbpath);
+            if (dbHolder()._isLoaded(nsToDatabase(currentOp.getNS()), storageGlobalParams.dbpath)) {
+                Client::Context cx(currentOp.getNS(), storageGlobalParams.dbpath);
                 _profile(c, currentOp, profileBufBuilder);
             }
             else {
@@ -137,21 +153,21 @@ namespace {
 
     NamespaceDetails* getOrCreateProfileCollection(Database *db, bool force, string* errmsg ) {
         fassert(16372, db);
-        const char* profileName = db->profileName.c_str();
-        NamespaceDetails* details = db->namespaceIndex.details(profileName);
-        if (!details && (cmdLine.defaultProfile || force)) {
+        const char* profileName = db->getProfilingNS();
+        NamespaceDetails* details = db->namespaceIndex().details(profileName);
+        if (!details && (serverGlobalParams.defaultProfile || force)) {
             // system.profile namespace doesn't exist; create it
             log() << "creating profile collection: " << profileName << endl;
             string myerrmsg;
-            if (!userCreateNS(db->profileName.c_str(),
+            if (!userCreateNS(profileName,
                               BSON("capped" << true << "size" << 1024 * 1024), myerrmsg , false)) {
-                myerrmsg = str::stream() << "could not create ns " << db->profileName << ": " << myerrmsg;
+                myerrmsg = str::stream() << "could not create ns " << profileName << ": " << myerrmsg;
                 log() << myerrmsg << endl;
                 if ( errmsg )
                     *errmsg = myerrmsg;
                 return NULL;
             }
-            details = db->namespaceIndex.details(profileName);
+            details = db->namespaceIndex().details(profileName);
         }
         else if ( details && !details->isCapped() ) {
             string myerrmsg = str::stream() << profileName << " exists but isn't capped";

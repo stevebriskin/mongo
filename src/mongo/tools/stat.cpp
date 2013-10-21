@@ -16,143 +16,75 @@
 
 #include "mongo/pch.h"
 
-#include <boost/program_options.hpp>
 #include <boost/thread/thread.hpp>
 #include <fstream>
 #include <iostream>
 
-#include "mongo/base/initializer.h"
+#include "mongo/base/init.h"
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/db/jsobjmanipulator.h"
 #include "mongo/db/json.h"
 #include "mongo/s/type_shard.h"
 #include "mongo/tools/stat_util.h"
+#include "mongo/tools/mongostat_options.h"
 #include "mongo/tools/tool.h"
 #include "mongo/util/net/httpclient.h"
+#include "mongo/util/options_parser/option_section.h"
 #include "mongo/util/text.h"
-
-namespace po = boost::program_options;
 
 namespace mongo {
 
     class Stat : public Tool {
     public:
 
-        Stat() : Tool( "stat" , REMOTE_SERVER , "admin" ) {
-            _http = false;
-            _many = false;
-
-            add_hidden_options()
-            ( "sleep" , po::value<int>() , "time to sleep between calls" )
-            ;
-            add_options()
-            ("noheaders", "don't output column names")
-            ("rowcount,n", po::value<int>()->default_value(0), "number of stats lines to print (0 for indefinite)")
-            ("http", "use http instead of raw db connection")
-            ("discover" , "discover nodes and display stats for all" )
-            ("all" , "all optional fields" )
-            ;
-
-            addPositionArg( "sleep" , 1 );
-
+        Stat() : Tool() {
             _autoreconnect = true;
         }
 
-        virtual void printExtraHelp( ostream & out ) {
-            out << "View live MongoDB performance statistics.\n" << endl;
-            out << "usage: " << _name << " [options] [sleep time]" << endl;
-            out << "sleep time: time to wait (in seconds) between calls" << endl;
-        }
-
-        virtual void printExtraHelpAfter( ostream & out ) {
-            out << "\n";
-            out << " Fields\n";
-            out << "   inserts  \t- # of inserts per second (* means replicated op)\n";
-            out << "   query    \t- # of queries per second\n";
-            out << "   update   \t- # of updates per second\n";
-            out << "   delete   \t- # of deletes per second\n";
-            out << "   getmore  \t- # of get mores (cursor batch) per second\n";
-            out << "   command  \t- # of commands per second, on a slave its local|replicated\n";
-            out << "   flushes  \t- # of fsync flushes per second\n";
-            out << "   mapped   \t- amount of data mmaped (total data size) megabytes\n";
-            out << "   vsize    \t- virtual size of process in megabytes\n";
-            out << "   res      \t- resident size of process in megabytes\n";
-            out << "   faults   \t- # of pages faults per sec\n";
-            out << "   locked   \t- name of and percent time for most locked database\n";
-            out << "   idx miss \t- percent of btree page misses (sampled)\n";
-            out << "   qr|qw    \t- queue lengths for clients waiting (read|write)\n";
-            out << "   ar|aw    \t- active clients (read|write)\n";
-            out << "   netIn    \t- network traffic in - bits\n";
-            out << "   netOut   \t- network traffic out - bits\n";
-            out << "   conn     \t- number of open connections\n";
-            out << "   set      \t- replica set name\n";
-            out << "   repl     \t- replication type \n";
-            out << "            \t    PRI - primary (master)\n";
-            out << "            \t    SEC - secondary\n";
-            out << "            \t    REC - recovering\n";
-            out << "            \t    UNK - unknown\n";
-            out << "            \t    SLV - slave\n";
-            out << "            \t    RTR - mongos process (\"router\")\n";
+        virtual void printHelp( ostream & out ) {
+            printMongoStatHelp(&out);
         }
 
         BSONObj stats() {
-            if ( _http ) {
+            if (mongoStatGlobalParams.http) {
                 HttpClient c;
                 HttpClient::Result r;
 
                 string url;
                 {
                     stringstream ss;
-                    ss << "http://" << _host;
-                    if ( _host.find( ":" ) == string::npos )
+                    ss << "http://" << toolGlobalParams.connectionString;
+                    if (toolGlobalParams.connectionString.find( ":" ) == string::npos)
                         ss << ":28017";
                     ss << "/_status";
                     url = ss.str();
                 }
 
                 if ( c.get( url , &r ) != 200 ) {
-                    cout << "error (http): " << r.getEntireResponse() << endl;
+                    toolError() << "error (http): " << r.getEntireResponse() << std::endl;
                     return BSONObj();
                 }
 
                 BSONObj x = fromjson( r.getBody() );
                 BSONElement e = x["serverStatus"];
                 if ( e.type() != Object ) {
-                    cout << "BROKEN: " << x << endl;
+                    toolError() << "BROKEN: " << x << std::endl;
                     return BSONObj();
                 }
                 return e.embeddedObjectUserCheck();
             }
             BSONObj out;
-            if ( ! conn().simpleCommand( _db , &out , "serverStatus" ) ) {
-                cout << "error: " << out << endl;
+            if (!conn().simpleCommand(toolGlobalParams.db, &out, "serverStatus")) {
+                toolError() << "error: " << out << std::endl;
                 return BSONObj();
             }
             return out.getOwned();
         }
 
-
-        virtual void preSetup() {
-            if ( hasParam( "http" ) ) {
-                _http = true;
-                _noconnection = true;
-            }
-
-            if ( hasParam( "host" ) &&
-                    getParam( "host" ).find( ',' ) != string::npos ) {
-                _noconnection = true;
-                _many = true;
-            }
-
-            if ( hasParam( "discover" ) ) {
-                _many = true;
-            }
-        }
-
         int run() {
-            _statUtil.setSeconds( getParam( "sleep" , 1 ) );
-            _statUtil.setAll( hasParam( "all" ) );
-            if ( _many )
+            _statUtil.setAll(mongoStatGlobalParams.allFields);
+            _statUtil.setSeconds(mongoStatGlobalParams.sleep);
+            if (mongoStatGlobalParams.many)
                 return runMany();
             return runNormal();
         }
@@ -199,8 +131,6 @@ namespace mongo {
         }
 
         int runNormal() {
-            bool showHeaders = ! hasParam( "noheaders" );
-            int rowCount = getParam( "rowcount" , 0 );
             int rowNum = 0;
 
             BSONObj prev = stats();
@@ -209,14 +139,15 @@ namespace mongo {
 
             int maxLockedDbWidth = 0;
 
-            while ( rowCount == 0 || rowNum < rowCount ) {
+            while (mongoStatGlobalParams.rowCount == 0 ||
+                   rowNum < mongoStatGlobalParams.rowCount) {
                 sleepsecs((int)ceil(_statUtil.getSeconds()));
                 BSONObj now;
                 try {
                     now = stats();
                 }
                 catch ( std::exception& e ) {
-                    cout << "can't get data: " << e.what() << endl;
+                    toolError() << "can't get data: " << e.what() << std::endl;
                     continue;
                 }
 
@@ -229,7 +160,7 @@ namespace mongo {
 
                     // adjust width up as longer 'locked db' values appear
                     setMaxLockedDbWidth( &out, &maxLockedDbWidth ); 
-                    if ( showHeaders && rowNum % 10 == 0 ) {
+                    if (mongoStatGlobalParams.showHeaders && rowNum % 10 == 0) {
                         printHeaders( out );
                     }
 
@@ -237,9 +168,9 @@ namespace mongo {
 
                 }
                 catch ( AssertionException& e ) {
-                    cout << "\nerror: " << e.what() << "\n"
-                         << now
-                         << endl;
+                    toolError() << "\nerror: " << e.what() << "\n"
+                              << now
+                              << std::endl;
                 }
 
                 prev = now;
@@ -287,7 +218,7 @@ namespace mongo {
         static void serverThread( shared_ptr<ServerState> state , int sleepTime) {
             try {
                 DBClientConnection conn( true );
-                conn._logLevel = 1;
+                conn._logLevel = logger::LogSeverity::Debug(1);
                 string errmsg;
                 if ( ! conn.connect( state->host , errmsg ) )
                     state->error = errmsg;
@@ -307,19 +238,24 @@ namespace mongo {
                             state->now = out.getOwned();
                         }
                         else {
+                            str::stream errorStream;
+                            errorStream << "serverStatus failed";
+                            BSONElement errorField = out["errmsg"];
+                            if (errorField.type() == String)
+                                errorStream << ": " << errorField.str();
                             scoped_lock lk( state->lock );
-                            state->error = "serverStatus failed";
+                            state->error = errorStream;
                             state->lastUpdate = time(0);
                         }
 
                         if ( out["shardCursorType"].type() == Object ||
-                             out["process"].String() == "mongos" ) {
+                             out["process"].str() == "mongos" ) {
                             state->mongos = true;
                             if ( cycleNumber % 10 == 1 ) {
                                 auto_ptr<DBClientCursor> c = conn.query( ShardType::ConfigNS , BSONObj() );
                                 vector<BSONObj> shards;
                                 while ( c->more() ) {
-                                    shards.push_back( c->next().getOwned() );
+                                    shards.push_back( c->nextSafe().getOwned() );
                                 }
                                 scoped_lock lk( state->lock );
                                 state->shards = shards;
@@ -337,10 +273,11 @@ namespace mongo {
 
             }
             catch ( std::exception& e ) {
-                cout << "serverThread (" << state->host << ") fatal error : " << e.what() << endl;
+                toolError() << "serverThread (" << state->host << ") fatal error : " << e.what()
+                          << std::endl;
             }
             catch ( ... ) {
-                cout << "serverThread (" << state->host << ") fatal error" << endl;
+                toolError() << "serverThread (" << state->host << ") fatal error" << std::endl;
             }
         }
 
@@ -357,10 +294,10 @@ namespace mongo {
             state->thr.reset( new boost::thread( boost::bind( serverThread,
                                                               state,
                                                               (int)ceil(_statUtil.getSeconds()) ) ) );
-            state->authParams = BSON( "user" << _username <<
-                                      "pwd" << _password <<
+            state->authParams = BSON( "user" << toolGlobalParams.username <<
+                                      "pwd" << toolGlobalParams.password <<
                                       "userSource" << getAuthenticationDatabase() <<
-                                      "mechanism" << _authenticationMechanism );
+                                      "mechanism" << toolGlobalParams.authenticationMechanism );
             return true;
         }
 
@@ -400,7 +337,7 @@ namespace mongo {
                     string errmsg;
                     ConnectionString cs = ConnectionString::parse( x["host"].String() , errmsg );
                     if ( errmsg.size() ) {
-                        cerr << errmsg << endl;
+                        toolError() << errmsg << std::endl;
                         continue;
                     }
 
@@ -419,12 +356,13 @@ namespace mongo {
             StateMap threads;
 
             {
-                string orig = getParam( "host" );
+                string orig = "localhost";
                 bool showPorts = false;
-                if ( orig == "" )
-                    orig = "localhost";
+                if (toolGlobalParams.hostSet) {
+                    orig = toolGlobalParams.host;
+                }
 
-                if ( orig.find( ":" ) != string::npos || hasParam( "port" ) )
+                if (orig.find(":") != string::npos || toolGlobalParams.portSet)
                     showPorts = true;
 
                 StringSplitter ss( orig.c_str() , "," );
@@ -432,8 +370,8 @@ namespace mongo {
                     string host = ss.next();
                     if ( showPorts && host.find( ":" ) == string::npos) {
                         // port supplied, but not for this host.  use default.
-                        if ( hasParam( "port" ) )
-                            host += ":" + _params["port"].as<string>();
+                        if (toolGlobalParams.portSet)
+                            host += ":" + toolGlobalParams.port;
                         else
                             host += ":27017";
                     }
@@ -444,10 +382,9 @@ namespace mongo {
             sleepsecs(1);
 
             int row = 0;
-            bool discover = hasParam( "discover" );
             int maxLockedDbWidth = 0;
 
-            while ( 1 ) {
+            while (mongoStatGlobalParams.rowCount == 0 || row < mongoStatGlobalParams.rowCount) {
                 sleepsecs( (int)ceil(_statUtil.getSeconds()) );
 
                 // collect data
@@ -466,7 +403,7 @@ namespace mongo {
                         rows.push_back( Row( i->first , out ) );
                     }
 
-                    if ( discover && ! i->second->now.isEmpty() ) {
+                    if (mongoStatGlobalParams.discover && ! i->second->now.isEmpty()) {
                         if ( _discover( threads , i->first , i->second ) )
                             break;
                     }
@@ -527,7 +464,7 @@ namespace mongo {
                 cout << endl;
 
                 //    header
-                if ( row++ % 5 == 0 && ! biggest.isEmpty() ) {
+                if (row++ % 5 == 0 && mongoStatGlobalParams.showHeaders && !biggest.isEmpty()) {
                     cout << setw( longestHost ) << "" << "\t";
                     printHeaders( biggest );
                 }
@@ -549,8 +486,6 @@ namespace mongo {
         }
 
         StatUtil _statUtil;
-        bool _http;
-        bool _many;
 
         struct Row {
             Row( string h , string e ) {
@@ -571,29 +506,5 @@ namespace mongo {
             BSONObj data;
         };
     };
-
+    REGISTER_MONGO_TOOL(Stat);
 }
-
-int toolMain( int argc , char ** argv, char ** envp ) {
-    mongo::runGlobalInitializersOrDie(argc, argv, envp);
-    mongo::Stat stat;
-    return stat.main( argc , argv );
-}
-
-#if defined(_WIN32)
-// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
-// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
-// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
-// and makes them available through the argv() and envp() members.  This enables toolMain()
-// to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    mongo::WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = toolMain(argc, wcl.argv(), wcl.envp());
-    ::_exit(exitCode);
-}
-#else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = toolMain(argc, argv, envp);
-    ::_exit(exitCode);
-}
-#endif

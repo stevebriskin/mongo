@@ -16,6 +16,7 @@
 #pragma once
 
 #include <bitset>
+#include <vector>
 
 #include "mongo/base/status.h"
 #include "mongo/db/auth/action_type.h"
@@ -24,7 +25,7 @@ namespace mongo {
 
     /*
      *  An ActionSet is a bitmask of ActionTypes that represents a set of actions.
-     *  These are the actions that a Privilege can grant a principal to perform on a resource.
+     *  These are the actions that a Privilege can grant a user to perform on a resource.
      */
     class ActionSet {
     public:
@@ -41,6 +42,8 @@ namespace mongo {
 
         bool empty() const { return _actions.none(); }
 
+        bool equals(const ActionSet& other) const { return this->_actions == other._actions; }
+
         bool contains(const ActionType& action) const;
 
         // Returns true only if this ActionSet contains all the actions present in the 'other'
@@ -49,6 +52,9 @@ namespace mongo {
 
         // Returns the string representation of this ActionSet
         std::string toString() const;
+
+        // Returns a vector of strings representing the actions in the ActionSet.
+        std::vector<std::string> getActionsAsStrings() const;
 
         // Takes a comma-separated string of action type string representations and returns
         // an int bitmask of the actions.
@@ -59,5 +65,9 @@ namespace mongo {
         // bitmask of actions this privilege grants
         std::bitset<ActionType::NUM_ACTION_TYPES> _actions;
     };
+
+    static inline bool operator==(const ActionSet& lhs, const ActionSet& rhs) {
+        return lhs.equals(rhs);
+    }
 
 } // namespace mongo

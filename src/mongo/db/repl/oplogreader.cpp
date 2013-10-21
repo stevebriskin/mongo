@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/repl/oplogreader.h"
@@ -22,7 +34,10 @@
 #include "mongo/base/counter.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/auth/security_key.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/repl/rs.h"  // theReplSet
@@ -41,77 +56,17 @@ namespace mongo {
 
     static const BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
-    /* Generally replAuthenticate will only be called within system threads to fully authenticate
-     * connections to other nodes in the cluster that will be used as part of internal operations.
-     * If a user-initiated action results in needing to call replAuthenticate, you can call it
-     * with skipAuthCheck set to false. Only do this if you are certain that the proper auth
-     * checks have already run to ensure that the user is authorized to do everything that this
-     * connection will be used for!
-     */
-    bool replAuthenticate(DBClientBase *conn, bool skipAuthCheck) {
-        if(!AuthorizationManager::isAuthEnabled()) {
+    bool replAuthenticate(DBClientBase *conn) {
+        if (!getGlobalAuthorizationManager()->isAuthEnabled())
             return true;
-        }
-        if (!skipAuthCheck && !cc().getAuthorizationManager()->hasInternalAuthorization()) {
-            log() << "replauthenticate: requires internal authorization, failing" << endl;
+
+        if (!isInternalAuthSet())
             return false;
-        }
-
-        string u;
-        string p;
-        if (internalSecurity.pwd.length() > 0) {
-            u = internalSecurity.user;
-            p = internalSecurity.pwd;
-        }
-        else {
-            BSONObj user;
-            {
-                Client::ReadContext ctxt("local.");
-                if( !Helpers::findOne("local.system.users", userReplQuery, user) ||
-                        // try the first user in local
-                        !Helpers::getSingleton("local.system.users", user) ) {
-                    log() << "replauthenticate: no user in local.system.users to use for authentication" << endl;
-                    return false;
-                }
-            }
-            u = user.getStringField("user");
-            p = user.getStringField("pwd");
-            massert( 10392 , "bad user object? [1]", !u.empty());
-            massert( 10393 , "bad user object? [2]", !p.empty());
-        }
-
-        string err;
-        if( !conn->auth("local", u.c_str(), p.c_str(), err, false) ) {
-            log() << "replauthenticate: can't authenticate to master server, user:" << u << endl;
-            return false;
-        }
-
-        return true;
+        return authenticateInternalUser(conn);
     }
 
-    bool replHandshake(DBClientConnection *conn) {
+    bool replHandshake(DBClientConnection *conn, const BSONObj& me) {
         string myname = getHostName();
-
-        BSONObj me;
-        {
-            
-            Lock::DBWrite l("local");
-            // local.me is an identifier for a server for getLastError w:2+
-            if ( ! Helpers::getSingleton( "local.me" , me ) ||
-                 ! me.hasField("host") ||
-                 me["host"].String() != myname ) {
-
-                // clean out local.me
-                Helpers::emptyCollection("local.me");
-
-                // repopulate
-                BSONObjBuilder b;
-                b.appendOID( "_id" , 0 , true );
-                b.append( "host", myname );
-                me = b.obj();
-                Helpers::putSingleton( "local.me" , me );
-            }
-        }
 
         BSONObjBuilder cmd;
         cmd.appendAs( me["_id"] , "handshake" );
@@ -127,9 +82,7 @@ namespace mongo {
         return true;
     }
 
-    OplogReader::OplogReader( bool doHandshake ) : 
-        _doHandshake( doHandshake ) { 
-        
+    OplogReader::OplogReader() {
         _tailingQueryOptions = QueryOption_SlaveOk;
         _tailingQueryOptions |= QueryOption_CursorTailable | QueryOption_OplogReplay;
         
@@ -143,10 +96,12 @@ namespace mongo {
         if( conn() == 0 ) {
             _conn = shared_ptr<DBClientConnection>(new DBClientConnection(false,
                                                                           0,
-                                                                          30 /* tcp timeout */));
+                                                                          tcp_timeout));
             string errmsg;
             if ( !_conn->connect(hostName.c_str(), errmsg) ||
-                 (AuthorizationManager::isAuthEnabled() && !replAuthenticate(_conn.get(), true)) ) {
+                 (getGlobalAuthorizationManager()->isAuthEnabled() &&
+                  !replAuthenticate(_conn.get())) ) {
+
                 resetConnection();
                 log() << "repl: " << errmsg << endl;
                 return false;
@@ -154,25 +109,36 @@ namespace mongo {
         }
         return true;
     }
-    
+
     bool OplogReader::connect(const std::string& hostName) {
-        if (conn() != 0) {
+        if (conn()) {
             return true;
         }
 
-        if ( ! commonConnect(hostName) ) {
-            return false;
-        }
-        
-        
-        if ( _doHandshake && ! replHandshake(_conn.get() ) ) {
+        if (!commonConnect(hostName)) {
             return false;
         }
 
         return true;
     }
 
-    bool OplogReader::connect(const BSONObj& rid, const int from, const string& to) {
+    bool OplogReader::connect(const std::string& hostName, const BSONObj& me) {
+        if (conn()) {
+            return true;
+        }
+
+        if (!commonConnect(hostName)) {
+            return false;
+        }
+
+        if (!replHandshake(_conn.get(), me)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool OplogReader::connect(const mongo::OID& rid, const int from, const string& to) {
         if (conn() != 0) {
             return true;
         }
@@ -183,9 +149,9 @@ namespace mongo {
         return false;
     }
 
-    bool OplogReader::passthroughHandshake(const BSONObj& rid, const int nextOnChainId) {
+    bool OplogReader::passthroughHandshake(const mongo::OID& rid, const int nextOnChainId) {
         BSONObjBuilder cmd;
-        cmd.appendAs(rid["_id"], "handshake");
+        cmd.append("handshake", rid);
         if (theReplSet) {
             const Member* chainedMember = theReplSet->findById(nextOnChainId);
             if (chainedMember != NULL) {
@@ -196,6 +162,16 @@ namespace mongo {
 
         BSONObj res;
         return conn()->runCommand("admin", cmd.obj(), res);
+    }
+
+    void OplogReader::query(const char *ns,
+                            Query query,
+                            int nToReturn,
+                            int nToSkip,
+                            const BSONObj* fields) {
+        cursor.reset(
+            _conn->query(ns, query, nToReturn, nToSkip, fields, QueryOption_SlaveOk).release()
+        );
     }
 
     void OplogReader::tailingQuery(const char *ns, const BSONObj& query, const BSONObj* fields ) {

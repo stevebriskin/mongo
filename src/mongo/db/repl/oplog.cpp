@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -24,11 +36,15 @@
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/dbhash.h"
+#include "mongo/db/index_builder.h"
 #include "mongo/db/index_update.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/bgsync.h"
@@ -36,14 +52,13 @@
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/write_concern.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/s/d_logic.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/file.h"
 #include "mongo/util/startup_test.h"
 
 namespace mongo {
-
-    // from d_migrate.cpp
-    void logOpForSharding( const char * opstr , const char * ns , const BSONObj& obj , BSONObj * patt );
 
     // cached copies of these...so don't rename them, drop them, etc.!!!
     static NamespaceDetails *localOplogMainDetails = 0;
@@ -73,7 +88,7 @@ namespace mongo {
         {
             const char *logns = rsoplog;
             if ( rsOplogDetails == 0 ) {
-                Client::Context ctx(logns , dbpath);
+                Client::Context ctx(logns, storageGlobalParams.dbpath);
                 localDB = ctx.db();
                 verify( localDB );
                 rsOplogDetails = nsdetails(logns);
@@ -90,11 +105,21 @@ namespace mongo {
                      */
             if( theReplSet ) {
                 if( !(theReplSet->lastOpTimeWritten<ts) ) {
-                    log() << "replSet error possible failover clock skew issue? " << theReplSet->lastOpTimeWritten.toString() << ' ' << endl;
+                    log() << "replication oplog stream went back in time. previous timestamp: "
+                          << theReplSet->lastOpTimeWritten << " newest timestamp: " << ts
+                          << ". attempting to sync directly from primary." << endl;
+                    std::string errmsg;
+                    BSONObjBuilder result;
+                    if (!theReplSet->forceSyncFrom(theReplSet->box.getPrimary()->fullName(),
+                                                   errmsg, result)) {
+                        log() << "Can't sync from primary: " << errmsg << endl;
+                    }
                 }
                 theReplSet->lastOpTimeWritten = ts;
                 theReplSet->lastH = h;
                 ctx.getClient()->setLastOp( ts );
+
+                replset::BackgroundSync::notify();
             }
         }
 
@@ -204,7 +229,7 @@ namespace mongo {
         {
             const char *logns = rsoplog;
             if ( rsOplogDetails == 0 ) {
-                Client::Context ctx(logns , dbpath);
+                Client::Context ctx(logns, storageGlobalParams.dbpath);
                 localDB = ctx.db();
                 verify( localDB );
                 rsOplogDetails = nsdetails(logns);
@@ -217,8 +242,15 @@ namespace mongo {
                      */
             if( theReplSet ) {
                 if( !(theReplSet->lastOpTimeWritten<ts) ) {
-                    log() << "replSet ERROR possible failover clock skew issue? " << theReplSet->lastOpTimeWritten << ' ' << ts << rsLog;
-                    log() << "replSet " << theReplSet->isPrimary() << rsLog;
+                    log() << "replication oplog stream went back in time. previous timestamp: "
+                          << theReplSet->lastOpTimeWritten << " newest timestamp: " << ts
+                          << ". attempting to sync directly from primary." << endl;
+                    std::string errmsg;
+                    BSONObjBuilder result;
+                    if (!theReplSet->forceSyncFrom(theReplSet->box.getPrimary()->fullName(),
+                                                   errmsg, result)) {
+                        log() << "Can't sync from primary: " << errmsg << endl;
+                    }
                 }
                 theReplSet->lastOpTimeWritten = ts;
                 theReplSet->lastH = hashNew;
@@ -228,9 +260,7 @@ namespace mongo {
 
         append_O_Obj(r->data(), partial, obj);
 
-        if ( logLevel >= 6 ) {
-            LOG( 6 ) << "logOp:" << BSONObj::make(r) << endl;
-        }
+        LOG( 6 ) << "logOp:" << BSONObj::make(r) << endl;
     }
 
     static void _logOpOld(const char *opstr, const char *ns, const char *logNS, const BSONObj& obj, BSONObj *o2, bool *bb, bool fromMigrate ) {
@@ -273,7 +303,7 @@ namespace mongo {
         if( logNS == 0 ) {
             logNS = "local.oplog.$main";
             if ( localOplogMainDetails == 0 ) {
-                Client::Context ctx(logNS , dbpath);
+                Client::Context ctx(logNS, storageGlobalParams.dbpath);
                 localDB = ctx.db();
                 verify( localDB );
                 localOplogMainDetails = nsdetails(logNS);
@@ -283,7 +313,7 @@ namespace mongo {
             r = theDataFileMgr.fast_oplog_insert(localOplogMainDetails, logNS, len);
         }
         else {
-            Client::Context ctx(logNS, dbpath);
+            Client::Context ctx(logNS, storageGlobalParams.dbpath);
             verify( nsdetails( logNS ) );
             // first we allocate the space, then we fill it below.
             r = theDataFileMgr.fast_oplog_insert( nsdetails( logNS ), logNS, len);
@@ -324,12 +354,20 @@ namespace mongo {
           d delete / remove
           u update
     */
-    void logOp(const char *opstr, const char *ns, const BSONObj& obj, BSONObj *patt, bool *b, bool fromMigrate) {
+    void logOp(const char* opstr,
+               const char* ns,
+               const BSONObj& obj,
+               BSONObj* patt,
+               bool* b,
+               bool fromMigrate,
+               const BSONObj* fullObj) {
         if ( replSettings.master ) {
             _logOp(opstr, ns, 0, obj, patt, b, fromMigrate);
         }
 
-        logOpForSharding( opstr , ns , obj , patt );
+        logOpForSharding(opstr, ns, obj, patt, fullObj, fromMigrate);
+        logOpForDbHash(opstr, ns, obj, patt, fullObj, fromMigrate);
+        getGlobalAuthorizationManager()->logOp(opstr, ns, obj, patt, b, fromMigrate, fullObj);
     }
 
     void createOplog() {
@@ -337,7 +375,7 @@ namespace mongo {
 
         const char * ns = "local.oplog.$main";
 
-        bool rs = !cmdLine._replSet.empty();
+        bool rs = !replSettings.replSet.empty();
         if( rs )
             ns = rsoplog;
 
@@ -347,9 +385,9 @@ namespace mongo {
 
         if ( nsd ) {
 
-            if ( cmdLine.oplogSize != 0 ) {
+            if (replSettings.oplogSize != 0) {
                 int o = (int)(nsd->storageSize() / ( 1024 * 1024 ) );
-                int n = (int)(cmdLine.oplogSize / ( 1024 * 1024 ) );
+                int n = (int)(replSettings.oplogSize / (1024 * 1024));
                 if ( n != o ) {
                     stringstream ss;
                     ss << "cmdline oplogsize (" << n << ") different than existing (" << o << ") see: http://dochub.mongodb.org/core/increase-oplog";
@@ -371,8 +409,8 @@ namespace mongo {
         /* create an oplog collection, if it doesn't yet exist. */
         BSONObjBuilder b;
         double sz;
-        if ( cmdLine.oplogSize != 0 )
-            sz = (double)cmdLine.oplogSize;
+        if (replSettings.oplogSize != 0)
+            sz = (double)replSettings.oplogSize;
         else {
             /* not specified. pick a default size */
             sz = 50.0 * 1024 * 1024;
@@ -382,10 +420,15 @@ namespace mongo {
                 sz = (256-64) * 1024 * 1024;
 #else
                 sz = 990.0 * 1024 * 1024;
-                boost::intmax_t free = File::freeSpace(dbpath); //-1 if call not supported.
+                boost::intmax_t free =
+                    File::freeSpace(storageGlobalParams.dbpath); //-1 if call not supported.
                 double fivePct = free * 0.05;
                 if ( fivePct > sz )
                     sz = fivePct;
+                // we use 5% of free space up to 50GB (1TB free)
+                double upperBound = 50.0 * 1024 * 1024 * 1024;
+                if (fivePct > upperBound)
+                    sz = upperBound;
 #endif
             }
         }
@@ -439,10 +482,18 @@ namespace mongo {
         if ( *opType == 'i' ) {
             opCounters->gotInsert();
 
-            if (NamespaceString(ns).coll == "system.indexes") {
-                // updates aren't allowed for indexes -- so we will do a regular insert. if index already
-                // exists, that is ok.
-                theDataFileMgr.insert(ns, (void*) o.objdata(), o.objsize());
+            const char *p = strchr(ns, '.');
+            if ( p && strcmp(p, ".system.indexes") == 0 ) {
+                if (o["background"].trueValue()) {
+                    IndexBuilder* builder = new IndexBuilder(ns, o);
+                    // This spawns a new thread and returns immediately.
+                    builder->go();
+                }
+                else {
+                    IndexBuilder builder(ns, o);
+                    // Finish the foreground build before returning
+                    builder.build();
+                }
             }
             else {
                 // do upserts for inserts as we might get replayed more than once
@@ -451,8 +502,17 @@ namespace mongo {
                 if( !o.getObjectID(_id) ) {
                     /* No _id.  This will be very slow. */
                     Timer t;
-                    updateObjectsForReplication(ns, o, o, true, false, false, debug, false,
-                                                QueryPlanSelectionPolicy::idElseNatural() );
+
+                    const NamespaceString requestNs(ns);
+                    UpdateRequest request(requestNs, QueryPlanSelectionPolicy::idElseNatural());
+
+                    request.setQuery(o);
+                    request.setUpdates(o);
+                    request.setUpsert();
+                    request.setFromReplication();
+
+                    update(request, &debug);
+
                     if( t.millis() >= 2 ) {
                         RARELY OCCASIONALLY log() << "warning, repl doing slow updates (no _id field) for " << ns << endl;
                     }
@@ -467,8 +527,16 @@ namespace mongo {
                               */
                     BSONObjBuilder b;
                     b.append(_id);
-                    updateObjectsForReplication(ns, o, b.done(), true, false, false , debug, false,
-                                                QueryPlanSelectionPolicy::idElseNatural() );
+
+                    const NamespaceString requestNs(ns);
+                    UpdateRequest request(requestNs, QueryPlanSelectionPolicy::idElseNatural());
+
+                    request.setQuery(b.done());
+                    request.setUpdates(o);
+                    request.setUpsert();
+                    request.setFromReplication();
+
+                    update(request, &debug);
                 }
             }
         }
@@ -481,20 +549,20 @@ namespace mongo {
 
             OpDebug debug;
             BSONObj updateCriteria = op.getObjectField("o2");
-            bool upsert = fields[3].booleanSafe() || convertUpdateToUpsert;
-            UpdateResult ur =
-                updateObjectsForReplication(ns,
-                                            o,
-                                            updateCriteria,
-                                            upsert,
-                                            /*multi*/ false,
-                                            /*logop*/ false,
-                                            debug,
-                                            /*fromMigrate*/ false,
-                                            QueryPlanSelectionPolicy::idElseNatural() );
+            const bool upsert = fields[3].booleanSafe() || convertUpdateToUpsert;
 
-            if( ur.num == 0 ) {
-                if( ur.mod ) {
+            const NamespaceString requestNs(ns);
+            UpdateRequest request(requestNs, QueryPlanSelectionPolicy::idElseNatural());
+
+            request.setQuery(updateCriteria);
+            request.setUpdates(o);
+            request.setUpsert(upsert);
+            request.setFromReplication();
+
+            UpdateResult ur = update(request, &debug);
+
+            if( ur.numMatched == 0 ) {
+                if( ur.modifiers ) {
                     if( updateCriteria.nFields() == 1 ) {
                         // was a simple { _id : ... } update criteria
                         failedUpdate = true;
@@ -537,10 +605,10 @@ namespace mongo {
                 verify( opType[1] == 'b' ); // "db" advertisement
         }
         else if ( *opType == 'c' ) {
-            opCounters->gotCommand();
             BufBuilder bb;
             BSONObjBuilder ob;
             _runCommands(ns, o, bb, ob, true, 0);
+            // _runCommands takes care of adjusting opcounters for command counting.
         }
         else if ( *opType == 'n' ) {
             // no op

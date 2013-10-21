@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -29,6 +41,7 @@
 #include "mongo/util/concurrency/msg.h"
 #include "mongo/util/concurrency/task.h"
 #include "mongo/util/concurrency/value.h"
+#include "mongo/util/fail_point_service.h"
 #include "mongo/util/goodies.h"
 #include "mongo/util/mongoutils/html.h"
 #include "mongo/util/ramlog.h"
@@ -36,6 +49,9 @@
 namespace mongo {
 
     using namespace bson;
+
+    MONGO_FP_DECLARE(rsDelayHeartbeatResponse);
+    MONGO_FP_DECLARE(rsStopHeartbeatRequest);
 
     extern bool replSetBlind;
 
@@ -48,6 +64,22 @@ namespace mongo {
         return jsTime() - downSince;
     }
 
+    void HeartbeatInfo::updateFromLastPoll(const HeartbeatInfo& newInfo) {
+        hbstate = newInfo.hbstate;
+        health = newInfo.health;
+        upSince = newInfo.upSince;
+        downSince = newInfo.downSince;
+        lastHeartbeat = newInfo.lastHeartbeat;
+        lastHeartbeatMsg = newInfo.lastHeartbeatMsg;
+        // Note: lastHeartbeatRecv is updated through CmdReplSetHeartbeat::run().
+
+        syncingTo = newInfo.syncingTo;
+        opTime = newInfo.opTime;
+        skew = newInfo.skew;
+        authIssue = newInfo.authIssue;
+        ping = newInfo.ping;
+    }
+
     /* { replSetHeartbeat : <setname> } */
     class CmdReplSetHeartbeat : public ReplSetCommand {
     public:
@@ -57,7 +89,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::replSetHeartbeat);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( replSetBlind ) {
@@ -65,6 +97,11 @@ namespace mongo {
                     errmsg = str::stream() << theReplSet->selfFullName() << " is blind";
                 }
                 return false;
+            }
+
+            MONGO_FAIL_POINT_BLOCK(rsDelayHeartbeatResponse, delay) {
+                const BSONObj& data = delay.getData();
+                sleepsecs(data["delay"].numberInt());
             }
 
             /* we don't call ReplSetCommand::check() here because heartbeat
@@ -87,9 +124,10 @@ namespace mongo {
             }
             {
                 string s = string(cmdObj.getStringField("replSetHeartbeat"));
-                if( cmdLine.ourSetName() != s ) {
+                if (replSettings.ourSetName() != s) {
                     errmsg = "repl set names do not match";
-                    log() << "replSet set names do not match, our cmdline: " << cmdLine._replSet << rsLog;
+                    log() << "replSet set names do not match, our cmdline: " << replSettings.replSet
+                          << rsLog;
                     log() << "replSet s: " << s << rsLog;
                     result.append("mismatch", true);
                     return false;
@@ -142,7 +180,9 @@ namespace mongo {
             }
 
             // note that we got a heartbeat from this node
-            from->get_hbinfo().recvHeartbeat();
+            theReplSet->mgr->send(boost::bind(&ReplSet::msgUpdateHBRecv,
+                                              theReplSet, from->hbinfo().id(), time(0)));
+
 
             return true;
         }
@@ -157,6 +197,15 @@ namespace mongo {
                           bool checkEmpty) {
         if( replSetBlind ) {
             return false;
+        }
+
+        MONGO_FAIL_POINT_BLOCK(rsStopHeartbeatRequest, member) {
+            const BSONObj& data = member.getData();
+            const std::string& stopMember = data["member"].str();
+
+            if (memberFullName == stopMember) {
+                return false;
+            }
         }
 
         BSONObj cmd = BSON( "replSetHeartbeat" << setName <<
@@ -238,18 +287,22 @@ namespace mongo {
                 if( ok ) {
                     up(info, mem);
                 }
-                else if (!info["errmsg"].eoo() && info["errmsg"].str() == "unauthorized") {
+                else if (info["code"].numberInt() == ErrorCodes::Unauthorized ||
+                         info["errmsg"].str() == "unauthorized") {
+
                     authIssue(mem);
                 }
                 else {
                     down(mem, info.getStringField("errmsg"));
                 }
             }
-            catch(DBException& e) {
+            catch (const DBException& e) {
+                log() << "replSet health poll task caught a DBException: " << e.what();
                 down(mem, e.what());
             }
-            catch(...) {
-                down(mem, "replSet unexpected exception in ReplSetHealthPollTask");
+            catch (const std::exception& e) {
+                log() << "replSet health poll task caught an exception: " << e.what();
+                down(mem, e.what());
             }
             m = mem;
 
@@ -403,6 +456,10 @@ namespace mongo {
             if (info.hasElement("syncingTo")) {
                 mem.syncingTo = info["syncingTo"].String();
             }
+            else {
+                // empty out syncingTo since they are no longer syncing to anyone
+                mem.syncingTo = "";
+            }
 
             if( info.hasElement("opTime") )
                 mem.opTime = info["opTime"].Date();
@@ -443,10 +500,6 @@ namespace mongo {
         // Heartbeat timeout
         time_t _timeout;
     };
-
-    void HeartbeatInfo::recvHeartbeat() {
-        lastHeartbeatRecv = time(0);
-    }
 
     int ReplSetHealthPollTask::s_try_offset = 0;
 

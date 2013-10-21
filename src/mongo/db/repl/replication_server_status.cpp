@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/repl/replication_server_status.h"
@@ -23,9 +35,13 @@
 #include "mongo/client/connpool.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/repl/is_master.h"
 #include "mongo/db/repl/master_slave.h"
+#include "mongo/db/repl/oplogreader.h"
 #include "mongo/db/repl/rs.h"
-#include "mongo/db/replutil.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/db/wire_version.h"
 
 namespace mongo {
 
@@ -36,8 +52,6 @@ namespace mongo {
     bool anyReplEnabled() {
         return replSettings.slave || replSettings.master || theReplSet;
     }
-
-    bool replAuthenticate(DBClientBase *conn, bool skipAuthCheck);
 
     void appendReplicationInfo(BSONObjBuilder& result, int level) {
         if ( replSet ) {
@@ -71,11 +85,12 @@ namespace mongo {
             int n = 0;
             list<BSONObj> src;
             {
-                Client::ReadContext ctx("local.sources", dbpath);
-                shared_ptr<Cursor> c = findTableScan("local.sources", BSONObj());
-                while ( c->ok() ) {
-                    src.push_back(c->current());
-                    c->advance();
+                Client::ReadContext ctx("local.sources", storageGlobalParams.dbpath);
+                auto_ptr<Runner> runner(InternalPlanner::collectionScan("local.sources"));
+                BSONObj obj;
+                Runner::RunnerState state;
+                while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
+                    src.push_back(obj);
                 }
             }
             
@@ -100,7 +115,7 @@ namespace mongo {
                     ScopedDbConnection conn(s["host"].valuestr());
                     
                     DBClientConnection *cliConn = dynamic_cast< DBClientConnection* >( &conn.conn() );
-                    if ( cliConn && replAuthenticate(cliConn, false) ) {
+                    if ( cliConn && replAuthenticate(cliConn) ) {
                         BSONObj first = conn->findOne( (string)"local.oplog.$" + sourcename,
                                                               Query().sort( BSON( "$natural" << 1 ) ) );
                         BSONObj last = conn->findOne( (string)"local.oplog.$" + sourcename,
@@ -156,11 +171,16 @@ namespace mongo {
             /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
                authenticated.
             */
+            if ( cmdObj["forShell"].trueValue() )
+                lastError.disableForCommand();
+
             appendReplicationInfo(result, 0);
 
             result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
             result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
             result.appendDate("localTime", jsTime());
+            result.append("maxWireVersion", maxWireVersion);
+            result.append("minWireVersion", minWireVersion);
             return true;
         }
     } cmdismaster;

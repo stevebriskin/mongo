@@ -14,9 +14,21 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/s/chunk.h"
 
@@ -417,11 +429,11 @@ namespace mongo {
                 ChunkPtr toMove = cm->findIntersectingChunk(min);
 
                 if ( ! (toMove->getMin() == min && toMove->getMax() == max) ){
-                    LOG(1) << "recently split chunk: " << range << " modified before we could migrate " << toMove << endl;
+                    LOG(1).stream() << "recently split chunk: " << range << " modified before we could migrate " << toMove << endl;
                     return true;
                 }
 
-                log() << "moving chunk (auto): " << toMove << " to: " << newLocation.toString() << endl;
+                log().stream() << "moving chunk (auto): " << toMove << " to: " << newLocation.toString() << endl;
 
                 BSONObj res;
                 massert( 10412 ,
@@ -514,11 +526,11 @@ namespace mongo {
 
     string Chunk::toString() const {
         stringstream ss;
-        ss << ChunkType::ns() << ":" << _manager->getns() <<
-              ChunkType::shard()   << ": " << _shard.toString() <<
-              ChunkType::DEPRECATED_lastmod() << ": " << _lastmod.toString() <<
-              ChunkType::min()     << ": " << _min <<
-              ChunkType::max()     << ": " << _max;
+        ss << ChunkType::ns()                 << ": " << _manager->getns()   << ", "
+           << ChunkType::shard()              << ": " << _shard.toString()   << ", "
+           << ChunkType::DEPRECATED_lastmod() << ": " << _lastmod.toString() << ", "
+           << ChunkType::min()                << ": " << _min                << ", "
+           << ChunkType::max()                << ": " << _max;
         return ss.str();
     }
 
@@ -561,7 +573,7 @@ namespace mongo {
             return;
         }
 
-        LOG(1) << "Refreshing MaxChunkSize: " << csize << endl;
+        LOG(1) << "Refreshing MaxChunkSize: " << csize << "MB" << endl;
 
         if (csize != Chunk::MaxChunkSize/(1024*1024)) {
             log() << "MaxChunkSize changing from " << Chunk::MaxChunkSize/(1024*1024) << "MB"
@@ -1248,6 +1260,13 @@ namespace mongo {
         // remove chunk data
         ScopedDbConnection conn(configServer.modelServer());
         conn->remove(ChunkType::ConfigNS, BSON(ChunkType::ns(_ns)));
+        
+        // Make sure we're dropped on the config
+        string error = conn->getLastError();
+        uassert( 17001, str::stream() << "could not drop chunks for " << _ns 
+                                      << causedBy( error ), 
+                 error.size() == 0 );
+        
         conn.done();
         LOG(1) << "ChunkManager::drop : " << _ns << "\t removed chunk data" << endl;
 
@@ -1346,7 +1365,7 @@ namespace mongo {
 
         }
         catch (...) {
-            LOG( LL_ERROR ) << "\t invalid ChunkRangeMap! printing ranges:" << endl;
+            error() << "\t invalid ChunkRangeMap! printing ranges:" << endl;
 
             for (ChunkRangeMap::const_iterator it=_ranges.begin(), end=_ranges.end(); it != end; ++it)
                 cout << it->first << ": " << *it->second << endl;
@@ -1456,7 +1475,8 @@ namespace mongo {
         cmdBuilder.append( "shardHost" , s.getConnString() );
         BSONObj cmd = cmdBuilder.obj();
 
-        LOG(1) << "    setShardVersion  " << s.getName()
+        LOG(1).stream()
+               << "    setShardVersion  " << s.getName()
                << " " << conn.getServerAddress()
                << "  " << ns
                << "  " << cmd

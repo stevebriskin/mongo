@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/pch.h"
@@ -20,10 +32,13 @@
 
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/db.h"
+#include "mongo/db/index/catalog_hack.h"
+#include "mongo/db/index_selection.h"
 #include "mongo/db/pagefault.h"
 #include "mongo/db/parsed_query.h"
 #include "mongo/db/query_plan_selection_policy.h"
 #include "mongo/db/queryutil.h"
+#include "mongo/db/structure/collection.h"
 
 //#define DEBUGQO(x) cout << x << endl;
 #define DEBUGQO(x)
@@ -430,7 +445,7 @@ namespace mongo {
         vector<shared_ptr<QueryPlan> > plans;
         shared_ptr<QueryPlan> optimalPlan;
         shared_ptr<QueryPlan> specialPlan;
-        for( int i = 0; i < d->nIndexes; ++i ) {
+        for( int i = 0; i < d->getCompletedIndexCount(); ++i ) {
             
             if ( !QueryUtilIndexed::indexUseful( _qps.frsp(), d, i, _qps.order() ) ) {
                 continue;
@@ -542,11 +557,13 @@ namespace mongo {
             while( i.more() ) {
                 int j = i.pos();
                 IndexDetails& ii = i.next();
-                const IndexSpec& spec = ii.getSpec();
-                if (special.has(spec.getTypeName()) &&
-                    spec.suitability( _qps.frsp().frsForIndex(d, j), _qps.order() ) != USELESS ) {
+                BSONObj keyPattern = ii.keyPattern();
+                string pluginName = CatalogHack::getAccessMethodName(keyPattern);
+                if (special.has(pluginName) &&
+                    (USELESS != IndexSelection::isSuitableFor(keyPattern,
+                        _qps.frsp().frsForIndex(d, j), _qps.order()))) {
                     uassert( 16330, "'special' query operator not allowed", _allowSpecial );
-                    _qps.setSinglePlan( newPlan( d, j, BSONObj(), BSONObj(), spec.getTypeName()));
+                    _qps.setSinglePlan( newPlan( d, j, BSONObj(), BSONObj(), pluginName));
                     return true;
                 }
             }
@@ -942,8 +959,9 @@ namespace mongo {
     shared_ptr<QueryPlanRunner> QueryPlanRunnerQueue::init() {
         massert( 10369, "no plans", _plans.plans().size() > 0 );
         
-        if ( _plans.plans().size() > 1 )
+        if ( _plans.plans().size() > 1 ) {
             LOG(1) << "  running multiple plans" << endl;
+        }
         for( QueryPlanSet::PlanVector::const_iterator i = _plans.plans().begin();
              i != _plans.plans().end(); ++i ) {
             shared_ptr<QueryPlanRunner> runner( _prototypeRunner.createChild() );
@@ -1493,7 +1511,7 @@ namespace mongo {
             while( i.more() ) {
                 IndexDetails& ii = i.next();
                 if ( indexWorks( ii.keyPattern(), min.isEmpty() ? max : min, ret.first, ret.second ) ) {
-                    if ( ii.getSpec().getType() == 0 ) {
+                    if (CatalogHack::getAccessMethodName(ii.keyPattern()).empty()) {
                         id = &ii;
                         keyPattern = ii.keyPattern();
                         break;
@@ -1554,36 +1572,42 @@ namespace mongo {
             // No matches are possible in the index so the index may be useful.
             return true;   
         }
-
-        return d->idx( idxNo ).getSpec().suitability( frsp.frsForIndex( d , idxNo ) , order )
-               != USELESS;
+        return USELESS != IndexSelection::isSuitableFor(keyPattern, frsp.frsForIndex( d , idxNo ) ,
+                                           order );
     }
-    
+
     void QueryUtilIndexed::clearIndexesForPatterns( const FieldRangeSetPair& frsp,
                                                     const BSONObj& order ) {
-        SimpleMutex::scoped_lock lk(NamespaceDetailsTransient::_qcMutex);
-        NamespaceDetailsTransient& nsdt = NamespaceDetailsTransient::get_inlock( frsp.ns() );
         CachedQueryPlan noCachedPlan;
-        nsdt.registerCachedQueryPlanForPattern( frsp._singleKey.pattern( order ), noCachedPlan );
-        nsdt.registerCachedQueryPlanForPattern( frsp._multiKey.pattern( order ), noCachedPlan );
+
+        Collection* collection = cc().database()->getCollection( frsp.ns() );
+        if ( !collection )
+            return;
+
+        collection->infoCache()->registerCachedQueryPlanForPattern( frsp._singleKey.pattern( order ),
+                                                                    noCachedPlan );
+        collection->infoCache()->registerCachedQueryPlanForPattern( frsp._multiKey.pattern( order ),
+                                                                    noCachedPlan );
     }
-    
+
     CachedQueryPlan QueryUtilIndexed::bestIndexForPatterns( const FieldRangeSetPair& frsp,
                                                             const BSONObj& order ) {
-        SimpleMutex::scoped_lock lk( NamespaceDetailsTransient::_qcMutex );
-        NamespaceDetailsTransient& nsdt = NamespaceDetailsTransient::get_inlock( frsp.ns() );
+
+        Collection* collection = cc().database()->getCollection( frsp.ns() );
+        verify( collection );
+
         // TODO Maybe it would make sense to return the index with the lowest
         // nscanned if there are two possibilities.
         {
             QueryPattern pattern = frsp._singleKey.pattern( order );
-            CachedQueryPlan cachedQueryPlan = nsdt.cachedQueryPlanForPattern( pattern );
+            CachedQueryPlan cachedQueryPlan = collection->infoCache()->cachedQueryPlanForPattern( pattern );
             if ( !cachedQueryPlan.indexKey().isEmpty() ) {
                 return cachedQueryPlan;
             }
         }
         {
             QueryPattern pattern = frsp._multiKey.pattern( order );
-            CachedQueryPlan cachedQueryPlan = nsdt.cachedQueryPlanForPattern( pattern );
+            CachedQueryPlan cachedQueryPlan = collection->infoCache()->cachedQueryPlanForPattern( pattern );
             if ( !cachedQueryPlan.indexKey().isEmpty() ) {
                 return cachedQueryPlan;
             }
@@ -1604,7 +1628,7 @@ namespace mongo {
             }
             else {
                 bool useful = false;
-                for( int j = 0; j < d->nIndexes; ++j ) {
+                for( int j = 0; j < d->getCompletedIndexCount(); ++j ) {
                     if ( indexUseful( *i, d, j, BSONObj() ) ) {
                         useful = true;
                         break;

@@ -14,11 +14,24 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
 
 #include "mongo/db/btree.h"
+
 #include "mongo/db/btree_stats.h"
 #include "mongo/db/btreebuilder.h"
 #include "mongo/db/client.h"
@@ -27,7 +40,8 @@
 #include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dur_commitjob.h"
-#include "mongo/db/index_insertion_continuation.h"
+#include "mongo/db/index/btree_index_cursor.h"  // for aboutToDeleteBucket
+#include "mongo/db/intervalbtreecursor.h"  // also for aboutToDeleteBucket
 #include "mongo/db/json.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/pdfile.h"
@@ -92,7 +106,7 @@ namespace mongo {
 
     template< class V >
     void BucketBasics<V>::assertWritable() {
-        if( cmdLine.dur )
+        if (storageGlobalParams.dur)
             dur::assertAlreadyDeclared(this, V::BucketSize);
     }
 
@@ -145,7 +159,7 @@ namespace mongo {
         this->assertValid(order, true);
 
         if ( bt_dmp ) {
-            _log() << thisLoc.toString() << ' ';
+            log() << thisLoc.toString() << ' ';
             ((BtreeBucket *) this)->dump(depth);
         }
 
@@ -745,7 +759,7 @@ namespace mongo {
                               const Ordering &order, int& pos, bool assertIfDup) const {
         Loc recordLoc;
         recordLoc = rl;
-        globalIndexCounters.btree( (char*)this );
+        globalIndexCounters->btree( reinterpret_cast<const char*>(this) );
 
         // binary search for this key
         bool dupsChecked = false;
@@ -818,7 +832,8 @@ namespace mongo {
 
     template< class V >
     void BtreeBucket<V>::delBucket(const DiskLoc thisLoc, const IndexDetails& id) {
-        ClientCursor::informAboutToDeleteBucket(thisLoc); // slow...
+        BtreeIndexCursor::aboutToDeleteBucket(thisLoc);
+        IntervalBtreeCursor::aboutToDeleteBucket(thisLoc);
         verify( !isHead() );
 
         DiskLoc ll = this->parent;
@@ -950,7 +965,8 @@ namespace mongo {
             ll.btree<V>()->childForPos( indexInParent( thisLoc ) ).writing() = this->nextChild;
         }
         BTREE(this->nextChild)->parent.writing() = this->parent;
-        ClientCursor::informAboutToDeleteBucket( thisLoc );
+        BtreeIndexCursor::aboutToDeleteBucket(thisLoc);
+        IntervalBtreeCursor::aboutToDeleteBucket(thisLoc);
         deallocBucket( thisLoc, id );
     }
 
@@ -1699,52 +1715,6 @@ namespace mongo {
 
     /** @thisLoc disk location of *this */
     template< class V >
-    void BtreeBucket<V>::insertStepOne(DiskLoc thisLoc, 
-                             IndexInsertionContinuationImpl<V>& c,
-                             bool dupsAllowed) const {
-        dassert( c.key.dataSize() <= this->KeyMax );
-        verify( c.key.dataSize() > 0 );
-
-        int pos;
-        bool found = find(c.idx, c.key, c.recordLoc, c.order, pos, !dupsAllowed);
-
-        if ( found ) {
-            const _KeyNode& kn = k(pos);
-            if ( kn.isUnused() ) {
-                LOG(4) << "btree _insert: reusing unused key" << endl;
-                c.b = this;
-                c.pos = pos;
-                c.op = IndexInsertionContinuation::SetUsed;
-                return;
-            }
-
-            DEV {
-                log() << "_insert(): key already exists in index (ok for background:true)\n";
-                log() << "  " << c.idx.indexNamespace() << " thisLoc:" << thisLoc.toString() << '\n';
-                log() << "  " << c.key.toString() << '\n';
-                log() << "  " << "recordLoc:" << c.recordLoc.toString() << " pos:" << pos << endl;
-                log() << "  old l r: " << this->childForPos(pos).toString() << ' ' << this->childForPos(pos+1).toString() << endl;
-            }
-            alreadyInIndex();
-        }
-
-        Loc ch = this->childForPos(pos);
-        DiskLoc child = ch;
-
-        if ( child.isNull() ) {
-            // A this->new key will be inserted at the same tree height as an adjacent existing key.
-            c.bLoc = thisLoc;
-            c.b = this;
-            c.pos = pos;
-            c.op = IndexInsertionContinuation::InsertHere;
-            return;
-        }
-
-        child.btree<V>()->insertStepOne(child, c, dupsAllowed);
-    }
-
-    /** @thisLoc disk location of *this */
-    template< class V >
     int BtreeBucket<V>::_insert(const DiskLoc thisLoc, const DiskLoc recordLoc,
                              const Key& key, const Ordering &order, bool dupsAllowed,
                              const DiskLoc lChild, const DiskLoc rChild, IndexDetails& idx) const {
@@ -1804,30 +1774,19 @@ namespace mongo {
     template< class V >
     void BtreeBucket<V>::dump(unsigned depth) const {
         string indent = string(depth, ' ');
-        _log() << "BUCKET n:" << this->n;
-        _log() << " parent:" << hex << this->parent.getOfs() << dec;
+        LogstreamBuilder l = log();
+        l << "BUCKET n:" << this->n;
+        l << " parent:" << hex << this->parent.getOfs() << dec;
         for ( int i = 0; i < this->n; i++ ) {
-            _log() << '\n' << indent;
+            l << '\n' << indent;
             KeyNode k = keyNode(i);
             string ks = k.key.toString();
-            _log() << "  " << hex << k.prevChildBucket.getOfs() << '\n';
-            _log() << indent << "    " << i << ' ' << ks.substr(0, 30) << " Loc:" << k.recordLoc.toString() << dec;
+            l << "  " << hex << k.prevChildBucket.getOfs() << '\n';
+            l << indent << "    " << i << ' ' << ks.substr(0, 30) << " Loc:" << k.recordLoc.toString() << dec;
             if ( this->k(i).isUnused() )
-                _log() << " UNUSED";
+                l << " UNUSED";
         }
-        _log() << "\n" << indent << "  " << hex << this->nextChild.getOfs() << dec << endl;
-    }
-
-    template< class V >
-    void BtreeBucket<V>::twoStepInsert(DiskLoc thisLoc, IndexInsertionContinuationImpl<V> &c,
-                                       bool dupsAllowed) const
-    {
-
-        if ( c.key.dataSize() > this->KeyMax ) {
-            problem() << "ERROR: key too large len:" << c.key.dataSize() << " max:" << this->KeyMax << ' ' << c.key.dataSize() << ' ' << c.idx.indexNamespace() << endl;
-            return; // op=Nothing
-        }
-        insertStepOne(thisLoc, c, dupsAllowed);
+        l << "\n" << indent << "  " << hex << this->nextChild.getOfs() << dec << endl;
     }
 
     /** todo: meaning of return code unclear clean up */
@@ -1976,7 +1935,4 @@ namespace mongo {
             }
         }
     } btunittest;
-
-
-    IndexInsertionContinuation::~IndexInsertionContinuation() {}
 }

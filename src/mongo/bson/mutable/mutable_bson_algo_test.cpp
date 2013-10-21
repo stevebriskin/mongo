@@ -19,6 +19,7 @@
 
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/mutable_bson_test_utils.h"
+#include "mongo/db/json.h"
 #include "mongo/platform/basic.h"
 #include "mongo/unittest/unittest.h"
 
@@ -161,50 +162,6 @@ namespace {
         ASSERT_FALSE(found_after_add.ok());
     }
 
-    class CountTest : public DocumentTest {
-        virtual void setUp() {
-            Element root = doc().root();
-
-            ASSERT_OK(root.appendInt("leaf", 0));
-
-            Element one = doc().makeElementObject("oneChild");
-            ASSERT_TRUE(one.ok());
-            ASSERT_OK(one.appendInt("one", 1));
-            ASSERT_OK(root.pushBack(one));
-
-            Element threeChildren = doc().makeElementObject("threeChildren");
-            ASSERT_TRUE(one.ok());
-            ASSERT_OK(threeChildren.appendInt("one", 1));
-            ASSERT_OK(threeChildren.appendInt("two", 2));
-            ASSERT_OK(threeChildren.appendInt("three", 3));
-            ASSERT_OK(root.pushBack(threeChildren));
-        }
-    };
-
-    TEST_F(CountTest, EmptyDocument) {
-        // Doesn't use the fixture but belongs in the same group of tests.
-        Document doc;
-        ASSERT_EQUALS(countChildren(doc.root()), 0u);
-    }
-
-    TEST_F(CountTest, EmptyElement) {
-        Element leaf = findFirstChildNamed(doc().root(), "leaf");
-        ASSERT_TRUE(leaf.ok());
-        ASSERT_EQUALS(countChildren(leaf), 0u);
-    }
-
-    TEST_F(CountTest, OneChildElement) {
-        Element oneChild = findFirstChildNamed(doc().root(), "oneChild");
-        ASSERT_TRUE(oneChild.ok());
-        ASSERT_EQUALS(countChildren(oneChild), 1u);
-    }
-
-    TEST_F(CountTest, ManyChildren) {
-        Element threeChildren = findFirstChildNamed(doc().root(), "threeChildren");
-        ASSERT_TRUE(threeChildren.ok());
-        ASSERT_EQUALS(countChildren(threeChildren), 3u);
-    }
-
     TEST_F(ManyChildrenTest, getNthSibling) {
         const Element leftChild = doc().root().leftChild();
         ASSERT_TRUE(leftChild.ok());
@@ -256,6 +213,91 @@ namespace {
         query = getNthSibling(rightChild, -(children - 1));
         ASSERT_TRUE(query.ok());
         ASSERT_EQUALS(leftChild, query);
+    }
+
+    class CountTest : public DocumentTest {
+        virtual void setUp() {
+            Element root = doc().root();
+
+            ASSERT_OK(root.appendInt("leaf", 0));
+
+            Element one = doc().makeElementObject("oneChild");
+            ASSERT_TRUE(one.ok());
+            ASSERT_OK(one.appendInt("one", 1));
+            ASSERT_OK(root.pushBack(one));
+
+            Element threeChildren = doc().makeElementObject("threeChildren");
+            ASSERT_TRUE(one.ok());
+            ASSERT_OK(threeChildren.appendInt("one", 1));
+            ASSERT_OK(threeChildren.appendInt("two", 2));
+            ASSERT_OK(threeChildren.appendInt("three", 3));
+            ASSERT_OK(root.pushBack(threeChildren));
+        }
+    };
+
+    TEST_F(CountTest, EmptyDocument) {
+        // Doesn't use the fixture but belongs in the same group of tests.
+        Document doc;
+        ASSERT_EQUALS(countChildren(doc.root()), 0u);
+    }
+
+    TEST_F(CountTest, EmptyElement) {
+        Element leaf = findFirstChildNamed(doc().root(), "leaf");
+        ASSERT_TRUE(leaf.ok());
+        ASSERT_EQUALS(countChildren(leaf), 0u);
+    }
+
+    TEST_F(CountTest, OneChildElement) {
+        Element oneChild = findFirstChildNamed(doc().root(), "oneChild");
+        ASSERT_TRUE(oneChild.ok());
+        ASSERT_EQUALS(countChildren(oneChild), 1u);
+    }
+
+    TEST_F(CountTest, ManyChildren) {
+        Element threeChildren = findFirstChildNamed(doc().root(), "threeChildren");
+        ASSERT_TRUE(threeChildren.ok());
+        ASSERT_EQUALS(countChildren(threeChildren), 3u);
+    }
+
+    TEST_F(CountTest, CountSiblingsNone) {
+        ConstElement current = findFirstChildNamed(doc().root(), "oneChild");
+        ASSERT_TRUE(current.ok());
+
+        current = current.leftChild();
+        ASSERT_TRUE(current.ok());
+
+        ASSERT_EQUALS(0U, countSiblingsLeft(current));
+        ASSERT_EQUALS(0U, countSiblingsRight(current));
+    }
+
+    TEST_F(CountTest, CountSiblingsMany) {
+        ConstElement current = findFirstChildNamed(doc().root(), "threeChildren");
+        ASSERT_TRUE(current.ok());
+
+        current = current.leftChild();
+        ASSERT_TRUE(current.ok());
+
+        ASSERT_EQUALS(0U, countSiblingsLeft(current));
+        ASSERT_EQUALS(2U, countSiblingsRight(current));
+
+        current = current.rightSibling();
+        ASSERT_TRUE(current.ok());
+        ASSERT_EQUALS(1U, countSiblingsLeft(current));
+        ASSERT_EQUALS(1U, countSiblingsRight(current));
+
+        current = current.rightSibling();
+        ASSERT_TRUE(current.ok());
+        ASSERT_EQUALS(2U, countSiblingsLeft(current));
+        ASSERT_EQUALS(0U, countSiblingsRight(current));
+
+        current = current.rightSibling();
+        ASSERT_FALSE(current.ok());
+    }
+
+    TEST(DeduplicateTest, ManyDuplicates) {
+        Document doc(mongo::fromjson("{ x : [ 1, 2, 2, 3, 3, 3, 4, 4, 4 ] }"));
+        deduplicateChildren(doc.root().leftChild(), woEqual(false));
+        ASSERT_TRUE(checkDoc(doc, mongo::fromjson("{x : [ 1, 2, 3, 4 ]}")));
     }
 
 } // namespace

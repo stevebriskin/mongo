@@ -36,8 +36,8 @@ run("chmod", "600", path+"key2");
 
 print("add a user to server0: foo");
 m = startMongodTest( port[0], name+"-0", 0 );
-m.getDB("admin").addUser("foo", "bar");
-m.getDB("test").addUser("bar", "baz");
+m.getDB("admin").addUser({user: "foo", pwd: "bar", roles: jsTest.adminUserRoles});
+m.getDB("test").addUser({user: "bar", pwd: "baz", roles: jsTest.basicUserRoles});
 print("make sure user is written before shutting down");
 m.getDB("test").getLastError();
 stopMongod(port[0]);
@@ -85,11 +85,11 @@ function doQueryOn(p) {
         if (typeof(JSON) != "undefined") {
             err = JSON.parse(e.substring(6));
         }
-        else if (e.indexOf("16550") > 0) {
-            err.code = 16550;
+        else if (e.indexOf("13") > 0) {
+            err.code = 13;
         }
     }
-    assert.eq(err.code, 16550);
+    assert.eq(err.code, 13);
 };
 
 doQueryOn(slave);

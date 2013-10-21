@@ -47,6 +47,8 @@ while( 1 ) { // if indexing finishes before we can run checks, try indexing w/ m
         print("wait for indexing to start");
         assert.soon( function() { return 2 == db.system.indexes.count( {ns:"test."+baseName} ) }, "no index created", 30000, 50 );
         print("started.");
+        sleep(1000); // there is a race between when the index build shows up in curop and
+                     // when it first attempts to grab a write lock.
         assert.eq( size, t.count() );
         assert.eq( 100, t.findOne( {i:100} ).i );
         q = t.find();
@@ -59,10 +61,14 @@ while( 1 ) { // if indexing finishes before we can run checks, try indexing w/ m
         assert.eq( "BasicCursor", ex.cursor, "used btree cursor" );
         assert( ex.nscanned < 1000 , "took too long to find 100: " + tojson( ex ) );
         t.remove( {i:40} );
+        assert( !db.getLastError() );
         t.update( {i:10}, {i:-10} );
+        assert( !db.getLastError() );
         id = t.find().hint( {$natural:-1} ).next()._id;
         t.update( {_id:id}, {i:-2} );
+        assert( !db.getLastError() );
         t.save( {i:-50} );
+        assert( !db.getLastError() );
         t.save( {i:size+2} );
         assert( !db.getLastError() );
 

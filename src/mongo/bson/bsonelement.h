@@ -23,6 +23,7 @@
 
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/oid.h"
+#include "mongo/platform/cstdint.h"
 #include "mongo/platform/float_utils.h"
 
 namespace mongo {
@@ -59,12 +60,12 @@ namespace mongo {
     */
     class BSONElement {
     public:
-        /** These functions, which start with a capital letter, throw a UserException if the
+        /** These functions, which start with a capital letter, throw a MsgAssertionException if the
             element is not of the required type. Example:
 
             std::string foo = obj["foo"].String(); // std::exception if not a std::string type or DNE
         */
-        std::string String()        const { return chk(mongo::String).valuestr(); }
+        std::string String()        const { return chk(mongo::String).str(); }
         Date_t Date()               const { return chk(mongo::Date).date(); }
         double Number()             const { return chk(isNumber()).number(); }
         double Double()             const { return chk(NumberDouble)._numberDouble(); }
@@ -73,8 +74,8 @@ namespace mongo {
         bool Bool()                 const { return chk(mongo::Bool).boolean(); }
         std::vector<BSONElement> Array() const; // see implementation for detailed comments
         mongo::OID OID()            const { return chk(jstOID).__oid(); }
-        void Null()                 const { chk(isNull()); } // throw UserException if not null
-        void OK()                   const { chk(ok()); }     // throw UserException if element DNE
+        void Null()                 const { chk(isNull()); } // throw MsgAssertionException if not null
+        void OK()                   const { chk(ok()); }     // throw MsgAssertionException if element DNE
 
         /** @return the embedded object associated with this field.
             Note the returned object is a reference to within the parent bson object. If that 
@@ -143,11 +144,17 @@ namespace mongo {
             return data + 1;
         }
 
-
+        /**
+         * NOTE: size includes the NULL terminator.
+         */
         int fieldNameSize() const {
             if ( fieldNameSize_ == -1 )
                 fieldNameSize_ = (int)strlen( fieldName() ) + 1;
             return fieldNameSize_;
+        }
+
+        const StringData fieldNameStringData() const {
+            return StringData(fieldName(), fieldNameSize() - 1);
         }
 
         /** raw data of the element's value (so be careful). */
@@ -237,8 +244,8 @@ namespace mongo {
         }
 
         // for objects the size *includes* the size of the size field
-        int objsize() const {
-            return *reinterpret_cast< const int* >( value() );
+        size_t objsize() const {
+            return static_cast< const size_t >( *reinterpret_cast< const uint32_t* >( value() ) );
         }
 
         /** Get a string's value.  Also gives you start of the real data for an embedded object.

@@ -1,3 +1,4 @@
+// DEPRECATED
 /**
  *    Copyright (C) 2008 10gen Inc.
  *
@@ -12,14 +13,31 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
+
+#include <set>
+#include <vector>
 
 #include "mongo/db/cursor.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_details.h"
+#include "mongo/db/index/btree_index_cursor.h"
+#include "mongo/db/index/index_access_method.h"
 
 namespace mongo {
 
@@ -37,13 +55,6 @@ namespace mongo {
      * A BtreeCursor may be initialized with the 'startKey' and 'endKey' bounds of an interval of
      * keys within a btree.  A BtreeCursor may alternatively be initialized with a FieldRangeVector
      * describing a list of intervals for every field of the btree index.
-     *
-     * Notes on inheritance:
-     *
-     * BtreeCursor is an abstract class.  Btrees come in different versions, with different storage
-     * formats.  The versions are v0 and v1 as of this writing.  Member functions implemented in
-     * BtreeCursor are storage format agnostic.  Classes derived from BtreeCursor implement the
-     * format specific bits.
      *
      * Notes on the yielding implementation:
      *
@@ -81,10 +92,10 @@ namespace mongo {
                                   int singleIntervalLimit,
                                   int direction );
 
-        virtual bool ok() { return !bucket.isNull(); }
+        virtual bool ok();
         virtual bool advance();
-        virtual void noteLocation(); // updates keyAtKeyOfs...
-        virtual void checkLocation() = 0;
+        virtual void noteLocation();
+        virtual void checkLocation();
         virtual bool supportGetMore() { return true; }
         virtual bool supportYields() { return true; }
 
@@ -106,18 +117,10 @@ namespace mongo {
         virtual bool modifiedKeys() const { return _multikey; }
         virtual bool isMultiKey() const { return _multikey; }
 
-        /** returns BSONObj() if ofs is out of range */
-        virtual BSONObj keyAt(int ofs) const = 0;
-
-        virtual BSONObj currKey() const = 0;
+        virtual BSONObj currKey() const;
         virtual BSONObj indexKeyPattern() { return _order; }
 
-        virtual void aboutToDeleteBucket(const DiskLoc& b) {
-            if ( bucket == b )
-                keyOfs = -1;
-        }
-
-        virtual DiskLoc currLoc() = 0;
+        virtual DiskLoc currLoc();
         virtual DiskLoc refLoc()   { return currLoc(); }
         virtual Record* _current() { return currLoc().rec(); }
         virtual BSONObj current()  { return BSONObj::make(_current()); }
@@ -143,14 +146,12 @@ namespace mongo {
 
         virtual long long nscanned() { return _nscanned; }
 
-        /** for debugging only */
-        const DiskLoc getBucket() const { return bucket; }
-        int getKeyOfs() const { return keyOfs; }
+        // XXX(hk): geo uses this for restoring state...for now.
+        virtual const DiskLoc getBucket() const;
+        // XXX(hk): geo uses this too.  :(
+        virtual int getKeyOfs() const;
 
-        // just for unit tests
-        virtual bool curKeyHasChild() = 0;
-
-    protected:
+    private:
         BtreeCursor( NamespaceDetails* nsd, int theIndexNo, const IndexDetails& idxDetails );
 
         virtual void init( const BSONObj& startKey,
@@ -161,12 +162,6 @@ namespace mongo {
         virtual void init( const shared_ptr<FieldRangeVector>& bounds,
                            int singleIntervalLimit,
                            int direction );
-
-        /**
-         * Our btrees may (rarely) have "unused" keys when items are deleted.
-         * Skip past them.
-         */
-        virtual bool skipUnusedKeys() = 0;
 
         bool skipOutOfRangeKeysAndCheckEnd();
 
@@ -181,28 +176,6 @@ namespace mongo {
 
         void checkEnd();
 
-        /** selective audits on construction */
-        void audit();
-
-        virtual void _audit() = 0;
-
-        virtual DiskLoc _locate(const BSONObj& key, const DiskLoc& loc) = 0;
-
-        virtual DiskLoc _advance(const DiskLoc& thisLoc,
-                                 int& keyOfs,
-                                 int direction,
-                                 const char* caller) = 0;
-
-        virtual void _advanceTo(DiskLoc& thisLoc,
-                                int& keyOfs,
-                                const BSONObj& keyBegin,
-                                int keyBeginLen,
-                                bool afterKey,
-                                const vector<const BSONElement*>& keyEnd,
-                                const vector<bool>& keyEndInclusive,
-                                const Ordering& order,
-                                int direction ) = 0;
-
         /** set initial bucket */
         void initWithoutIndependentFieldRanges();
 
@@ -213,11 +186,17 @@ namespace mongo {
                         const vector<const BSONElement*>& keyEnd,
                         const vector<bool>& keyEndInclusive );
 
+        void _finishConstructorInit();
+        static BtreeCursor* make( NamespaceDetails* nsd,
+                                  int idxNo,
+                                  const IndexDetails& indexDetails );
+
         // these are set in the construtor
         NamespaceDetails* const d;
         const int idxNo;
         const IndexDetails& indexDetails;
 
+        // These variables are for query-level index scanning.
         // these are all set in init()
         set<DiskLoc> _dups;
         BSONObj startKey;
@@ -225,12 +204,7 @@ namespace mongo {
         bool _endKeyInclusive;
         bool _multikey; // this must be updated every getmore batch in case someone added a multikey
         BSONObj _order; // this is the same as indexDetails.keyPattern()
-        Ordering _ordering;
-        DiskLoc bucket;
-        int keyOfs;
-        int _direction; // 1=fwd,-1=reverse
-        BSONObj keyAtKeyOfs; // so we can tell if things moved around on us between the query and the getMore call
-        DiskLoc locAtKeyOfs;
+        int _direction;
         shared_ptr<FieldRangeVector> _bounds;
         auto_ptr<FieldRangeVectorIterator> _boundsIterator;
         bool _boundsMustMatch; // If iteration is aborted before a key matching _bounds is
@@ -242,11 +216,11 @@ namespace mongo {
         bool _independentFieldRanges;
         long long _nscanned;
 
-    private:
-        void _finishConstructorInit();
-        static BtreeCursor* make( NamespaceDetails* nsd,
-                                  int idxNo,
-                                  const IndexDetails& indexDetails );
+        // These variables are for index traversal.
+        scoped_ptr<BtreeIndexCursor> _indexCursor;
+        scoped_ptr<IndexAccessMethod> _indexAM;
+        scoped_ptr<IndexDescriptor> _indexDescriptor;
+        bool _hitEnd;
     };
 
 } // namespace mongo

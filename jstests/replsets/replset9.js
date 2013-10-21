@@ -1,11 +1,11 @@
 
 
-var rt = new ReplSetTest( { name : "replset9tests" , nodes: 1, oplogSize: 100 } );
+var rt = new ReplSetTest( { name : "replset9tests" , nodes: 1, oplogSize: 300 } );
 
 var nodes = rt.startSet();
 rt.initiate();
 var master = rt.getMaster();
-var bigstring = Array(1000).toString();
+var bigstring = Array(5000).toString();
 var md = master.getDB( 'd' );
 var mdc = md[ 'c' ];
 
@@ -32,7 +32,26 @@ md.getLastError();
 
 // add a secondary; start cloning
 var slave = rt.add();
-rt.reInitiate();
+(function reinitiate() {
+    var master  = rt.nodes[0];
+    var c = master.getDB("local")['system.replset'].findOne();
+    var config  = rt.getReplSetConfig();
+    config.version = c.version + 1;
+    var admin  = master.getDB("admin");
+    var cmd     = {};
+    var cmdKey  = 'replSetReconfig';
+    var timeout = timeout || 30000;
+    cmd[cmdKey] = config;
+    printjson(cmd);
+
+    assert.soon(function() {
+        var result = admin.runCommand(cmd);
+        printjson(result);
+        return result['ok'] == 1;
+    }, "reinitiate replica set", timeout);
+})();
+
+
 print ("initiation complete!");
 var sc = slave.getDB( 'd' )[ 'c' ];
 slave.setSlaveOk();

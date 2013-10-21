@@ -38,6 +38,7 @@ import glob
 from optparse import OptionParser
 import os
 import parser
+import pprint
 import re
 import shutil
 import shlex
@@ -99,7 +100,8 @@ smoke_db_prefix = ''
 small_oplog = False
 small_oplog_rs = False
 
-all_test_results = []
+test_report = { "results": [] }
+report_file = None
 
 # This class just implements the with statement API, for a sneaky
 # purpose below.
@@ -120,7 +122,6 @@ def buildlogger(cmd, is_global=False):
         else:
             return [utils.find_python(), 'buildscripts/buildlogger.py'] + cmd
     return cmd
-
 
 class mongod(object):
     def __init__(self, **kwargs):
@@ -166,7 +167,9 @@ class mongod(object):
 
     def setup_admin_user(self, port=mongod_port):
         try:
-            Connection( "localhost" , int(port) ).admin.add_user("admin","password")
+            Connection( "localhost" , int(port), ssl=use_ssl ).admin.command("createUser", "admin",
+                                                                pwd="password",
+                                                                roles=["__system"])
         except OperationFailure, e:
             if e.message == 'need to login':
                 pass # SERVER-4225
@@ -196,10 +199,14 @@ class mongod(object):
             call(argv)
         utils.ensureDir(dir_name)
         argv = [mongod_executable, "--port", str(self.port), "--dbpath", dir_name]
-        # This should always be set for tests
-        argv += ['--setParameter', 'enableTestCommands=1']
+        # These parameters are alwas set for tests
+        # SERVER-9137 Added httpinterface parameter to keep previous behavior
+        argv += ['--setParameter', 'enableTestCommands=1', '--httpinterface']
         if self.kwargs.get('small_oplog'):
             argv += ["--master", "--oplogSize", "511"]
+        params = self.kwargs.get('set_parameters', None)
+        if params:
+            for p in params.split(','): argv += ['--setParameter', p]
         if self.kwargs.get('small_oplog_rs'):
             argv += ["--replSet", "foo", "--oplogSize", "511"]
         if self.slave:
@@ -212,14 +219,16 @@ class mongod(object):
             argv += ['--auth']
             authMechanism = self.kwargs.get('authMechanism', 'MONGODB-CR')
             if authMechanism != 'MONGODB-CR':
-                argv.append('--setParameter=authenticationMechanisms=' + authMechanism)
+                argv += ['--setParameter', 'authenticationMechanisms=' + authMechanism]
             self.auth = True
-        if self.kwargs.get('use_ssl'):
-            argv += ['--sslOnNormalPorts',
+        if self.kwargs.get('use_ssl') or self.kwargs.get('use_x509'):
+            argv += ['--sslMode', "sslOnly",
                      '--sslPEMKeyFile', 'jstests/libs/server.pem',
                      '--sslCAFile', 'jstests/libs/ca.pem',
                      '--sslWeakCertificateValidation']
-        
+        if self.kwargs.get('use_x509'):
+            argv += ['--clusterAuthMode','x509'];
+            self.auth = True
         print "running " + " ".join(argv)
         self.proc = self._start(buildlogger(argv, is_global=True))
 
@@ -243,7 +252,6 @@ class mongod(object):
         child processes of this process can be killed with a single
         call to TerminateJobObject (see self.stop()).
         """
-        proc = Popen(argv)
 
         if os.sys.platform == "win32":
             # Create a job object with the "kill on job close"
@@ -252,6 +260,12 @@ class mongod(object):
             # and lets us terminate the whole tree of processes
             # rather than orphaning the mongod.
             import win32job
+
+            # Magic number needed to allow job reassignment in Windows 7
+            # see: MSDN - Process Creation Flags - ms684863
+            CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+            proc = Popen(argv, creationflags=CREATE_BREAKAWAY_FROM_JOB)
 
             self.job_object = win32job.CreateJobObject(None, '')
 
@@ -265,6 +279,9 @@ class mongod(object):
 
             win32job.AssignProcessToJobObject(self.job_object, proc._handle)
 
+        else:
+            proc = Popen(argv)
+
         return proc
 
     def stop(self):
@@ -277,7 +294,7 @@ class mongod(object):
                 win32job.TerminateJobObject(self.job_object, -1)
                 import time
                 # Windows doesn't seem to kill the process immediately, so give it some time to die
-                time.sleep(5) 
+                time.sleep(5)
             else:
                 # This function not available in Python 2.5
                 self.proc.terminate()
@@ -301,8 +318,8 @@ class TestFailure(Exception):
 class TestExitFailure(TestFailure):
     def __init__(self, *args):
         self.path = args[0]
-
         self.status=args[1]
+
     def __str__(self):
         return "test %s exited with status %d" % (self.path, self.status)
 
@@ -331,15 +348,25 @@ def check_db_hashes(master, slave):
     global lost_in_slave, lost_in_master, screwy_in_slave, replicated_collections
 
     replicated_collections += master.dict.keys()
-    
-    for db in replicated_collections:
-        if db not in slave.dict:
-            lost_in_slave.append(db)
-        mhash = master.dict[db]
-        shash = slave.dict[db]
-        if mhash != shash:
-            screwy_in_slave[db] = mhash + "/" + shash
 
+    for coll in replicated_collections:
+        if coll not in slave.dict:
+            lost_in_slave.append(coll)
+        mhash = master.dict[coll]
+        shash = slave.dict[coll]
+        if mhash != shash:
+            mTestDB = Connection(port=master.port, slave_okay=True).test
+            sTestDB = Connection(port=slave.port, slave_okay=True).test
+            mCount = mTestDB[coll].count()
+            sCount = sTestDB[coll].count()
+            stats = {'hashes': {'master': mhash, 'slave': shash},
+                     'counts':{'master': mCount, 'slave': sCount}}
+            try:
+                stats["docs"] = {'master':list(mTestDB[coll].find(limit=10)),
+                                  'slave':list(sTestDB[coll].find(limit=10))}
+            except Exception, e:
+                stats["error-docs"] = e;
+            screwy_in_slave[coll] = stats
     for db in slave.dict.keys():
         if db not in master.dict:
             lost_in_master.append(db)
@@ -359,12 +386,19 @@ def skipTest(path):
     if small_oplog: # For tests running in parallel
         if basename in ["cursor8.js", "indexh.js", "dropdb.js", "connections_opened.js", "opcounters.js"]:
             return True
-        if os.sys.platform == "sunos5":
-            if basename == "geo_update_btree.js":
-                return True
-    if auth or keyFile: # For tests running with auth
+    if use_ssl: 
+        # Skip tests using mongobridge since it does not support SSL
+        # TODO: Remove when SERVER-10910 has been resolved.  
+        if basename in ["gridfs.js", "initial_sync3.js", "majority.js", "no_chaining.js",
+                        "rollback4.js", "slavedelay3.js", "sync2.js", "tags.js"]:
+            return True
+        # TODO: For now skip tests using MongodRunner, remove when SERVER-10909 has been resolved
+        if basename in ["fastsync.js", "index_retry.js", "ttl_repl_maintenance.js", 
+                        "unix_socket1.js"]:
+            return True;
+    if auth or keyFile or use_x509: # For tests running with auth
         # Skip any tests that run with auth explicitly
-        if parentDir == "auth" or "auth" in basename:
+        if parentDir.lower() == "auth" or "auth" in basename.lower():
             return True
         if parentPath == mongo_repo: # Skip client tests
             return True
@@ -375,17 +409,16 @@ def skipTest(path):
         if parentDir == "disk": # SERVER-7356
             return True
 
-        authTestsToSkip = [("sharding", "gle_with_conf_servers.js"), # SERVER-6972
-                           ("sharding", "read_pref.js"), # SERVER-6972
-                           ("sharding", "read_pref_cmd.js"), # SERVER-6972
-                           ("sharding", "read_pref_rs_client.js"), # SERVER-6972
+        authTestsToSkip = [("jstests", "drop2.js"), # SERVER-8589,
+                           ("jstests", "killop.js"), # SERVER-10128
+                           ("sharding", "replmonitor_bad_seed.js"), # SERVER-10420
+                           ("sharding", "trace_missing_docs_test.js"), # SERVER-10640
                            ("sharding", "sync3.js"), # SERVER-6388 for this and those below
                            ("sharding", "sync6.js"),
                            ("sharding", "parallel.js"),
                            ("jstests", "bench_test1.js"),
                            ("jstests", "bench_test2.js"),
                            ("jstests", "bench_test3.js"),
-                           ("jstests", "drop2.js") # SERVER-8589
                            ]
 
         if os.path.join(parentDir,basename) in [ os.path.join(*test) for test in authTestsToSkip ]:
@@ -393,7 +426,9 @@ def skipTest(path):
 
     return False
 
-def runTest(test):
+def runTest(test, result):
+    # result is a map containing test result details, like result["url"]
+
     # test is a tuple of ( filename , usedb<bool> )
     # filename should be a js file to run
     # usedb is true if the test expects a mongod to be running
@@ -446,11 +481,14 @@ def runTest(test):
     else:
         keyFileData = None
 
+    mongo_test_filename = os.path.basename(path)
+    if 'sharedclient' in path:
+        mongo_test_filename += "-sharedclient"
 
     # sys.stdout.write() is more atomic than print, so using it prevents
     # lines being interrupted by, e.g., child processes
     sys.stdout.write(" *******************************************\n")
-    sys.stdout.write("         Test : %s ...\n" % os.path.basename(path))
+    sys.stdout.write("         Test : %s ...\n" % mongo_test_filename)
     sys.stdout.flush()
 
     # FIXME: we don't handle the case where the subprocess
@@ -460,12 +498,16 @@ def runTest(test):
                      'TestData.testPath = "' + path + '";' + \
                      'TestData.testFile = "' + os.path.basename( path ) + '";' + \
                      'TestData.testName = "' + re.sub( ".js$", "", os.path.basename( path ) ) + '";' + \
+                     'TestData.setParameters = "' + ternary( set_parameters, set_parameters, "" )  + '";' + \
                      'TestData.noJournal = ' + ternary( no_journal )  + ";" + \
                      'TestData.noJournalPrealloc = ' + ternary( no_preallocj )  + ";" + \
                      'TestData.auth = ' + ternary( auth ) + ";" + \
                      'TestData.keyFile = ' + ternary( keyFile , '"' + str(keyFile) + '"' , 'null' ) + ";" + \
                      'TestData.keyFileData = ' + ternary( keyFile , '"' + str(keyFileData) + '"' , 'null' ) + ";" + \
-                     'TestData.authMechanism = ' + ternary( authMechanism, '"' + str(authMechanism) + '"', 'null') + ";"
+                     'TestData.authMechanism = ' + ternary( authMechanism,
+                                               '"' + str(authMechanism) + '"', 'null') + ";" + \
+                     'TestData.useSSL = ' + ternary( use_ssl ) + ";" + \
+                     'TestData.useX509 = ' + ternary( use_x509 ) + ";"
         if os.sys.platform == "win32":
             # double quotes in the evalString on windows; this
             # prevents the backslashes from being removed when
@@ -476,18 +518,30 @@ def runTest(test):
             evalString += 'jsTest.authenticate(db.getMongo());'
 
         argv = argv + [ '--eval', evalString]
-    
+
     if argv[0].endswith( 'test' ) and no_preallocj :
         argv = argv + [ '--nopreallocj' ]
-    
-    
+
+
     sys.stdout.write("      Command : %s\n" % ' '.join(argv))
     sys.stdout.write("         Date : %s\n" % datetime.now().ctime())
     sys.stdout.flush()
 
-    os.environ['MONGO_TEST_FILENAME'] = os.path.basename(path)
+    os.environ['MONGO_TEST_FILENAME'] = mongo_test_filename
     t1 = time.time()
-    r = call(buildlogger(argv), cwd=test_path)
+
+    proc = Popen(buildlogger(argv), cwd=test_path, stdout=PIPE)
+    first_line = proc.stdout.readline() # Get suppressed output URL
+    m = re.search(r"\s*\(output suppressed; see (?P<url>.*)\)" + os.linesep, first_line)
+    if m:
+        result["url"] = m.group("url")
+    sys.stdout.write(first_line)
+    for line in proc.stdout: # print until subprocess's stdout closed
+        sys.stdout.write(line)
+
+    proc.wait() # wait if stdout is closed before subprocess exits.
+    r = proc.returncode
+
     t2 = time.time()
     del os.environ['MONGO_TEST_FILENAME']
 
@@ -506,11 +560,14 @@ def runTest(test):
     sys.stdout.write("                %10.4f %s\n" % ((timediff) * scale, suffix))
     sys.stdout.flush()
 
+    result["exit_code"] = r
+
     if r != 0:
         raise TestExitFailure(path, r)
-    
+
     if start_mongod:
         try:
+            # The purpose of this Connection is to verify that the smoke.py mongod is still up  
             c = Connection(host="127.0.0.1", port=int(mongod_port), ssl=use_ssl)
         except Exception,e:
             print "Exception from pymongo: ", e
@@ -523,7 +580,7 @@ def run_tests(tests):
     # need this.  (So long as there are no conflicts with port,
     # dbpath, etc., and so long as we shut ours down properly,
     # starting this mongod shouldn't break anything, though.)
-    
+
     # The reason we want to use "with" is so that we get __exit__ semantics
     # but "with" is only supported on Python 2.5+
 
@@ -531,24 +588,29 @@ def run_tests(tests):
         master = mongod(small_oplog_rs=small_oplog_rs,
                         small_oplog=small_oplog,
                         no_journal=no_journal,
+                        set_parameters=set_parameters,
                         no_preallocj=no_preallocj,
                         auth=auth,
                         authMechanism=authMechanism,
-                        use_ssl=use_ssl).__enter__()
+                        use_ssl=use_ssl,
+                        use_x509=use_x509).__enter__()
     else:
         master = Nothing()
     try:
         if small_oplog:
-            slave = mongod(slave=True).__enter__()
+            slave = mongod(slave=True,
+                           set_parameters=set_parameters).__enter__()
         elif small_oplog_rs:
             slave = mongod(slave=True,
                            small_oplog_rs=small_oplog_rs,
                            small_oplog=small_oplog,
                            no_journal=no_journal,
+                           set_parameters=set_parameters,
                            no_preallocj=no_preallocj,
                            auth=auth,
                            authMechanism=authMechanism,
-                           use_ssl=use_ssl).__enter__()
+                           use_ssl=use_ssl,
+                           use_x509=use_x509).__enter__()
             primary = Connection(port=master.port, slave_okay=True);
 
             primary.admin.command({'replSetInitiate' : {'_id' : 'foo', 'members' : [
@@ -569,16 +631,24 @@ def run_tests(tests):
 
             tests_run = 0
             for tests_run, test in enumerate(tests):
-                test_result = { "test": test[0], "start": time.time() }
+                test_result = { "start": time.time() }
+
+                if test[0].startswith(mongo_repo + os.path.sep):
+                    test_result["test_file"] = test[0][len(mongo_repo)+1:]
+                else:
+                    # user could specify a file not in repo. leave it alone.
+                    test_result["test_file"] = test[0]
+
                 try:
                     fails.append(test)
-                    runTest(test)
+                    runTest(test, test_result)
                     fails.pop()
                     winners.append(test)
 
-                    test_result["passed"] = True
                     test_result["end"] = time.time()
-                    all_test_results.append( test_result )
+                    test_result["elapsed"] = test_result["end"] - test_result["start"]
+                    test_result["status"] = "pass"
+                    test_report["results"].append( test_result )
 
                     if small_oplog or small_oplog_rs:
                         master.wait_for_repl()
@@ -589,16 +659,19 @@ def run_tests(tests):
                             master = mongod(small_oplog_rs=small_oplog_rs,
                                             small_oplog=small_oplog,
                                             no_journal=no_journal,
+                                            set_parameters=set_parameters,
                                             no_preallocj=no_preallocj,
                                             auth=auth,
                                             authMechanism=authMechanism,
-                                            use_ssl=use_ssl).__enter__()
+                                            use_ssl=use_ssl,
+                                            use_x509=use_x509).__enter__()
 
                 except TestFailure, f:
-                    test_result["passed"] = False
                     test_result["end"] = time.time()
+                    test_result["elapsed"] = test_result["end"] - test_result["start"]
                     test_result["error"] = str(f)
-                    all_test_results.append( test_result )
+                    test_result["status"] = "fail"
+                    test_report["results"].append( test_result )
                     try:
                         print f
                         # Record the failing test and re-raise.
@@ -639,8 +712,18 @@ at the end of testing:""" % (src, dst)
     if screwy_in_slave:
         print """The following collections has different hashes in master and slave
 at the end of testing:"""
-        for db in screwy_in_slave.keys():
-            print "%s\t %s" % (db, screwy_in_slave[db])
+        for coll in screwy_in_slave.keys():
+            stats = screwy_in_slave[coll]
+            print "collection: %s\t (master/slave) hashes: %s/%s counts: %i/%i" % (coll, stats['hashes']['master'], stats['hashes']['slave'], stats['counts']['master'], stats['counts']['slave'])
+            if "docs" in stats:
+                print "Master docs (limited):"
+                pprint.pprint(stats["docs"]["master"], indent=2)
+                print "Slave docs (limited):"
+                pprint.pprint(stats["docs"]["slave"], indent=2)
+            if "error-docs" in stats:
+                print "Error getting docs to diff:"
+                pprint.pprint(stats["error-docs"])
+
     if (small_oplog or small_oplog_rs) and not (lost_in_master or lost_in_slave or screwy_in_slave):
         print "replication ok for %d collections" % (len(replicated_collections))
     if losers or lost_in_slave or lost_in_master or screwy_in_slave:
@@ -690,6 +773,14 @@ def expand_suites(suites,expandUseDB=True):
             paths = ["firstExample", "secondExample", "whereExample", "authTest", "clientTest", "httpClientTest"]
             if os.sys.platform == "win32":
                 paths = [path + '.exe' for path in paths]
+
+            if not test_path:
+                # If we are testing 'in-tree', then add any files of the same name from the
+                # sharedclient directory. The out of tree client build doesn't have shared clients.
+                scpaths = ["sharedclient/" + path for path in paths]
+                scfiles = glob.glob("sharedclient/*")
+                paths += [scfile for scfile in scfiles if scfile in scpaths]
+
             # hack
             tests += [(test_path and path or os.path.join(mongo_repo, path), False) for path in paths]
         elif suite == 'mongosTest':
@@ -714,7 +805,7 @@ def expand_suites(suites,expandUseDB=True):
         if globstr:
             if usedb and not expandUseDB:
                 tests += [ (suite,False) ]
-            else:                
+            else:
                 if globstr.endswith('.js'):
                     loc = 'jstests/'
                 else:
@@ -734,12 +825,16 @@ def add_exe(e):
 
 def set_globals(options, tests):
     global mongod_executable, mongod_port, shell_executable, continue_on_failure, small_oplog, small_oplog_rs
-    global no_journal, no_preallocj, auth, authMechanism, keyFile, smoke_db_prefix, test_path, start_mongod
-    global use_ssl
+    global no_journal, set_parameters, no_preallocj, auth, authMechanism, keyFile, smoke_db_prefix, test_path, start_mongod
+    global use_ssl, use_x509
     global file_of_commands_mode
+    global report_file
     start_mongod = options.start_mongod
     if hasattr(options, 'use_ssl'):
         use_ssl = options.use_ssl
+    if hasattr(options, 'use_x509'):
+        use_x509 = options.use_x509
+        use_ssl = use_ssl or use_x509
     #Careful, this can be called multiple times
     test_path = options.test_path
 
@@ -759,6 +854,7 @@ def set_globals(options, tests):
     if hasattr(options, "small_oplog_rs"):
         small_oplog_rs = options.small_oplog_rs
     no_journal = options.no_journal
+    set_parameters = options.set_parameters
     no_preallocj = options.no_preallocj
     if options.mode == 'suite' and tests == ['client']:
         # The client suite doesn't work with authentication
@@ -780,6 +876,8 @@ def set_globals(options, tests):
     # if smoke.py is running a list of commands read from a
     # file (or stdin) rather than running a suite of js tests
     file_of_commands_mode = options.File and options.mode == 'files'
+    # generate json report
+    report_file = options.report_file
 
 def file_version():
     return md5(open(__file__, 'r').read()).hexdigest()
@@ -861,7 +959,7 @@ def add_to_failfile(tests, options):
 
 
 def main():
-    global mongod_executable, mongod_port, shell_executable, continue_on_failure, small_oplog, no_journal, no_preallocj, auth, keyFile, smoke_db_prefix, test_path
+    global mongod_executable, mongod_port, shell_executable, continue_on_failure, small_oplog, no_journal, set_parameters, no_preallocj, auth, keyFile, smoke_db_prefix, test_path
     parser = OptionParser(usage="usage: smoke.py [OPTIONS] ARGS*")
     parser.add_option('--mode', dest='mode', default='suite',
                       help='If "files", ARGS are filenames; if "suite", ARGS are sets of tests (%default)')
@@ -899,6 +997,9 @@ def main():
     parser.add_option('--auth', dest='auth', default=False,
                       action="store_true",
                       help='Run standalone mongods in tests with authentication enabled')
+    parser.add_option('--use-x509', dest='use_x509', default=False,
+                      action="store_true",
+                      help='Use x509 auth for internal cluster authentication')
     parser.add_option('--authMechanism', dest='authMechanism', default='MONGODB-CR',
                       help='Use the given authentication mechanism, when --auth is used.')
     parser.add_option('--keyFile', dest='keyFile', default=None,
@@ -914,13 +1015,14 @@ def main():
     parser.add_option('--with-cleanbb', dest='with_cleanbb', default=False,
                       action="store_true",
                       help='Clear database files from previous smoke.py runs')
-    parser.add_option('--dont-start-mongod', dest='start_mongod', default=True, 
+    parser.add_option('--dont-start-mongod', dest='start_mongod', default=True,
                       action='store_false',
                       help='Do not start mongod before commencing test running')
     parser.add_option('--use-ssl', dest='use_ssl', default=False,
                       action='store_true',
                       help='Run mongo shell and mongod instances with SSL encryption')
-
+    parser.add_option('--set-parameters', dest='set_parameters', default="",
+                      help='Adds --setParameter for each passed in items in the csv list - ex. "param1=1,param2=foo" ')
     # Buildlogger invocation from command line
     parser.add_option('--buildlogger-builder', dest='buildlogger_builder', default=None,
                       action="store", help='Set the "builder name" for buildlogger')
@@ -930,6 +1032,10 @@ def main():
                       action="store", help='Path to Python file containing buildlogger credentials')
     parser.add_option('--buildlogger-phase', dest='buildlogger_phase', default=None,
                       action="store", help='Set the "phase" for buildlogger (e.g. "core", "auth") for display in the webapp (optional)')
+    parser.add_option('--report-file', dest='report_file', default=None,
+                      action='store',
+                      help='Path to generate detailed json report containing all test details')
+
 
     global tests
     (options, tests) = parser.parse_args()
@@ -972,7 +1078,7 @@ def main():
     if options.ignore_files != None :
         ignore_patt = re.compile( options.ignore_files )
         print "Ignoring files with pattern: ", ignore_patt
-	
+
         def ignore_test( test ):
             if ignore_patt.search( test[0] ) != None:
                 print "Ignoring test ", test[0]
@@ -990,14 +1096,19 @@ def main():
         dbroot = os.path.join(options.smoke_db_prefix, 'data', 'db')
         call([utils.find_python(), "buildscripts/cleanbb.py", "--nokill", dbroot])
 
+    test_report["start"] = time.time()
     try:
         run_tests(tests)
     finally:
         add_to_failfile(fails, options)
 
-        f = open( "smoke-last.json", "wb" )
-        f.write( json.dumps( { "results" : all_test_results } ) )
-        f.close()
+        test_report["end"] = time.time()
+        test_report["elapsed"] = test_report["end"] - test_report["start"]
+        test_report["failures"] = len(losers.keys())
+        if report_file:
+            f = open( report_file, "wb" )
+            f.write( json.dumps( test_report ) )
+            f.close()
 
         report()
 

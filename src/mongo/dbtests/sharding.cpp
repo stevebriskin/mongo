@@ -16,12 +16,11 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
-
-#include "mongo/dbtests/dbtests.h"
+#include "mongo/pch.h"
 
 #include "mongo/client/dbclientmockcursor.h"
 #include "mongo/client/parallel.h"
+#include "mongo/dbtests/dbtests.h"
 #include "mongo/s/chunk_diff.h"
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/type_chunk.h"
@@ -98,6 +97,11 @@ namespace ShardingTests {
             _shard = Shard( "shard0000", "$hostFooBar:27017" );
             // Need to run this to ensure the shard is in the global lookup table
             _shard.setAddress( _shard.getAddress() );
+
+            // Create an index so that diffing works correctly, otherwise no cursors from S&O
+            client().ensureIndex( ChunkType::ConfigNS, // br
+                                  BSON( ChunkType::ns() << 1 << // br
+                                          ChunkType::DEPRECATED_lastmod() << 1 ) );
         }
 
         virtual ~ChunkManagerTest() {

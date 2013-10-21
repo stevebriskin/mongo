@@ -12,18 +12,34 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
-#include "pch.h"
-#include "db/pipeline/pipeline.h"
+#include "mongo/pch.h"
 
-#include "db/jsobj.h"
-#include "db/pipeline/accumulator.h"
-#include "db/pipeline/document.h"
-#include "db/pipeline/document_source.h"
-#include "db/pipeline/expression.h"
-#include "db/pipeline/expression_context.h"
-#include "util/mongoutils/str.h"
+#include "mongo/db/pipeline/pipeline.h"
+
+#include "mongo/db/auth/action_set.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -31,17 +47,11 @@ namespace mongo {
     const char Pipeline::pipelineName[] = "pipeline";
     const char Pipeline::explainName[] = "explain";
     const char Pipeline::fromRouterName[] = "fromRouter";
-    const char Pipeline::splitMongodPipelineName[] = "splitMongodPipeline";
     const char Pipeline::serverPipelineName[] = "serverPipeline";
     const char Pipeline::mongosPipelineName[] = "mongosPipeline";
 
-    Pipeline::~Pipeline() {
-    }
-
     Pipeline::Pipeline(const intrusive_ptr<ExpressionContext> &pTheCtx):
-        collectionName(),
         explain(false),
-        splitMongodPipeline(false),
         pCtx(pTheCtx) {
     }
 
@@ -50,15 +60,11 @@ namespace mongo {
     struct StageDesc {
         const char *pName;
         intrusive_ptr<DocumentSource> (*pFactory)(
-            BSONElement *, const intrusive_ptr<ExpressionContext> &);
+            BSONElement, const intrusive_ptr<ExpressionContext> &);
     };
 
     /* this table must be in alphabetical order by name for bsearch() */
     static const StageDesc stageDesc[] = {
-#ifdef NEVER /* disabled for now in favor of $match */
-        {DocumentSourceFilter::filterName,
-         DocumentSourceFilter::createFromBson},
-#endif
         {DocumentSourceGeoNear::geoNearName,
          DocumentSourceGeoNear::createFromBson},
         {DocumentSourceGroup::groupName,
@@ -67,12 +73,14 @@ namespace mongo {
          DocumentSourceLimit::createFromBson},
         {DocumentSourceMatch::matchName,
          DocumentSourceMatch::createFromBson},
-#ifdef LATER // https://jira.mongodb.org/browse/SERVER-3253 
+        {DocumentSourceMergeCursors::name,
+         DocumentSourceMergeCursors::createFromBson},
         {DocumentSourceOut::outName,
          DocumentSourceOut::createFromBson},
-#endif
         {DocumentSourceProject::projectName,
          DocumentSourceProject::createFromBson},
+        {DocumentSourceRedact::redactName,
+         DocumentSourceRedact::createFromBson},
         {DocumentSourceSkip::skipName,
          DocumentSourceSkip::createFromBson},
         {DocumentSourceSort::sortName,
@@ -104,9 +112,13 @@ namespace mongo {
                 continue;
             }
 
+            // ignore cursor options since they are handled externally.
+            if (str::equals(pFieldName, "cursor")) {
+                continue;
+            }
+
             /* look for the aggregation command */
             if (!strcmp(pFieldName, commandName)) {
-                pPipeline->collectionName = cmdElement.String();
                 continue;
             }
 
@@ -124,21 +136,22 @@ namespace mongo {
 
             /* if the request came from the router, we're in a shard */
             if (!strcmp(pFieldName, fromRouterName)) {
-                pCtx->setInShard(cmdElement.Bool());
+                pCtx->inShard = cmdElement.Bool();
                 continue;
             }
 
-            /* check for debug options */
-            if (!strcmp(pFieldName, splitMongodPipelineName)) {
-                pPipeline->splitMongodPipeline = true;
+            if (str::equals(pFieldName, "allowDiskUsage")) {
+                uassert(16949,
+                        str::stream() << "allowDiskUsage must be a bool, not a "
+                                      << typeName(cmdElement.type()),
+                        cmdElement.type() == Bool);
+                pCtx->extSortAllowed = cmdElement.Bool();
                 continue;
             }
 
             /* we didn't recognize a field in the command */
             ostringstream sb;
-            sb <<
-               "unrecognized field \"" <<
-               cmdElement.fieldName();
+            sb << "unrecognized field '" << cmdElement.fieldName() << "'";
             errmsg = sb.str();
             return intrusive_ptr<Pipeline>();
         }
@@ -176,15 +189,23 @@ namespace mongo {
             uassert(16436,
                     str::stream() << "Unrecognized pipeline stage name: '" << stageName << "'",
                     pDesc);
-            intrusive_ptr<DocumentSource> stage = (*pDesc->pFactory)(&stageSpec, pCtx);
+            intrusive_ptr<DocumentSource> stage = pDesc->pFactory(stageSpec, pCtx);
             verify(stage);
             stage->setPipelineStep(iStep);
             sources.push_back(stage);
+
+            if (dynamic_cast<DocumentSourceOut*>(stage.get())) {
+                uassert(16991, "$out can only be the final stage in the pipeline",
+                        iStep == nSteps - 1);
+            }
         }
 
         /* if there aren't any pipeline stages, there's nothing more to do */
         if (sources.empty())
             return pPipeline;
+
+        // NOTE the rest of this function is all optimizations.
+        // TODO find a clean way to break these up into separate functions.
 
         /*
           Move filters up where possible.
@@ -291,13 +312,71 @@ namespace mongo {
             (*iter)->optimize();
         }
 
+        // Optimize [$redact, $match] to [$match, $redact, $match] if possible
+        if (sources.size() >= 2 && dynamic_cast<DocumentSourceRedact*>(sources[0].get())) {
+            if (DocumentSourceMatch* match = dynamic_cast<DocumentSourceMatch*>(sources[1].get())) {
+                const BSONObj redactSafePortion = match->redactSafePortion();
+                if (!redactSafePortion.isEmpty()) {
+                    sources.push_front(
+                        DocumentSourceMatch::createFromBson(
+                            BSON("$match" << redactSafePortion).firstElement(),
+                            pCtx));
+                }
+            }
+        }
+
         return pPipeline;
+    }
+
+    void Pipeline::addRequiredPrivileges(Command* commandTemplate,
+                                         const string& db,
+                                         BSONObj cmdObj,
+                                         vector<Privilege>* out) {
+        ResourcePattern inputResource(commandTemplate->parseResourcePattern(db, cmdObj));
+        uassert(17138,
+                mongoutils::str::stream() << "Invalid input resource, " << inputResource.toString(),
+                inputResource.isExactNamespacePattern());
+
+        if (false && cmdObj["allowDiskUsage"].trueValue()) {
+            // TODO no privilege for this yet.
+        }
+
+        out->push_back(Privilege(inputResource, ActionType::find));
+
+        BSONObj pipeline = cmdObj.getObjectField("pipeline");
+        BSONForEach(stageElem, pipeline) {
+            BSONObj stage = stageElem.embeddedObjectUserCheck();
+            if (str::equals(stage.firstElementFieldName(), "$out")) {
+                // TODO Figure out how to handle temp collection privileges. For now, using the
+                // output ns is ok since we only do db-level privilege checks.
+                NamespaceString outputNs(db, stage.firstElement().str());
+                uassert(17139,
+                        mongoutils::str::stream() << "Invalid $out target namespace, " <<
+                        outputNs.ns(),
+                        outputNs.isValid());
+
+                ActionSet actions;
+                // logically on output ns
+                actions.addAction(ActionType::remove);
+                actions.addAction(ActionType::insert);
+
+                // on temp ns due to implementation, but not logically on output ns
+                actions.addAction(ActionType::createCollection);
+                actions.addAction(ActionType::createIndex);
+                actions.addAction(ActionType::dropCollection);
+                actions.addAction(ActionType::renameCollectionSameDB);
+
+                out->push_back(Privilege(ResourcePattern::forExactNamespace(outputNs), actions));
+                out->push_back(Privilege(ResourcePattern::forExactNamespace(
+                                                 NamespaceString(db, "system.indexes")),
+                                         ActionType::find));
+            }
+        }
     }
 
     intrusive_ptr<Pipeline> Pipeline::splitForSharded() {
         /* create an initialize the shard spec we'll return */
         intrusive_ptr<Pipeline> pShardPipeline(new Pipeline(pCtx));
-        pShardPipeline->collectionName = collectionName;
         pShardPipeline->explain = explain;
 
         /*
@@ -350,36 +429,34 @@ namespace mongo {
         return true;
     }
 
-    void Pipeline::toBson(BSONObjBuilder *pBuilder) const {
-        /* create an array out of the pipeline operations */
-        BSONArrayBuilder arrayBuilder;
+    Document Pipeline::serialize() const {
+        MutableDocument serialized;
+        // create an array out of the pipeline operations
+        vector<Value> array;
         for(SourceContainer::const_iterator iter(sources.begin()),
                                             listEnd(sources.end());
                                         iter != listEnd;
                                         ++iter) {
             intrusive_ptr<DocumentSource> pSource(*iter);
-            pSource->addToBsonArray(&arrayBuilder);
+            pSource->serializeToArray(array);
         }
 
-        /* add the top-level items to the command */
-        pBuilder->append(commandName, getCollectionName());
-        pBuilder->append(pipelineName, arrayBuilder.arr());
+        // add the top-level items to the command
+        serialized.setField(commandName, Value(pCtx->ns.coll()));
+        serialized.setField(pipelineName, Value(array));
 
         if (explain) {
-            pBuilder->append(explainName, explain);
+            serialized.setField(explainName, Value(explain));
         }
 
-        bool btemp;
-        if ((btemp = getSplitMongodPipeline())) {
-            pBuilder->append(splitMongodPipelineName, btemp);
+        if (pCtx->extSortAllowed) {
+            serialized.setField("allowDiskUsage", Value(true));
         }
 
-        if ((btemp = pCtx->getInRouter())) {
-            pBuilder->append(fromRouterName, btemp);
-        }
+        return serialized.freeze();
     }
 
-    bool Pipeline::run(BSONObjBuilder &result, string &errmsg) {
+    void Pipeline::stitch() {
         massert(16600, "should not have an empty pipeline",
                 !sources.empty());
 
@@ -393,101 +470,55 @@ namespace mongo {
             pTemp->setSource(prevSource);
             prevSource = pTemp.get();
         }
-
-        /*
-          Iterate through the resulting documents, and add them to the result.
-          We do this even if we're doing an explain, in order to capture
-          the document counts and other stats.  However, we don't capture
-          the result documents for explain.
-        */
-        if (explain) {
-            if (!pCtx->getInRouter())
-                writeExplainShard(result);
-            else {
-                writeExplainMongos(result);
-            }
-        }
-        else {
-            // the array in which the aggregation results reside
-            // cant use subArrayStart() due to error handling
-            BSONArrayBuilder resultArray;
-            DocumentSource* finalSource = sources.back().get();
-            for(bool hasDoc = !finalSource->eof(); hasDoc; hasDoc = finalSource->advance()) {
-                Document pDocument(finalSource->getCurrent());
-
-                /* add the document to the result set */
-                BSONObjBuilder documentBuilder (resultArray.subobjStart());
-                pDocument->toBson(&documentBuilder);
-                documentBuilder.doneFast();
-                // object will be too large, assert. the extra 1KB is for headers
-                uassert(16389,
-                        str::stream() << "aggregation result exceeds maximum document size ("
-                                      << BSONObjMaxUserSize / (1024 * 1024) << "MB)",
-                        resultArray.len() < BSONObjMaxUserSize - 1024);
-            }
-
-            resultArray.done();
-            result.appendArray("result", resultArray.arr());
-        }
-
-    return true;
     }
 
-    void Pipeline::writeExplainOps(BSONArrayBuilder *pArrayBuilder) const {
-        for(SourceContainer::const_iterator iter(sources.begin()),
-                                            listEnd(sources.end());
-                                        iter != listEnd;
-                                        ++iter) {
-            intrusive_ptr<DocumentSource> pSource(*iter);
+    void Pipeline::run(BSONObjBuilder& result) {
+        // should not get here in the explain case
+        verify(!explain);
 
-            // handled in writeExplainMongos
-            if (dynamic_cast<DocumentSourceBsonArray*>(pSource.get()))
-                continue;
-
-            pSource->addToBsonArray(pArrayBuilder, true);
-        }
-    }
-
-    void Pipeline::writeExplainShard(BSONObjBuilder &result) const {
-        BSONArrayBuilder opArray; // where we'll put the pipeline ops
-
-        // next, add the pipeline operators
-        writeExplainOps(&opArray);
-
-        result.appendArray(serverPipelineName, opArray.arr());
-    }
-
-    void Pipeline::writeExplainMongos(BSONObjBuilder &result) const {
-
-        /*
-          For now, this should be a BSON source array.
-          In future, we might have a more clever way of getting this, when
-          we have more interleaved fetching between shards.  The DocumentSource
-          interface will have to change to accommodate that.
-         */
-        DocumentSourceBsonArray *pSourceBsonArray =
-            dynamic_cast<DocumentSourceBsonArray *>(sources.front().get());
-        verify(pSourceBsonArray);
-
-        BSONArrayBuilder shardOpArray; // where we'll put the pipeline ops
-        for(bool hasDocument = !pSourceBsonArray->eof(); hasDocument;
-            hasDocument = pSourceBsonArray->advance()) {
-            Document pDocument = pSourceBsonArray->getCurrent();
-            BSONObjBuilder opBuilder;
-            pDocument->toBson(&opBuilder);
-            shardOpArray.append(opBuilder.obj());
+        // the array in which the aggregation results reside
+        // cant use subArrayStart() due to error handling
+        BSONArrayBuilder resultArray;
+        DocumentSource* finalSource = sources.back().get();
+        while (boost::optional<Document> next = finalSource->getNext()) {
+            // add the document to the result set
+            BSONObjBuilder documentBuilder (resultArray.subobjStart());
+            next->toBson(&documentBuilder);
+            documentBuilder.doneFast();
+            // object will be too large, assert. the extra 1KB is for headers
+            uassert(16389,
+                    str::stream() << "aggregation result exceeds maximum document size ("
+                                  << BSONObjMaxUserSize / (1024 * 1024) << "MB)",
+                    resultArray.len() < BSONObjMaxUserSize - 1024);
         }
 
-        BSONArrayBuilder mongosOpArray; // where we'll put the pipeline ops
-        writeExplainOps(&mongosOpArray);
+        resultArray.done();
+        result.appendArray("result", resultArray.arr());
+    }
 
-        // now we combine the shard pipelines with the one here
-        result.append(serverPipelineName, shardOpArray.arr());
-        result.append(mongosPipelineName, mongosOpArray.arr());
+    vector<Value> Pipeline::writeExplainOps() const {
+        vector<Value> array;
+        for(SourceContainer::const_iterator it = sources.begin(); it != sources.end(); ++it) {
+            (*it)->serializeToArray(array, /*explain=*/true);
+        }
+        return array;
     }
 
     void Pipeline::addInitialSource(intrusive_ptr<DocumentSource> source) {
         sources.push_front(source);
+    }
+
+    bool Pipeline::canRunInMongos() const {
+        if (pCtx->extSortAllowed)
+            return false;
+
+        if (explain)
+            return false;
+
+        if (dynamic_cast<DocumentSourceNeedsMongod*>(sources.back().get()))
+            return false;
+
+        return true;
     }
 
 } // namespace mongo

@@ -16,16 +16,27 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include <string>
 #include <vector>
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
 #include "mongo/db/commands.h"
@@ -33,18 +44,17 @@
 #include "mongo/db/curop-inl.h"
 #include "mongo/db/extsort.h"
 #include "mongo/db/index.h"
+#include "mongo/db/index_builder.h"
 #include "mongo/db/index_update.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_current_op.h"
 #include "mongo/db/pdfile.h"
-#include "mongo/db/sort_phase_one.h"
+#include "mongo/db/structure/collection.h"
 #include "mongo/util/concurrency/task.h"
 #include "mongo/util/timer.h"
 #include "mongo/util/touch_pages.h"
 
 namespace mongo {
-
-    void freeExtents(DiskLoc firstExt, DiskLoc lastExt);
 
     /* this should be done in alloc record not here, but doing here for now. 
        really dumb; it's a start.
@@ -59,10 +69,8 @@ namespace mongo {
 
     /** @return number of skipped (invalid) documents */
     unsigned compactExtent(const char *ns, NamespaceDetails *d, const DiskLoc diskloc, int n,
-                const scoped_array<IndexSpec> &indexSpecs,
-                scoped_array<SortPhaseOne>& phase1, int nidx, bool validate, 
-                double pf, int pb)
-    {
+                           int nidx, bool validate, double pf, int pb) {
+
         log() << "compact begin extent #" << n << " for namespace " << ns << endl;
         unsigned oldObjSize = 0; // we'll report what the old padding was
         unsigned oldObjSizeWithPadding = 0;
@@ -72,12 +80,14 @@ namespace mongo {
         verify( e->validates(diskloc) );
         unsigned skipped = 0;
 
+        Database* db = cc().database();
+
         {
             // the next/prev pointers within the extent might not be in order so we first page the whole thing in 
             // sequentially
             log() << "compact paging in len=" << e->length/1000000.0 << "MB" << endl;
             Timer t;
-            MongoDataFile* mdf = cc().database()->getFile( diskloc.a() );
+            DataFile* mdf = db->getFile( diskloc.a() );
             HANDLE fd = mdf->getFd();
             int offset = diskloc.getOfs();
             Extent* ext = diskloc.ext();
@@ -97,7 +107,7 @@ namespace mongo {
             if( !L.isNull() ) {
                 while( 1 ) {
                     Record *recOld = L.rec();
-                    L = recOld->nextInExtent(L);
+                    L = db->getExtentManager().getNextRecordInExtent(L);
                     BSONObj objOld = BSONObj::make(recOld);
 
                     if( !validate || objOld.valid() ) {
@@ -124,13 +134,6 @@ namespace mongo {
                         recNew = (Record *) getDur().writingPtr(recNew, lenWHdr);
                         addRecordToRecListInExtent(recNew, loc);
                         memcpy(recNew->data(), objOld.objdata(), sz);
-
-                        {
-                            // extract keys for all indexes we will be rebuilding
-                            for( int x = 0; x < nidx; x++ ) { 
-                                phase1[x].addKeys(indexSpecs[x], objOld, loc, false);
-                            }
-                        }
                     }
                     else { 
                         if( ++skipped <= 10 )
@@ -156,19 +159,16 @@ namespace mongo {
                 }
             } // if !L.isNull()
 
-            verify( d->firstExtent == diskloc );
-            verify( d->lastExtent != diskloc );
+            verify( d->firstExtent() == diskloc );
+            verify( d->lastExtent() != diskloc );
             DiskLoc newFirst = e->xnext;
-            d->firstExtent.writing() = newFirst;
+            d->firstExtent().writing() = newFirst;
             newFirst.ext()->xprev.writing().Null();
             getDur().writing(e)->markEmpty();
-            freeExtents( diskloc, diskloc );
+            cc().database()->getExtentManager().freeExtents( diskloc, diskloc );
+
             // update datasize/record count for this namespace's extent
-            {
-                NamespaceDetails::Stats *s = getDur().writing(&d->stats);
-                s->datasize += datasize;
-                s->nrecords += nrecords;
-            }
+            d->incrementStats( datasize, nrecords );
 
             getDur().commitIfNeeded();
 
@@ -190,7 +190,7 @@ namespace mongo {
         getDur().commitIfNeeded();
 
         list<DiskLoc> extents;
-        for( DiskLoc L = d->firstExtent; !L.isNull(); L = L.ext()->xnext ) 
+        for( DiskLoc L = d->firstExtent(); !L.isNull(); L = L.ext()->xnext )
             extents.push_back(L);
         log() << "compact " << extents.size() << " extents" << endl;
 
@@ -199,11 +199,13 @@ namespace mongo {
                                                         extents.size()));
 
         // same data, but might perform a little different after compact?
-        NamespaceDetailsTransient::get(ns).clearQueryCache();
+        Collection* collection = cc().database()->getCollection( ns );
+        if ( collection )
+            collection->infoCache()->addedIndex();
 
-        int nidx = d->nIndexes;
-        scoped_array<IndexSpec> indexSpecs( new IndexSpec[nidx] );
-        scoped_array<SortPhaseOne> phase1( new SortPhaseOne[nidx] );
+        verify( d->getCompletedIndexCount() == d->getTotalIndexCount() );
+        int nidx = d->getCompletedIndexCount();
+        scoped_array<BSONObj> indexSpecs( new BSONObj[nidx] );
         {
             NamespaceDetails::IndexIterator ii = d->ii(); 
             // For each existing index...
@@ -225,29 +227,15 @@ namespace mongo {
                     // Pass the element through to the new index spec.
                     b.append(e);
                 }
-                // Add the new index spec to 'indexSpecs'.
-                BSONObj o = b.obj().getOwned();
-                indexSpecs[idxNo].reset(o);
-                // Create an external sorter.
-                phase1[idxNo].sorter.reset
-                        ( new BSONObjExternalSorter
-                           // Use the default index interface, since the new index will be created
-                           // with the default index version.
-                         ( IndexInterface::defaultVersion(),
-                           o.getObjectField("key") ) );
-                phase1[idxNo].sorter->hintNumObjects( d->stats.nrecords );
+                indexSpecs[idxNo] = b.obj().getOwned();
             }
         }
 
         log() << "compact orphan deleted lists" << endl;
-        for( int i = 0; i < Buckets; i++ ) { 
-            d->deletedList[i].writing().Null();
-        }
-
-
+        d->orphanDeletedList();
 
         // Start over from scratch with our extent sizing and growth
-        d->lastExtentSize=0;
+        d->setLastExtentSize( 0 );
 
         // before dropping indexes, at least make sure we can allocate one extent!
         uassert(14025, "compact error no space available to allocate", !allocateSpaceForANewRecord(ns, d, Record::HeaderSize+1, false).isNull());
@@ -268,14 +256,10 @@ namespace mongo {
 
         // reset data size and record counts to 0 for this namespace
         // as we're about to tally them up again for each new extent
-        {
-            NamespaceDetails::Stats *s = getDur().writing(&d->stats);
-            s->datasize = 0;
-            s->nrecords = 0;
-        }
+        d->setStats( 0, 0 );
 
         for( list<DiskLoc>::iterator i = extents.begin(); i != extents.end(); i++ ) { 
-            skipped += compactExtent(ns, d, *i, n++, indexSpecs, phase1, nidx, validate, pf, pb);
+            skipped += compactExtent(ns, d, *i, n++, nidx, validate, pf, pb);
             pm.hit();
         }
 
@@ -283,59 +267,22 @@ namespace mongo {
             result.append("invalidObjects", skipped);
         }
 
-        verify( d->firstExtent.ext()->xprev.isNull() );
+        verify( d->firstExtent().ext()->xprev.isNull() );
 
         // indexes will do their own progress meter?
         pm.finished();
 
         // build indexes
         NamespaceString s(ns);
-        string si = s.db + ".system.indexes";
+        string si = s.db().toString() + ".system.indexes";
         for( int i = 0; i < nidx; i++ ) {
             killCurrentOp.checkForInterrupt(false);
-            BSONObj info = indexSpecs[i].info;
+            BSONObj info = indexSpecs[i];
             log() << "compact create index " << info["key"].Obj().toString() << endl;
-            scoped_lock precalcLock(theDataFileMgr._precalcedMutex);
-            try {
-                theDataFileMgr.setPrecalced(&phase1[i]);
-                theDataFileMgr.insert(si.c_str(), info.objdata(), info.objsize());
-            }
-            catch(...) {
-                theDataFileMgr.setPrecalced(NULL);
-                throw;
-            }
-            theDataFileMgr.setPrecalced(NULL);
+            theDataFileMgr.insert(si.c_str(), info.objdata(), info.objsize());
         }
 
         return true;
-    }
-
-    bool compact(const string& ns, string &errmsg, bool validate, BSONObjBuilder& result, double pf, int pb) {
-        massert( 14028, "bad ns", NamespaceString::normal(ns.c_str()) );
-        massert( 14027, "can't compact a system namespace", !str::contains(ns, ".system.") ); // items in system.indexes cannot be moved there are pointers to those disklocs in NamespaceDetails
-
-        bool ok;
-        {
-            Lock::DBWrite lk(ns);
-            BackgroundOperation::assertNoBgOpInProgForNs(ns.c_str());
-            Client::Context ctx(ns);
-            NamespaceDetails *d = nsdetails(ns);
-            massert( 13660, str::stream() << "namespace " << ns << " does not exist", d );
-            massert( 13661, "cannot compact capped collection", !d->isCapped() );
-            log() << "compact " << ns << " begin" << endl;
-            if( pf != 0 || pb != 0 ) { 
-                log() << "paddingFactor:" << pf << " paddingBytes:" << pb << endl;
-            } 
-            try { 
-                ok = _compact(ns.c_str(), d, errmsg, validate, result, pf, pb);
-            }
-            catch(...) { 
-                log() << "compact " << ns << " end (with error)" << endl;
-                throw;
-            }
-            log() << "compact " << ns << " end" << endl;
-        }
-        return ok;
     }
 
     bool isCurrentlyAReplSetPrimary();
@@ -352,7 +299,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::compact);
-            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
         virtual void help( stringstream& help ) const {
             help << "compact collection\n"
@@ -363,6 +310,16 @@ namespace mongo {
                 "  validate - check records are noncorrupt before adding to newly compacting extents. slower but safer (defaults to true in this version)\n";
         }
         CompactCmd() : Command("compact") { }
+
+        virtual std::vector<BSONObj> stopIndexBuilds(const std::string& dbname, 
+                                                     const BSONObj& cmdObj) {
+            std::string systemIndexes = dbname+".system.indexes";
+            std::string coll = cmdObj.firstElement().valuestr();
+            std::string ns = dbname + "." + coll;
+            BSONObj criteria = BSON("ns" << systemIndexes << "op" << "insert" << "insert.ns" << ns);
+
+            return IndexBuilder::killMatchingIndexBuilds(criteria);
+        }
 
         virtual bool run(const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             string coll = cmdObj.firstElement().valuestr();
@@ -415,7 +372,37 @@ namespace mongo {
             }
 
             bool validate = !cmdObj.hasElement("validate") || cmdObj["validate"].trueValue(); // default is true at the moment
-            bool ok = compact(ns, errmsg, validate, result, pf, pb);
+
+            massert( 14028, "bad ns", NamespaceString::normal(ns.c_str()) );
+            massert( 14027, "can't compact a system namespace", !str::contains(ns, ".system.") ); // items in system.indexes cannot be moved there are pointers to those disklocs in NamespaceDetails
+
+            bool ok;
+            {
+                Lock::DBWrite lk(ns);
+                BackgroundOperation::assertNoBgOpInProgForNs(ns.c_str());
+                Client::Context ctx(ns);
+                NamespaceDetails *d = nsdetails(ns);
+                massert( 13660, str::stream() << "namespace " << ns << " does not exist", d );
+                massert( 13661, "cannot compact capped collection", !d->isCapped() );
+                log() << "compact " << ns << " begin" << endl;
+
+                std::vector<BSONObj> indexesInProg = stopIndexBuilds(db, cmdObj);
+
+                if( pf != 0 || pb != 0 ) { 
+                    log() << "paddingFactor:" << pf << " paddingBytes:" << pb << endl;
+                } 
+                try { 
+                    ok = _compact(ns.c_str(), d, errmsg, validate, result, pf, pb);
+                }
+                catch(...) { 
+                    log() << "compact " << ns << " end (with error)" << endl;
+                    throw;
+                }
+                log() << "compact " << ns << " end" << endl;
+
+                IndexBuilder::restoreIndexes(db+".system.indexes", indexesInProg);
+            }
+
             return ok;
         }
     };

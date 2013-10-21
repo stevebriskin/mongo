@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 /**
@@ -34,15 +46,17 @@
 #include "mongo/base/status.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/privilege.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop-inl.h"
+#include "mongo/db/index/catalog_hack.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/kill_current_op.h"
-#include "mongo/db/namespace-inl.h"
 #include "mongo/db/pdfile.h"
+#include "mongo/db/query/internal_plans.h"
+#include "mongo/db/storage_options.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/alignedbuilder.h"
 #include "mongo/util/background.h"
@@ -51,43 +65,6 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-    class CleanCmd : public Command {
-    public:
-        CleanCmd() : Command( "clean" ) {}
-
-        virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return WRITE; }
-
-        virtual void help(stringstream& h) const { h << "internal"; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::clean);
-            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
-        }
-        bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
-            string dropns = dbname + "." + cmdObj.firstElement().valuestrsafe();
-
-            if ( !cmdLine.quiet )
-                tlog() << "CMD: clean " << dropns << endl;
-
-            NamespaceDetails *d = nsdetails(dropns);
-
-            if ( ! d ) {
-                errmsg = "ns not found";
-                return 0;
-            }
-
-            for ( int i = 0; i < Buckets; i++ )
-                d->deletedList[i].Null();
-
-            result.append("ns", dropns.c_str());
-            return 1;
-        }
-
-    } cleanCmd;
 
     namespace dur {
         boost::filesystem::path getJournalDir();
@@ -159,7 +136,8 @@ namespace mongo {
             catch(...) { }
 
             try {
-                result.append("onSamePartition", onSamePartition(dur::getJournalDir().string(), dbpath));
+                result.append("onSamePartition", onSamePartition(dur::getJournalDir().string(),
+                                                                 storageGlobalParams.dbpath));
             }
             catch(...) { }
 
@@ -191,15 +169,16 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::validate);
-            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
+            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
         }
         //{ validate: "collectionnamewithoutthedbpart" [, scandata: <bool>] [, full: <bool> } */
 
         bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             string ns = dbname + "." + cmdObj.firstElement().valuestrsafe();
             NamespaceDetails * d = nsdetails( ns );
-            if ( !cmdLine.quiet )
-                tlog() << "CMD: validate " << ns << endl;
+            if (!serverGlobalParams.quiet) {
+                MONGO_TLOG(0) << "CMD: validate " << ns << endl;
+            }
 
             if ( ! d ) {
                 errmsg = "ns not found";
@@ -226,18 +205,18 @@ namespace mongo {
                 result.appendNumber("max", d->maxCappedDocs());
             }
 
-            result.append("firstExtent", str::stream() << d->firstExtent.toString()
-                                    << " ns:" << d->firstExtent.ext()->nsDiagnostic.toString());
-            result.append( "lastExtent", str::stream() <<  d->lastExtent.toString()
-                                    << " ns:" <<  d->lastExtent.ext()->nsDiagnostic.toString());
+            result.append( "firstExtent", str::stream() << d->firstExtent().toString()
+                           << " ns:" << d->firstExtent().ext()->nsDiagnostic.toString());
+            result.append( "lastExtent", str::stream() <<  d->lastExtent().toString()
+                           << " ns:" <<  d->lastExtent().ext()->nsDiagnostic.toString());
 
             BSONArrayBuilder extentData;
             int extentCount = 0;
             try {
-                d->firstExtent.ext()->assertOk();
-                d->lastExtent.ext()->assertOk();
+                d->firstExtent().ext()->assertOk();
+                d->lastExtent().ext()->assertOk();
 
-                DiskLoc extentDiskLoc = d->firstExtent;
+                DiskLoc extentDiskLoc = d->firstExtent();
                 while (!extentDiskLoc.isNull()) {
                     Extent* thisExtent = extentDiskLoc.ext();
                     if (full) {
@@ -256,9 +235,9 @@ namespace mongo {
                         errors << sb.str();
                         valid = false;
                     }
-                    if (nextDiskLoc.isNull() && extentDiskLoc != d->lastExtent) {
+                    if (nextDiskLoc.isNull() && extentDiskLoc != d->lastExtent()) {
                         StringBuilder sb;
-                        sb << "'lastExtent' pointer " << d->lastExtent.toString()
+                        sb << "'lastExtent' pointer " << d->lastExtent().toString()
                            << " does not point to last extent in list " << extentDiskLoc.toString();
                         errors << sb.str();
                         valid = false;
@@ -280,42 +259,42 @@ namespace mongo {
             if ( full )
                 result.appendArray( "extents" , extentData.arr() );
 
-            result.appendNumber("datasize", d->stats.datasize);
-            result.appendNumber("nrecords", d->stats.nrecords);
-            result.appendNumber("lastExtentSize", d->lastExtentSize);
+            result.appendNumber("datasize", d->dataSize());
+            result.appendNumber("nrecords", d->numRecords());
+            result.appendNumber("lastExtentSize", d->lastExtentSize());
             result.appendNumber("padding", d->paddingFactor());
 
             try {
 
                 bool testingLastExtent = false;
                 try {
-                    if (d->firstExtent.isNull()) {
+                    if (d->firstExtent().isNull()) {
                         errors << "'firstExtent' pointer is null";
                         valid=false;
                     }
                     else {
-                        result.append("firstExtentDetails", d->firstExtent.ext()->dump());
-                        if (!d->firstExtent.ext()->xprev.isNull()) {
+                        result.append("firstExtentDetails", d->firstExtent().ext()->dump());
+                        if (!d->firstExtent().ext()->xprev.isNull()) {
                             StringBuilder sb;
-                            sb << "'xprev' pointer in 'firstExtent' " << d->firstExtent.toString()
-                               << " is " << d->firstExtent.ext()->xprev.toString()
+                            sb << "'xprev' pointer in 'firstExtent' " << d->firstExtent().toString()
+                               << " is " << d->firstExtent().ext()->xprev.toString()
                                << ", should be null";
                             errors << sb.str();
                             valid=false;
                         }
                     }
                     testingLastExtent = true;
-                    if (d->lastExtent.isNull()) {
+                    if (d->lastExtent().isNull()) {
                         errors << "'lastExtent' pointer is null";
                         valid=false;
                     }
                     else {
-                        if (d->firstExtent != d->lastExtent) {
-                            result.append("lastExtentDetails", d->lastExtent.ext()->dump());
-                            if (!d->lastExtent.ext()->xnext.isNull()) {
+                        if (d->firstExtent() != d->lastExtent()) {
+                            result.append("lastExtentDetails", d->lastExtent().ext()->dump());
+                            if (!d->lastExtent().ext()->xnext.isNull()) {
                                 StringBuilder sb;
-                                sb << "'xnext' pointer in 'lastExtent' " << d->lastExtent.toString()
-                                   << " is " << d->lastExtent.ext()->xnext.toString()
+                                sb << "'xnext' pointer in 'lastExtent' " << d->lastExtent().toString()
+                                   << " is " << d->lastExtent().ext()->xnext.toString()
                                    << ", should be null";
                                 errors << sb.str();
                                 valid = false;
@@ -334,7 +313,6 @@ namespace mongo {
 
                 set<DiskLoc> recs;
                 if( scanData ) {
-                    shared_ptr<Cursor> c = theDataFileMgr.findAll(ns);
                     int n = 0;
                     int nInvalid = 0;
                     long long nQuantizedSize = 0;
@@ -344,10 +322,13 @@ namespace mongo {
                     long long bsonLen = 0;
                     int outOfOrder = 0;
                     DiskLoc cl_last;
-                    while ( c->ok() ) {
+
+                    DiskLoc cl;
+                    Runner::RunnerState state;
+                    auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns));
+                    while (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, &cl))) {
                         n++;
 
-                        DiskLoc cl = c->currLoc();
                         if ( n < 1000000 )
                             recs.insert(cl);
                         if ( d->isCapped() ) {
@@ -356,7 +337,7 @@ namespace mongo {
                             cl_last = cl;
                         }
 
-                        Record *r = c->_current();
+                        Record *r = cl.rec();
                         len += r->lengthWithHeaders();
                         nlen += r->netLength();
                         
@@ -404,8 +385,10 @@ namespace mongo {
                                 bsonLen += obj.objsize();
                             }
                         }
-
-                        c->advance();
+                    }
+                    if (Runner::RUNNER_EOF != state) {
+                        // TODO: more descriptive logging.
+                        warning() << "Internal error while reading collection " << ns << endl;
                     }
                     if ( d->isCapped() && !d->capLooped() ) {
                         result.append("cappedOutOfOrder", outOfOrder);
@@ -432,7 +415,7 @@ namespace mongo {
 
                 BSONArrayBuilder deletedListArray;
                 for ( int i = 0; i < Buckets; i++ ) {
-                    deletedListArray << d->deletedList[i].isNull();
+                    deletedListArray << d->deletedListEntry(i).isNull();
                 }
 
                 int ndel = 0;
@@ -440,7 +423,7 @@ namespace mongo {
                 BSONArrayBuilder delBucketSizes;
                 int incorrect = 0;
                 for ( int i = 0; i < Buckets; i++ ) {
-                    DiskLoc loc = d->deletedList[i];
+                    DiskLoc loc = d->deletedListEntry(i);
                     try {
                         int k = 0;
                         while ( !loc.isNull() ) {
@@ -491,14 +474,17 @@ namespace mongo {
 
                 int idxn = 0;
                 try  {
-                    result.append("nIndexes", d->nIndexes);
+                    result.append("nIndexes", d->getCompletedIndexCount());
                     BSONObjBuilder indexes; // not using subObjStart to be exception safe
                     NamespaceDetails::IndexIterator i = d->ii();
                     while( i.more() ) {
                         IndexDetails& id = i.next();
                         log() << "validating index " << idxn << ": " << id.indexNamespace() << endl;
-                        long long keys = id.idxInterface().fullValidate(id.head, id.keyPattern());
-                        indexes.appendNumber(id.indexNamespace(), keys);
+                        auto_ptr<IndexDescriptor> descriptor(CatalogHack::getDescriptor(d, idxn));
+                        auto_ptr<IndexAccessMethod> iam(CatalogHack::getIndex(descriptor.get()));
+                        int64_t keys;
+                        iam->validate(&keys);
+                        indexes.appendNumber(id.indexNamespace(), static_cast<long long>(keys));
                         idxn++;
                     }
                     result.append("keysPerIndex", indexes.done());

@@ -18,23 +18,25 @@
 
 #pragma once
 
+#include <iostream>
+#include <sstream>
+
 #include <boost/detail/endian.hpp>
-#include <boost/thread/condition_variable.hpp>
+#include <boost/intrusive_ptr.hpp>
+#include <boost/scoped_array.hpp>
+#include <boost/scoped_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "mongo/bson/util/misc.h"
-#include "mongo/util/concurrency/mutex.h"
 
 namespace mongo {
 
     /* @return a dump of the buffer as hex byte ascii output */
     string hexdump(const char *data, unsigned len);
 
-    void setThreadName(const char * name);
-    string getThreadName();
-
     template<class T>
     inline string ToString(const T& t) {
-        stringstream s;
+        std::stringstream s;
         s << t;
         return s.str();
     }
@@ -51,16 +53,16 @@ namespace mongo {
             while ( len > 0 ) {
                 for ( int i = 0; i < 16; i++ ) {
                     if ( *p >= 32 && *p <= 126 )
-                        cout << *p;
+                        std::cout << *p;
                     else
-                        cout << '.';
+                        std::cout << '.';
                     p++;
                 }
-                cout << "  ";
+                std::cout << "  ";
                 p -= 16;
                 for ( int i = 0; i < 16; i++ )
-                    cout << (unsigned) ((unsigned char)*p++) << ' ';
-                cout << endl;
+                    std::cout << (unsigned) ((unsigned char)*p++) << ' ';
+                std::cout << std::endl;
                 len -= 16;
             }
         }
@@ -69,12 +71,12 @@ namespace mongo {
     }
 
 // PRINT(2+2);  prints "2+2: 4"
-#define MONGO_PRINT(x) cout << #x ": " << (x) << endl
+#define MONGO_PRINT(x) std::cout << #x ": " << (x) << std::endl
 #define PRINT MONGO_PRINT
 // PRINTFL; prints file:line
-#define MONGO_PRINTFL cout << __FILE__ ":" << __LINE__ << endl
+#define MONGO_PRINTFL std::cout << __FILE__ ":" << __LINE__ << std::endl
 #define PRINTFL MONGO_PRINTFL
-#define MONGO_FLOG log() << __FILE__ ":" << __LINE__ << endl
+#define MONGO_FLOG log() << __FILE__ ":" << __LINE__ << std::endl
 #define FLOG MONGO_FLOG
 
     inline bool startsWith(const char *str, const char *prefix) {
@@ -180,7 +182,7 @@ namespace mongo {
         char * _buf;
     };
 
-    ostream& operator<<( ostream &s, const ThreadSafeString &o );
+    std::ostream& operator<<(std::ostream &s, const ThreadSafeString &o);
 
     /** A generic pointer type for function arguments.
      *  It will convert from any pointer type except auto_ptr.
@@ -228,3 +230,4 @@ namespace mongo {
     using boost::intrusive_ptr;
     using boost::dynamic_pointer_cast;
 } // namespace mongo
+

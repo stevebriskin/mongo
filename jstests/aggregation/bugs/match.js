@@ -34,15 +34,15 @@ function assertResults( expectedResults, matchSpec ) {
     }
     matchStage = { $match:matchSpec };
     // Check where matching is folded in to DocumentSourceCursor.
-    assertEqualResultsUnordered( findResults, t.aggregate( matchStage ).result );
+    assertEqualResultsUnordered( findResults, t.aggregate( matchStage ).toArray() );
     // Check where matching is not folded in to DocumentSourceCursor.
     assertEqualResultsUnordered( findResults,
                                  t.aggregate( { $project:identityProjection },
-                                              matchStage ).result );    
+                                              matchStage ).toArray() );
 }
 
 // Invalid matcher syntax.
-assertError( 10073, { a:{ $mod:[ 0 /* invalid */, 0 ] } } );
+assertError( 16810, { a:{ $mod:[ 0 /* invalid */, 0 ] } } );
 
 // $where not allowed.
 assertError( 16395, { $where:'true' } );

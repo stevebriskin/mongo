@@ -24,6 +24,7 @@
 
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/time_support.h"
@@ -53,7 +54,9 @@ namespace mongo {
         LOG(1) << "BackgroundJob starting: " << name() << endl;
         {
             scoped_lock l( status->m );
-            massert( 13643 , mongoutils::str::stream() << "backgroundjob already started: " << name() , status->state == NotStarted );
+            massert( 13643, mongoutils::str::stream() << "backgroundjob already started: "
+                                                      << name(),
+                            status->state != Running );
             status->state = Running;
         }
 
@@ -65,10 +68,10 @@ namespace mongo {
             run();
         }
         catch ( std::exception& e ) {
-            LOG( LL_ERROR ) << "backgroundjob " << name() << "error: " << e.what() << endl;
+            error() << "backgroundjob " << name() << " exception: " << e.what() << endl;
         }
         catch(...) {
-            LOG( LL_ERROR ) << "uncaught exception in BackgroundJob " << name() << endl;
+            error() << "uncaught exception in BackgroundJob " << name() << endl;
         }
 
         {
@@ -78,7 +81,9 @@ namespace mongo {
         }
 
 #ifdef MONGO_SSL
-        SSLManager::cleanupThreadLocals();
+        SSLManagerInterface* manager = getSSLManager();
+        if (manager)
+            manager->cleanupThreadLocals();
 #endif
         if( status->deleteSelf )
             delete this;

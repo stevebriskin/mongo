@@ -327,7 +327,7 @@ ReplSetTest.prototype.callIsMaster = function() {
   return master || false;
 }
 
-ReplSetTest.awaitRSClientHosts = function( conn, host, hostOk, rs ) {
+ReplSetTest.awaitRSClientHosts = function( conn, host, hostOk, rs, timeout ) {
     var hostCount = host.length;
     if( hostCount ){
         for( var i = 0; i < hostCount; i++ ) {
@@ -335,6 +335,8 @@ ReplSetTest.awaitRSClientHosts = function( conn, host, hostOk, rs ) {
         }
         return;
     }
+    
+    timeout = timeout || 60 * 1000;
     
     if( hostOk == undefined ) hostOk = { ok : true }
     if( host.host ) host = host.host
@@ -374,8 +376,7 @@ ReplSetTest.awaitRSClientHosts = function( conn, host, hostOk, rs ) {
             }
         }
         return false;
-    }, "timed out waiting for replica set client to recognize hosts",
-       3 * 20 * 1000 /* ReplicaSetMonitorWatcher updates every 20s */ )
+    }, "timed out waiting for replica set client to recognize hosts", timeout )
     
 }
 
@@ -405,7 +406,11 @@ ReplSetTest.prototype.getMaster = function( timeout ) {
   var master = null;
 
   try {
-    master = jsTest.attempt({context: this, timeout: tmo, desc: "Finding master"}, this.callIsMaster);
+    var self = this;
+    assert.soon(function() {
+      master = self.callIsMaster();
+      return master;
+    }, "Finding master", tmo);
   }
   catch (err) {
     print("ReplSetTest getMaster failed: " + tojson(err));
@@ -473,16 +478,17 @@ ReplSetTest.prototype.initiate = function( cfg , initCmd , timeout ) {
     cmd[cmdKey] = config;
     printjson(cmd);
 
-    jsTest.attempt({context:this, timeout: timeout, desc: "Initiate replica set"}, function() {
+    assert.soon(function() {
         var result = master.runCommand(cmd);
         printjson(result);
         return result['ok'] == 1;
-    });
+    }, "Initiate replica set", timeout);
 
     this.awaitSecondaryNodes();
 
     // Setup authentication if running test with authentication
-    if (jsTestOptions().keyFile && !this.keyFile) {
+    if ((jsTestOptions().keyFile || jsTestOptions().useX509) && 
+          cmdKey == 'replSetInitiate') {
         master = this.getMaster();
         jsTest.addAuth(master);
         jsTest.authenticateNodes(this.nodes);
@@ -499,17 +505,19 @@ ReplSetTest.prototype.reInitiate = function() {
 
 ReplSetTest.prototype.getLastOpTimeWritten = function() {
     this.getMaster();
-    jsTest.attempt({context : this, desc : "awaiting oplog query", timeout: 30000},
-                 function() {
-                     try {
-                         this.latest = this.liveNodes.master.getDB("local")['oplog.rs'].find({}).sort({'$natural': -1}).limit(1).next()['ts'];
-                     }
-                     catch(e) {
-                         print("ReplSetTest caught exception " + e);
-                         return false;
-                     }
-                     return true;
-                 });
+    var self = this;
+    assert.soon(function() {
+        try {
+            var cursor = self.liveNodes.master.getDB("local")['oplog.rs'].find({});
+            self.latest = cursor.sort({'$natural': -1}).limit(1).next()['ts'];
+        }
+        catch(e) {
+            print("ReplSetTest caught exception " + e);
+            return false;
+        }
+
+        return true;
+    }, "awaiting oplog query", 30000);
 };
 
 ReplSetTest.prototype.awaitReplication = function(timeout) {
@@ -521,14 +529,16 @@ ReplSetTest.prototype.awaitReplication = function(timeout) {
     print("ReplSetTest awaitReplication: starting: timestamp for primary, " +
           name + ", is " + tojson(this.latest));
 
-    jsTest.attempt({context: this, timeout: timeout, desc: "awaiting replication"},
-                 function() {
+    var configVersion = this.liveNodes.master.getDB("local")['system.replset'].findOne().version;
+
+    var self = this;
+    assert.soon( function() {
                      try {
                          print("ReplSetTest awaitReplication: checking secondaries against timestamp " +
-                               tojson(this.latest));
+                               tojson(self.latest));
                          var secondaryCount = 0;
-                         for (var i=0; i<this.liveNodes.slaves.length; i++) {
-                             var slave = this.liveNodes.slaves[i];
+                         for (var i=0; i < self.liveNodes.slaves.length; i++) {
+                             var slave = self.liveNodes.slaves[i];
 
                              // Continue if we're connected to an arbiter
                              if (res = slave.getDB("admin").runCommand({replSetGetStatus: 1})) {
@@ -546,21 +556,21 @@ ReplSetTest.prototype.awaitReplication = function(timeout) {
                              if (log.find({}).sort({'$natural': -1}).limit(1).hasNext()) {
                                  var entry = log.find({}).sort({'$natural': -1}).limit(1).next();
                                  var ts = entry['ts'];
-                                 if (this.latest.t < ts.t ||
-                                        (this.latest.t == ts.t && this.latest.i < ts.i)) {
-                                     this.latest = this.liveNodes.master.getDB("local")['oplog.rs'].
+                                 if (self.latest.t < ts.t ||
+                                        (self.latest.t == ts.t && self.latest.i < ts.i)) {
+                                     self.latest = self.liveNodes.master.getDB("local")['oplog.rs'].
                                                         find({}).
                                                         sort({'$natural': -1}).
                                                         limit(1).
                                                         next()['ts'];
                                      print("ReplSetTest awaitReplication: timestamp for " + name +
-                                           " is newer, resetting latest to " + tojson(this.latest));
+                                           " is newer, resetting latest to " + tojson(self.latest));
                                      return false;
                                  }
-                                 if (!friendlyEqual(this.latest, ts)) {
+                                 if (!friendlyEqual(self.latest, ts)) {
                                      print("ReplSetTest awaitReplication: timestamp for secondary #" +
                                            secondaryCount + ", " + name + ", is " + tojson(ts) +
-                                           " but latest is " + tojson(this.latest));
+                                           " but latest is " + tojson(self.latest));
                                      print("ReplSetTest awaitReplication: last oplog entry (of " +
                                            log.count() + ") for secondary #" + secondaryCount +
                                            ", " + name + ", is " + tojsononeline(entry));
@@ -576,22 +586,31 @@ ReplSetTest.prototype.awaitReplication = function(timeout) {
                                        secondaryCount + ", " + name + ", to have an oplog built");
                                  return false;
                              }
+
+                             var slaveConfigVersion = slave.getDB("local")['system.replset'].findOne().version;
+
+                             if (configVersion != slaveConfigVersion) {
+                                 print("ReplSetTest awaitReplication: secondary #" + secondaryCount +
+                                       ", " + name + ", has config version #" + slaveConfigVersion +
+                                       ", but expected config version #" + configVersion);
+                                 return false;
+                             }
                          }
 
                          print("ReplSetTest awaitReplication: finished: all " + secondaryCount +
-                               " secondaries synced at timestamp " + tojson(this.latest));
+                               " secondaries synced at timestamp " + tojson(self.latest));
                          return true;
                      }
                      catch (e) {
                          print("ReplSetTest awaitReplication: caught exception: " + e);
 
                          // we might have a new master now
-                         this.getLastOpTimeWritten();
+                         self.getLastOpTimeWritten();
                          print("ReplSetTest awaitReplication: resetting: timestamp for primary " +
-                               this.liveNodes.master + " is " + tojson(this.latest));
+                               self.liveNodes.master + " is " + tojson(self.latest));
                          return false;
                      }
-                 });
+                 }, "awaiting replication", timeout);
 }
 
 ReplSetTest.prototype.getHashes = function( db ){
@@ -722,7 +741,7 @@ ReplSetTest.prototype.restart = function( n , options, signal, wait ){
     this.stop( n, signal, wait && wait.toFixed ? wait : true, options )
     started = this.start( n , options , true, wait );
 
-    if (jsTestOptions().keyFile && !this.keyFile) {
+    if (jsTestOptions().keyFile || jsTestOptions().useX509) {
         if (started.length) {
              // if n was an array of conns, start will return an array of connections
             for (var i = 0; i < started.length; i++) {
@@ -828,9 +847,10 @@ ReplSetTest.prototype.waitForMaster = function( timeout ){
     
     var master = undefined
     
-    jsTest.attempt({context: this, timeout: timeout, desc: "waiting for master"}, function() {
-        return ( master = this.getMaster() )
-    });
+    var self = this;
+    assert.soon(function() {
+        return ( master = self.getMaster() );
+    }, "waiting for master", timeout);
     
     return master
 }
@@ -896,10 +916,17 @@ ReplSetTest.prototype.waitForIndicator = function( node, states, ind, timeout ){
     var lastTime = null
     var currTime = new Date().getTime()
     var status = undefined
+
+    var self = this;
+    assert.soon(function() {
         
-    jsTest.attempt({context: this, timeout: timeout, desc: "waiting for state indicator " + ind + " for " + timeout + "ms" }, function() {
-        
-        status = this.status()
+        try {
+            status = self.status();
+        }
+        catch ( ex ) {
+            print( "ReplSetTest waitForIndicator could not get status: " + tojson( ex ) );
+            return false;
+        }
         
         var printStatus = false
         if( lastTime == null || ( currTime = new Date().getTime() ) - (1000 * 5) > lastTime ){
@@ -925,7 +952,7 @@ ReplSetTest.prototype.waitForIndicator = function( node, states, ind, timeout ){
         
         return false
         
-    });
+    }, "waiting for state indicator " + ind + " for " + timeout + "ms", timeout);
     
     print( "ReplSetTest waitForIndicator final status:" )
     printjson( status )
@@ -1061,16 +1088,30 @@ ReplSetTest.prototype.bridge = function( opts ) {
  * the connection between nodes 0 and 2 by calling replTest.partition(0,2) or
  * replTest.partition(2,0) (either way is identical). Then the replica set would
  * have the following bridges: 0->1, 1->0, 1->2, 2->1.
+ *
+ * The bidirectional parameter, which defaults to true, determines whether
+ * replTest.partition(0,2) will stop the bridges for 0->2 and 2->0 (true), or
+ * just 0->2 (false).
  */
-ReplSetTest.prototype.partition = function(from, to) {
+ReplSetTest.prototype.partition = function(from, to, bidirectional) {
+    bidirectional = typeof bidirectional !== 'undefined' ? bidirectional : true;
+
     this.bridges[from][to].stop();
-    this.bridges[to][from].stop();
+
+    if (bidirectional) {
+        this.bridges[to][from].stop();
+    }
 };
 
 /**
  * This reverses a partition created by partition() above.
  */
-ReplSetTest.prototype.unPartition = function(from, to) {
+ReplSetTest.prototype.unPartition = function(from, to, bidirectional) {
+    bidirectional = typeof bidirectional !== 'undefined' ? bidirectional : true;
+
     this.bridges[from][to].start();
-    this.bridges[to][from].start();
+
+    if (bidirectional) {
+        this.bridges[to][from].start();
+    }
 };

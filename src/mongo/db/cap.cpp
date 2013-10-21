@@ -15,19 +15,34 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
-#include "pdfile.h"
-#include "db.h"
-#include "../util/mmap.h"
-#include "../util/hashtab.h"
-#include "../scripting/engine.h"
+#include "mongo/pch.h"
+
 #include <algorithm>
 #include <list>
-#include "json.h"
-#include "clientcursor.h"
-#include "index_update.h"
+
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/db.h"
+#include "mongo/db/index_update.h"
+#include "mongo/db/json.h"
+#include "mongo/db/pdfile.h"
+#include "mongo/db/structure/collection.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/util/hashtab.h"
+#include "mongo/util/mmap.h"
 
 /*
  capped collection layout
@@ -112,34 +127,34 @@ namespace mongo {
     void NamespaceDetails::cappedCheckMigrate() {
         // migrate old NamespaceDetails format
         verify( isCapped() );
-        if ( capExtent.a() == 0 && capExtent.getOfs() == 0 ) {
+        if ( _capExtent.a() == 0 && _capExtent.getOfs() == 0 ) {
             //capFirstNewRecord = DiskLoc();
-            capFirstNewRecord.writing().setInvalid();
+            _capFirstNewRecord.writing().setInvalid();
             // put all the DeletedRecords in cappedListOfAllDeletedRecords()
             for ( int i = 1; i < Buckets; ++i ) {
-                DiskLoc first = deletedList[ i ];
+                DiskLoc first = _deletedList[ i ];
                 if ( first.isNull() )
                     continue;
                 DiskLoc last = first;
                 for (; !last.drec()->nextDeleted().isNull(); last = last.drec()->nextDeleted() );
                 last.drec()->nextDeleted().writing() = cappedListOfAllDeletedRecords();
                 cappedListOfAllDeletedRecords().writing() = first;
-                deletedList[i].writing() = DiskLoc();
+                _deletedList[i].writing() = DiskLoc();
             }
             // NOTE cappedLastDelRecLastExtent() set to DiskLoc() in above
 
             // Last, in case we're killed before getting here
-            capExtent.writing() = firstExtent;
+            _capExtent.writing() = _firstExtent;
         }
     }
 
     bool NamespaceDetails::inCapExtent( const DiskLoc &dl ) const {
         verify( !dl.isNull() );
         // We could have a rec or drec, doesn't matter.
-        bool res = dl.drec()->myExtentLoc(dl) == capExtent;
+        bool res = dl.drec()->myExtentLoc(dl) == _capExtent;
         DEV {
             // old implementation. this check is temp to test works the same.  new impl should be a little faster.
-            verify( res == (dl.drec()->myExtent( dl ) == capExtent.ext()) );
+            verify( res == (dl.drec()->myExtent( dl ) == _capExtent.ext()) );
         }
         return res;
     }
@@ -155,7 +170,7 @@ namespace mongo {
     void NamespaceDetails::advanceCapExtent( const char *ns ) {
         // We want cappedLastDelRecLastExtent() to be the last DeletedRecord of the prev cap extent
         // (or DiskLoc() if new capExtent == firstExtent)
-        if ( capExtent == lastExtent )
+        if ( _capExtent == _lastExtent )
             getDur().writingDiskLoc( cappedLastDelRecLastExtent() ) = DiskLoc();
         else {
             DiskLoc i = cappedFirstDeletedInCurExtent();
@@ -163,13 +178,14 @@ namespace mongo {
             getDur().writingDiskLoc( cappedLastDelRecLastExtent() ) = i;
         }
 
-        getDur().writingDiskLoc( capExtent ) = theCapExtent()->xnext.isNull() ? firstExtent : theCapExtent()->xnext;
+        getDur().writingDiskLoc( _capExtent ) =
+            theCapExtent()->xnext.isNull() ? _firstExtent : theCapExtent()->xnext;
 
         /* this isn't true if a collection has been renamed...that is ok just used for diagnostics */
         //dassert( theCapExtent()->ns == ns );
 
         theCapExtent()->assertOk();
-        getDur().writingDiskLoc( capFirstNewRecord ) = DiskLoc();
+        getDur().writingDiskLoc( _capFirstNewRecord ) = DiskLoc();
     }
 
     DiskLoc NamespaceDetails::__capAlloc( int len ) {
@@ -227,24 +243,24 @@ namespace mongo {
         theCapExtent()->assertOk();
         DiskLoc firstEmptyExtent;
         while ( 1 ) {
-            if ( stats.nrecords < maxCappedDocs() ) {
+            if ( _stats.nrecords < maxCappedDocs() ) {
                 loc = __capAlloc( len );
                 if ( !loc.isNull() )
                     break;
             }
 
             // If on first iteration through extents, don't delete anything.
-            if ( !capFirstNewRecord.isValid() ) {
+            if ( !_capFirstNewRecord.isValid() ) {
                 advanceCapExtent( ns );
 
-                if ( capExtent != firstExtent )
-                    capFirstNewRecord.writing().setInvalid();
+                if ( _capExtent != _firstExtent )
+                    _capFirstNewRecord.writing().setInvalid();
                 // else signal done with first iteration through extents.
                 continue;
             }
 
-            if ( !capFirstNewRecord.isNull() &&
-                    theCapExtent()->firstRecord == capFirstNewRecord ) {
+            if ( !_capFirstNewRecord.isNull() &&
+                    theCapExtent()->firstRecord == _capFirstNewRecord ) {
                 // We've deleted all records that were allocated on the previous
                 // iteration through this extent.
                 advanceCapExtent( ns );
@@ -253,9 +269,9 @@ namespace mongo {
 
             if ( theCapExtent()->firstRecord.isNull() ) {
                 if ( firstEmptyExtent.isNull() )
-                    firstEmptyExtent = capExtent;
+                    firstEmptyExtent = _capExtent;
                 advanceCapExtent( ns );
-                if ( firstEmptyExtent == capExtent ) {
+                if ( firstEmptyExtent == _capExtent ) {
                     maybeComplain( ns, len );
                     return DiskLoc();
                 }
@@ -271,22 +287,22 @@ namespace mongo {
                    << ", len: " << len
                    << ", maxPasses: " << maxPasses
                    << ", _maxDocsInCapped: " << _maxDocsInCapped
-                   << ", nrecords: " << stats.nrecords
-                   << ", datasize: " << stats.datasize;
+                   << ", nrecords: " << _stats.nrecords
+                   << ", datasize: " << _stats.datasize;
                 msgasserted(10345, sb.str());
             }
         }
 
         // Remember first record allocated on this iteration through capExtent.
-        if ( capFirstNewRecord.isValid() && capFirstNewRecord.isNull() )
-            getDur().writingDiskLoc(capFirstNewRecord) = loc;
+        if ( _capFirstNewRecord.isValid() && _capFirstNewRecord.isNull() )
+            getDur().writingDiskLoc(_capFirstNewRecord) = loc;
 
         return loc;
     }
 
     void NamespaceDetails::dumpExtents() {
         cout << "dumpExtents:" << endl;
-        for ( DiskLoc i = firstExtent; !i.isNull(); i = i.ext()->xnext ) {
+        for ( DiskLoc i = _firstExtent; !i.isNull(); i = i.ext()->xnext ) {
             Extent *e = i.ext();
             stringstream ss;
             e->dump(ss);
@@ -295,16 +311,16 @@ namespace mongo {
     }
 
     void NamespaceDetails::cappedDumpDelInfo() {
-        cout << "dl[0]: " << deletedList[0].toString() << endl;
-        for( DiskLoc z = deletedList[0]; !z.isNull(); z = z.drec()->nextDeleted() ) {
+        cout << "dl[0]: " << _deletedList[0].toString() << endl;
+        for( DiskLoc z = _deletedList[0]; !z.isNull(); z = z.drec()->nextDeleted() ) {
             cout << "  drec:" << z.toString() << " dreclen:" << hex << z.drec()->lengthWithHeaders() <<
                  " ext:" << z.drec()->myExtent(z)->myLoc.toString() << endl;
         }
-        cout << "dl[1]: " << deletedList[1].toString() << endl;
+        cout << "dl[1]: " << _deletedList[1].toString() << endl;
     }
 
     void NamespaceDetails::cappedTruncateLastDelUpdate() {
-        if ( capExtent == firstExtent ) {
+        if ( _capExtent == _firstExtent ) {
             // Only one extent of the collection is in use, so there
             // is no deleted record in a previous extent, so nullify
             // cappedLastDelRecLastExtent().
@@ -359,7 +375,7 @@ namespace mongo {
             // TODO The algorithm used in this function cannot generate an
             // empty collection, but we could call emptyCappedCollection() in
             // this case instead of asserting.
-            uassert( 13415, "emptying the collection is not allowed", stats.nrecords > 1 );
+            uassert( 13415, "emptying the collection is not allowed", _stats.nrecords > 1 );
 
             // Delete the newest record, and coalesce the new deleted
             // record with existing deleted records.
@@ -380,7 +396,7 @@ namespace mongo {
                     // NOTE Because we didn't delete the last document, and
                     // capLooped() is false, capExtent is not the first extent
                     // so xprev will be nonnull.
-                    capExtent.writing() = theCapExtent()->xprev;
+                    _capExtent.writing() = theCapExtent()->xprev;
                     theCapExtent()->assertOk();
 
                     // update cappedLastDelRecLastExtent()
@@ -395,7 +411,7 @@ namespace mongo {
             // NOTE In this comparison, curr and potentially capFirstNewRecord
             // may point to invalid data, but we can still compare the
             // references themselves.
-            if ( curr == capFirstNewRecord ) {
+            if ( curr == _capFirstNewRecord ) {
 
                 // Set 'capExtent' to the first nonempty extent prior to the
                 // initial capExtent.  There must be such an extent because we
@@ -404,19 +420,19 @@ namespace mongo {
                 // In this case we will keep the initial capExtent and specify
                 // that all records contained within are on the fresh rather than
                 // stale side of the extent.
-                DiskLoc newCapExtent = capExtent;
+                DiskLoc newCapExtent = _capExtent;
                 do {
                     // Find the previous extent, looping if necessary.
-                    newCapExtent = ( newCapExtent == firstExtent ) ? lastExtent : newCapExtent.ext()->xprev;
+                    newCapExtent = ( newCapExtent == _firstExtent ) ? _lastExtent : newCapExtent.ext()->xprev;
                     newCapExtent.ext()->assertOk();
                 }
                 while ( newCapExtent.ext()->firstRecord.isNull() );
-                capExtent.writing() = newCapExtent;
+                _capExtent.writing() = newCapExtent;
 
                 // Place all documents in the new capExtent on the fresh side
                 // of the capExtent by setting capFirstNewRecord to the first
                 // document in the new capExtent.
-                capFirstNewRecord.writing() = theCapExtent()->firstRecord;
+                _capFirstNewRecord.writing() = theCapExtent()->firstRecord;
 
                 // update cappedLastDelRecLastExtent()
                 cappedTruncateLastDelUpdate();
@@ -427,14 +443,15 @@ namespace mongo {
     void NamespaceDetails::emptyCappedCollection( const char *ns ) {
         DEV verify( this == nsdetails(ns) );
         massert( 13424, "collection must be capped", isCapped() );
-        massert( 13425, "background index build in progress", !indexBuildsInProgress );
+        massert( 13425, "background index build in progress", !_indexBuildsInProgress );
 
-        vector<BSONObj> indexes = Helpers::findAll( Namespace( ns ).getSisterNS( "system.indexes" ) , BSON( "ns" << ns ) );
+        vector<BSONObj> indexes = Helpers::findAll( NamespaceString(ns).getSystemIndexesCollection(),
+                                                    BSON( "ns" << ns ) );
         for ( unsigned i=0; i<indexes.size(); i++ ) {
             indexes[i] = indexes[i].copy();
         }
 
-        if ( nIndexes ) {
+        if ( _nIndexes ) {
             string errmsg;
             BSONObjBuilder note;
             bool res = dropIndexes( this , ns , "*" , errmsg , note , true );
@@ -443,7 +460,9 @@ namespace mongo {
 
         // Clear all references to this namespace.
         ClientCursor::invalidate( ns );
-        NamespaceDetailsTransient::resetCollection( ns );
+        Collection* collection = cc().database()->getCollection( ns );
+        verify( collection->details() == this );
+        collection->infoCache()->reset();
 
         // Get a writeable reference to 'this' and reset all pertinent
         // attributes.
@@ -453,27 +472,27 @@ namespace mongo {
         t->cappedListOfAllDeletedRecords() = DiskLoc();
 
         // preserve firstExtent/lastExtent
-        t->capExtent = firstExtent;
-        t->stats.datasize = stats.nrecords = 0;
+        t->_capExtent = _firstExtent;
+        t->_stats.datasize = _stats.nrecords = 0;
         // lastExtentSize preserve
         // nIndexes preserve 0
         // capped preserve true
         // max preserve
         t->_paddingFactor = 1.0;
         t->_systemFlags = 0;
-        t->capFirstNewRecord = DiskLoc();
-        t->capFirstNewRecord.setInvalid();
+        t->_capFirstNewRecord = DiskLoc();
+        t->_capFirstNewRecord.setInvalid();
         t->cappedLastDelRecLastExtent().setInvalid();
         // dataFileVersion preserve
         // indexFileVersion preserve
-        t->multiKeyIndexBits = 0;
-        t->reservedA = 0;
-        t->extraOffset = 0;
+        t->_multiKeyIndexBits = 0;
+        t->_reservedA = 0;
+        t->_extraOffset = 0;
         // indexBuildInProgress preserve 0
-        memset(t->reserved, 0, sizeof(t->reserved));
+        memset(t->_reserved, 0, sizeof(t->_reserved));
 
         // Reset all existing extents and recreate the deleted list.
-        for( DiskLoc ext = firstExtent; !ext.isNull(); ext = ext.ext()->xnext ) {
+        for( DiskLoc ext = _firstExtent; !ext.isNull(); ext = ext.ext()->xnext ) {
             DiskLoc prev = ext.ext()->xprev;
             DiskLoc next = ext.ext()->xnext;
             DiskLoc empty = ext.ext()->reuse( ns, true );
@@ -483,7 +502,8 @@ namespace mongo {
         }
 
         for ( unsigned i=0; i<indexes.size(); i++ ) {
-            theDataFileMgr.insertWithObjMod(Namespace( ns ).getSisterNS( "system.indexes" ).c_str(),
+            string idxns = NamespaceString(ns).getSystemIndexesCollection();
+            theDataFileMgr.insertWithObjMod(idxns.c_str(),
                                             indexes[i],
                                             false,
                                             true);

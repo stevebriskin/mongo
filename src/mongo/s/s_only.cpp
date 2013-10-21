@@ -15,18 +15,21 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/authorization_manager.h"
-#include "mongo/db/auth/auth_external_state_s.h"
-#include "mongo/s/shard.h"
+#include "mongo/db/auth/authorization_manager_global.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/authz_session_external_state_s.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/matcher.h"
+#include "mongo/s/client_info.h"
 #include "mongo/s/grid.h"
-#include "request.h"
-#include "client_info.h"
-#include "../db/dbhelpers.h"
-#include "../db/matcher.h"
-#include "../db/commands.h"
+#include "mongo/s/request.h"
+#include "mongo/s/shard.h"
+#include "mongo/util/concurrency/thread_name.h"
 
 /*
   most a pile of hacks to make linking nicer
@@ -50,7 +53,7 @@ namespace mongo {
 
     LockState::LockState(){} // ugh
 
-    Client::Client(const char *desc , AbstractMessagingPort *p) :
+    Client::Client(const string& desc, AbstractMessagingPort *p) :
         ClientBasic(p),
         _context(0),
         _shutdown(false),
@@ -64,17 +67,34 @@ namespace mongo {
     Client& Client::initThread(const char *desc, AbstractMessagingPort *mp) {
         // mp is non-null only for client connections, and mongos uses ClientInfo for those
         massert(16478, "Client being used for incoming connection thread in mongos", mp == NULL);
-        setThreadName(desc);
+
         verify( currentClient.get() == 0 );
-        // mp is always NULL in mongos. Threads for client connections use ClientInfo in mongos
-        massert(16482,
-                "Non-null messaging port provided to Client::initThread in a mongos",
-                mp == NULL);
-        Client *c = new Client(desc, mp);
-        c->setAuthorizationManager(new AuthorizationManager(new AuthExternalStateMongos()));
+
+        string fullDesc = desc;
+        if ( str::equals( "conn" , desc ) && mp != NULL )
+            fullDesc = str::stream() << desc << mp->connectionId();
+
+        setThreadName( fullDesc.c_str() );
+
+        Client *c = new Client( fullDesc, mp );
         currentClient.reset(c);
         mongo::lastError.initThread();
+        c->setAuthorizationSession(new AuthorizationSession(new AuthzSessionExternalStateMongos(
+                getGlobalAuthorizationManager())));
         return *c;
+    }
+
+    /* resets the client for the current thread */
+    // Needed here since we may want to use for testing when linked against mongos
+    void Client::resetThread( const StringData& origThreadName ) {
+        verify( currentClient.get() != 0 );
+
+        // Detach all client info from thread
+        mongo::lastError.reset(NULL);
+        currentClient.get()->shutdown();
+        currentClient.reset(NULL);
+
+        setThreadName( origThreadName.rawData() );
     }
 
     string Client::clientAddress(bool includePort) const {
@@ -103,39 +123,7 @@ namespace mongo {
                                          BSONObj& cmdObj,
                                          BSONObjBuilder& result,
                                          bool fromRepl ) {
-        verify(c);
-
         std::string dbname = nsToDatabase(ns);
-
-        // Access control checks
-        if (AuthorizationManager::isAuthEnabled()) {
-            std::vector<Privilege> privileges;
-            c->addRequiredPrivileges(dbname, cmdObj, &privileges);
-            AuthorizationManager* authManager = client.getAuthorizationManager();
-            if (!authManager->checkAuthForPrivileges(privileges).isOK()) {
-                result.append("note", str::stream() << "not authorized for command: " <<
-                                    c->name << " on database " << dbname);
-                appendCommandStatus(result, false, "unauthorized");
-                return;
-            }
-        }
-        if (c->adminOnly() &&
-                c->localHostOnlyIfNoAuth(cmdObj) &&
-                !AuthorizationManager::isAuthEnabled() &&
-                !client.getIsLocalHostConnection()) {
-            log() << "command denied: " << cmdObj.toString() << endl;
-            appendCommandStatus(result,
-                               false,
-                               "unauthorized: this command must run from localhost when running db "
-                               "without auth");
-            return;
-        }
-        if (c->adminOnly() && !startsWith(ns, "admin.")) {
-            log() << "command denied: " << cmdObj.toString() << endl;
-            appendCommandStatus(result, false, "access denied - use admin db");
-            return;
-        }
-        // End of access control checks
 
         if (cmdObj.getBoolField("help")) {
             stringstream help;
@@ -146,6 +134,13 @@ namespace mongo {
             appendCommandStatus(result, true, "");
             return;
         }
+
+        Status status = _checkAuthorization(c, &client, dbname, cmdObj, fromRepl);
+        if (!status.isOK()) {
+            appendCommandStatus(result, status);
+            return;
+        }
+
         std::string errmsg;
         bool ok;
         try {

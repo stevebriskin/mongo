@@ -1,14 +1,19 @@
 t = db.geo_s2index
 t.drop()
 
+// We internally drop adjacent duplicate points in lines.
+someline = { "type" : "LineString", "coordinates": [ [40,5], [40,5], [ 40, 5], [41, 6], [41,6]]}
+t.insert( {geo : someline , nonGeo: "someline"})
+t.ensureIndex({geo: "2dsphere"})
+foo = t.find({geo: {$geoIntersects: {$geometry: {type: "Point", coordinates: [40,5]}}}}).next();
+assert.eq(foo.geo, someline);
+t.dropIndex({geo: "2dsphere"})
+
 pointA = { "type" : "Point", "coordinates": [ 40, 5 ] }
 t.insert( {geo : pointA , nonGeo: "pointA"})
 
 pointD = { "type" : "Point", "coordinates": [ 41.001, 6.001 ] }
 t.insert( {geo : pointD , nonGeo: "pointD"})
-
-someline = { "type" : "LineString", "coordinates": [ [ 40, 5], [41, 6]]}
-t.insert( {geo : someline , nonGeo: "someline"})
 
 pointB = { "type" : "Point", "coordinates": [ 41, 6 ] }
 t.insert( {geo : pointB , nonGeo: "pointB"})
@@ -33,29 +38,29 @@ t.ensureIndex( { geo : "2dsphere", nonGeo: 1 } )
 assert(!db.getLastError())
 
 res = t.find({ "geo" : { "$geoIntersects" : { "$geometry" : pointA} } });
-assert.eq(res.count(), 3);
+assert.eq(res.itcount(), 3);
 
 res = t.find({ "geo" : { "$geoIntersects" : { "$geometry" : pointB} } });
-assert.eq(res.count(), 4);
+assert.eq(res.itcount(), 4);
 
 res = t.find({ "geo" : { "$geoIntersects" : { "$geometry" : pointD} } });
-assert.eq(res.count(), 1);
+assert.eq(res.itcount(), 1);
 
 res = t.find({ "geo" : { "$geoIntersects" : { "$geometry" : someline} } })
-assert.eq(res.count(), 5);
+assert.eq(res.itcount(), 5);
 
 res = t.find({ "geo" : { "$geoIntersects" : { "$geometry" : somepoly} } })
-assert.eq(res.count(), 6);
+assert.eq(res.itcount(), 6);
 
 res = t.find({ "geo" : { "$within" : { "$geometry" : somepoly} } })
-assert.eq(res.count(), 6);
+assert.eq(res.itcount(), 6);
 
 res = t.find({ "geo" : { "$geoIntersects" : { "$geometry" : somepoly} } }).limit(1)
 assert.eq(res.itcount(), 1);
 
 res = t.find({ "nonGeo": "pointA",
                "geo" : { "$geoIntersects" : { "$geometry" : somepoly} } })
-assert.eq(res.count(), 1);
+assert.eq(res.itcount(), 1);
 
 // Don't crash mongod if we give it bad input.
 t.drop()

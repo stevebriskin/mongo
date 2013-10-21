@@ -15,17 +15,20 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
-#include "mmap.h"
-#include "file_allocator.h"
-#include "../db/d_concurrency.h"
+#include "mongo/pch.h"
+
 #include <errno.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 #include <fcntl.h>
-#include "../util/processinfo.h"
-#include "mongoutils/str.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#include "mongo/db/d_concurrency.h"
+#include "mongo/util/file_allocator.h"
+#include "mongo/util/mmap.h"
+#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/processinfo.h"
+
 using namespace mongoutils;
 
 namespace mongo {
@@ -174,6 +177,11 @@ namespace mongo {
     }
 
     void* MemoryMappedFile::remapPrivateView(void *oldPrivateAddr) {
+#if defined(__sunos__) // SERVER-8795
+        verify( Lock::isW() );
+        LockMongoFilesExclusive lockMongoFiles;
+#endif
+
         // don't unmap, just mmap over the old region
         void * x = mmap( oldPrivateAddr, len , PROT_READ|PROT_WRITE , MAP_PRIVATE|MAP_NORESERVE|MAP_FIXED , fd , 0 );
         if( x == MAP_FAILED ) {

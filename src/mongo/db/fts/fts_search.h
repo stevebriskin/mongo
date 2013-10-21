@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
@@ -24,11 +36,14 @@
 #include <queue>
 
 #include "mongo/base/disallow_copying.h"
-#include "mongo/db/fts/fts_index.h"
 #include "mongo/db/fts/fts_matcher.h"
 #include "mongo/db/fts/fts_query.h"
 #include "mongo/db/fts/fts_util.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/matcher.h"
+
+// mongo::fts::FTSSearch is deprecated: the "text" command is deprecated in favor of the $text
+// query operator.
 
 namespace mongo {
 
@@ -57,16 +72,13 @@ namespace mongo {
 
             typedef std::map<Record*,double> Scores;
 
-            FTSSearch( NamespaceDetails* ns,
-                       const IndexDetails& id,
+            FTSSearch( IndexDescriptor* descriptor,
+                       const FTSSpec& ftsSpec,
                        const BSONObj& indexPrefix,
                        const FTSQuery& query,
                        const BSONObj& filter );
 
-
             void go(Results* results, unsigned limit );
-
-            const FTSIndex * getIndex() const { return _fts; }
 
             long long getKeysLookedAt() const { return _keysLookedAt; }
             long long getObjLookedAt() const { return _objectsLookedAt; }
@@ -81,9 +93,8 @@ namespace mongo {
              */
             bool _ok( Record* record ) const;
 
-            NamespaceDetails* _ns;
-            const IndexDetails& _id;
-            FTSIndex* _fts;
+            IndexDescriptor* _descriptor;
+            const FTSSpec& _ftsSpec;
             BSONObj _indexPrefix;
             FTSQuery _query;
             FTSMatcher _ftsMatcher;

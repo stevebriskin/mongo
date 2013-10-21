@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
 /* This file is things related to the "grid configuration":
@@ -23,13 +35,10 @@
 
 #pragma once
 
-#include "../db/namespace.h"
-#include "../client/model.h"
 #include "mongo/client/dbclient_rs.h"
-
-#include "chunk.h"
-#include "shard.h"
-#include "shardkey.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/shard.h"
+#include "mongo/s/shardkey.h"
 
 namespace mongo {
 
@@ -219,6 +228,13 @@ namespace mongo {
         bool init( vector<string> configHosts );
 
         bool init( const std::string& s );
+
+        /**
+         * Check hosts are unique. Returns true if all configHosts
+         * hostname:port entries are unique. Otherwise return false
+         * and fill errmsg with message containing the offending server.
+         */
+        bool checkHostsAreUnique( const vector<string>& configHosts, string* errmsg );
 
         bool allUp();
         bool allUp( string& errmsg );

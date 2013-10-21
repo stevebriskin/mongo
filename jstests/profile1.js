@@ -13,11 +13,12 @@ print("profile1.js BEGIN");
 // special db so that it can be run in parallel tests
 var stddb = db;
 var db = db.getSisterDB("profile1");
+db.dropDatabase();
 
 try {
 
     username = "jstests_profile1_user";
-    db.addUser( username, "password", false, 1 );
+    db.addUser({user: username, pwd: "password", roles: jsTest.basicUserRoles});
     db.auth( username, "password" );
 
     function profileCursor( query ) {

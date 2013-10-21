@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -28,19 +40,21 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/background.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/shutdown.h"
 #include "mongo/db/db.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/log_process_details.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/db/repl/multicmd.h"
 #include "mongo/db/repl/write_concern.h"
-#include "mongo/db/replutil.h"
-#include "mongo/server.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/scripting/engine.h"
+#include "mongo/server.h"
 #include "mongo/util/lruishmap.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/processinfo.h"
@@ -150,7 +164,6 @@ namespace mongo {
         FeaturesCmd() : Command( "features", true ) {}
         void help(stringstream& h) const { h << "return build level feature settings"; }
         virtual bool slaveOk() const { return true; }
-        virtual bool readOnly() { return true; }
         virtual LockType locktype() const { return NONE; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
@@ -188,7 +201,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::hostInfo);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             ProcessInfo p;
@@ -225,11 +238,13 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::logRotate);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            fassert(16175, rotateLogs());
-            return 1;
+            bool didRotate = rotateLogs();
+            if (didRotate)
+                logProcessDetailsForLogRotate();
+            return didRotate;
         }
 
     } logRotateCmd;
@@ -336,7 +351,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::getLog);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual void help( stringstream& help ) const {
             help << "{ getLog : '*' }  OR { getLog : 'global' }";
@@ -356,20 +371,18 @@ namespace mongo {
                 result.appendArray( "names" , arr.arr() );
             }
             else {
-                RamLog* rl = RamLog::get( p );
-                if ( ! rl ) {
+                RamLog* ramlog = RamLog::getIfExists(p);
+                if ( ! ramlog ) {
                     errmsg = str::stream() << "no RamLog named: " << p;
                     return false;
                 }
+                RamLog::LineIterator rl(ramlog);
 
-                result.appendNumber( "totalLinesWritten", rl->getTotalLinesWritten() );
-
-                vector<const char*> lines;
-                rl->get( lines );
+                result.appendNumber( "totalLinesWritten", rl.getTotalLinesWritten() );
 
                 BSONArrayBuilder arr( result.subarrayStart( "log" ) );
-                for ( unsigned i=0; i<lines.size(); i++ )
-                    arr.append( lines[i] );
+                while (rl.more())
+                    arr.append(rl.next());
                 arr.done();
             }
             return true;
@@ -389,11 +402,11 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::getCmdLineOpts);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual bool run(const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            result.append("argv", CmdLine::getArgvArray());
-            result.append("parsed", CmdLine::getParsedOpts());
+            result.append("argv", serverGlobalParams.argvArray);
+            result.append("parsed", serverGlobalParams.parsedOpts);
             return true;
         }
 

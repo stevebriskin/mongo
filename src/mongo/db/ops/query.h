@@ -14,22 +14,36 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
 
 #include "mongo/pch.h"
-#include "../../util/net/message.h"
-#include "../dbmessage.h"
-#include "../jsobj.h"
-#include "../diskloc.h"
-#include "../explain.h"
-#include "../../s/d_chunk_manager.h"
+
+#include "mongo/db/diskloc.h"
+#include "mongo/db/dbmessage.h"
+#include "mongo/db/explain.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/s/collection_metadata.h"
+#include "mongo/util/net/message.h"
 
 // struct QueryOptions, QueryResult, QueryResultFlags in:
 
 namespace mongo {
 
+    class CurOp;
     class ParsedQuery;
     class QueryOptimizerCursor;
     struct QueryPlanSummary;
@@ -290,14 +304,14 @@ namespace mongo {
          * @return the number of results in the buffer.
          */
         int handoff( Message &result );
-        /** A chunk manager found at the beginning of the query. */
-        ShardChunkManagerPtr chunkManager() const { return _chunkManager; }
+        /** Metadata found at the beginning of the query. */
+        CollectionMetadataPtr collMetadata() const { return _collMetadata; }
 
     private:
         QueryResponseBuilder( const ParsedQuery &parsedQuery, const shared_ptr<Cursor> &cursor );
         void init( const QueryPlanSummary &queryPlan, const BSONObj &oldPlan );
 
-        ShardChunkManagerPtr newChunkManager() const;
+        CollectionMetadataPtr newCollMetadata() const;
         shared_ptr<ExplainRecordingStrategy> newExplainRecordingStrategy
         ( const QueryPlanSummary &queryPlan, const BSONObj &oldPlan ) const;
         shared_ptr<ResponseBuildStrategy> newResponseBuildStrategy
@@ -316,7 +330,7 @@ namespace mongo {
         shared_ptr<Cursor> _cursor;
         shared_ptr<QueryOptimizerCursor> _queryOptimizerCursor;
         BufBuilder _buf;
-        ShardChunkManagerPtr _chunkManager;
+        CollectionMetadataPtr _collMetadata;
         shared_ptr<ExplainRecordingStrategy> _explain;
         shared_ptr<ResponseBuildStrategy> _builder;
     };

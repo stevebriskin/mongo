@@ -52,8 +52,8 @@ namespace CursorTests {
                     }
                 }
                 // orphan idxSpec for this test
-                IndexSpec *idxSpec = new IndexSpec( BSON( "a" << 1 ) );
-                return new FieldRangeVector( s, *idxSpec, direction );
+                BSONObj kp = BSON( "a" << 1 );
+                return new FieldRangeVector( s, kp, direction );
             }
             DBDirectClient _c;
         private:
@@ -173,9 +173,7 @@ namespace CursorTests {
 
                 Client::WriteContext ctx( ns() );
                 FieldRangeSet frs( ns(), spec, true, true );
-                // orphan spec for this test.
-                IndexSpec *idxSpec = new IndexSpec( idx() );
-                boost::shared_ptr< FieldRangeVector > frv( new FieldRangeVector( frs, *idxSpec, direction() ) );
+                boost::shared_ptr< FieldRangeVector > frv( new FieldRangeVector( frs, idx(), direction() ) );
                 scoped_ptr<BtreeCursor> c( BtreeCursor::make( nsdetails( ns() ),
                                                               nsdetails( ns() )->idx( 1 ),
                                                               frv,
@@ -287,8 +285,8 @@ namespace CursorTests {
             void run() {
                 _c.dropCollection( ns() );
                 // Set up a compound index with some data.
-                IndexSpec idx( BSON( "a" << 1 << "b" << 1 ) );
-                _c.ensureIndex( ns(), idx.keyPattern );
+                BSONObj kp = BSON( "a" << 1 << "b" << 1 );
+                _c.ensureIndex( ns(), kp);
                 for( int i = 0; i < 300; ++i ) {
                     _c.insert( ns(), BSON( "a" << i << "b" << i ) );
                 }
@@ -300,7 +298,7 @@ namespace CursorTests {
                 // of 'a' in the index and check for an index key with that value for 'a' and 'b'
                 // equal to 30.
                 FieldRangeSet frs( ns(), BSON( "b" << 30 ), true, true );
-                boost::shared_ptr<FieldRangeVector> frv( new FieldRangeVector( frs, idx, 1 ) );
+                boost::shared_ptr<FieldRangeVector> frv( new FieldRangeVector( frs, kp, 1 ) );
                 Client::WriteContext ctx( ns() );
                 scoped_ptr<BtreeCursor> c( BtreeCursor::make( nsdetails( ns() ),
                                                               nsdetails( ns() )->idx(1),
@@ -581,7 +579,7 @@ namespace CursorTests {
                 }
 
                 boost::shared_ptr<Cursor> cursor;
-                ClientCursor::Holder clientCursor;
+                ClientCursorHolder clientCursor;
                 ClientCursor::YieldData yieldData;
 
                 {
@@ -631,7 +629,7 @@ namespace CursorTests {
                 while( !isExpectedIterate( cursor->current() ) ) {
                     ASSERT( cursor->advance() );
                 }
-                ClientCursor::Holder clientCursor( new ClientCursor( QueryOption_NoCursorTimeout,
+                ClientCursorHolder clientCursor( new ClientCursor( QueryOption_NoCursorTimeout,
                                                                     cursor, ns() ) );
                 DiskLoc loc = clientCursor->currLoc();
                 ASSERT( !loc.isNull() );
@@ -640,7 +638,7 @@ namespace CursorTests {
                 ClientCursor::YieldData data;
                 clientCursor->prepareToYield( data );
                 // The cursor will be advanced in aboutToDelete().
-                ClientCursor::aboutToDelete( nsdetails( ns() ), loc );
+                ClientCursor::aboutToDelete( ns(), nsdetails( ns() ), loc );
                 clientCursor->recoverFromYield( data );
                 ASSERT( clientCursor->ok() );
                 
@@ -714,7 +712,7 @@ namespace CursorTests {
             private:
                 Client::WriteContext _ctx;
                 boost::shared_ptr<Cursor> _cursor;
-                ClientCursor::Holder _clientCursor;
+                ClientCursorHolder _clientCursor;
             };
             
             /** Pin pins a ClientCursor over its lifetime. */
@@ -723,7 +721,7 @@ namespace CursorTests {
                 void run() {
                     assertNotPinned();
                     {
-                        ClientCursor::Pin pin( cursorid() );
+                        ClientCursorPin pin( cursorid() );
                         assertPinned();
                         ASSERT_THROWS( erase(), AssertionException );
                     }
@@ -746,12 +744,12 @@ namespace CursorTests {
             class PinTwice : public Base {
             public:
                 void run() {
-                    ClientCursor::Pin pin( cursorid() );
+                    ClientCursorPin pin( cursorid() );
                     ASSERT_THROWS( pinCursor(), AssertionException );
                 }
             private:
                 void pinCursor() const {
-                    ClientCursor::Pin pin( cursorid() );
+                    ClientCursorPin pin( cursorid() );
                 }
             };
             
@@ -759,7 +757,7 @@ namespace CursorTests {
             class CursorDeleted : public Base {
             public:
                 void run() {
-                    ClientCursor::Pin pin( cursorid() );
+                    ClientCursorPin pin( cursorid() );
                     ASSERT( pin.c() );
                     // Delete the pinned cursor.
                     ClientCursor::invalidate( ns() );

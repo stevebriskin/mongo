@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/db/intervalbtreecursor.h"
@@ -22,6 +34,9 @@
 #include "mongo/db/pdfile.h"
 
 namespace mongo {
+
+    unordered_set<IntervalBtreeCursor*> IntervalBtreeCursor::_activeCursors;
+    SimpleMutex IntervalBtreeCursor::_activeCursorsMutex("active_interval_btree_cursors");
 
     /**
      * Advance 'loc' until it does not reference an unused key, or the end of the btree is reached.
@@ -77,6 +92,26 @@ namespace mongo {
         _currRecoverable( _indexDetails, _ordering, _curr ),
         _nscanned(),
         _multikeyFlag() {
+
+        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
+        _activeCursors.insert(this);
+    }
+
+    IntervalBtreeCursor::~IntervalBtreeCursor() {
+        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
+        _activeCursors.erase(this);
+    }
+
+    void IntervalBtreeCursor::aboutToDeleteBucket(const DiskLoc& bucket) {
+        SimpleMutex::scoped_lock lock(_activeCursorsMutex);
+        for (unordered_set<IntervalBtreeCursor*>::iterator i = _activeCursors.begin();
+             i != _activeCursors.end(); ++i) {
+
+            IntervalBtreeCursor* ic = *i;
+            if (bucket == ic->_curr.bucket) {
+                ic->_currRecoverable.invalidateInitialLocation();
+            }
+        }
     }
 
     void IntervalBtreeCursor::init() {
@@ -128,11 +163,6 @@ namespace mongo {
         return _curr.bucket.btree<V1>()->keyNode( _curr.pos ).key.toBson();
     }
 
-    void IntervalBtreeCursor::aboutToDeleteBucket( const DiskLoc& b ) {
-        if ( b == _curr.bucket ) {
-            _currRecoverable.invalidateInitialLocation();
-        }
-    }
 
     void IntervalBtreeCursor::noteLocation() {
         _currRecoverable = LogicalBtreePosition( _indexDetails, _ordering, _curr );

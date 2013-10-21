@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/repl/sync.h"
@@ -33,7 +45,7 @@ namespace mongo {
     }
 
     BSONObj Sync::getMissingDoc(const BSONObj& o) {
-        OplogReader missingObjReader;
+        OplogReader missingObjReader; // why are we using OplogReader to run a non-oplog query?
         const char *ns = o.getStringField("ns");
 
         // capped collections
@@ -43,19 +55,51 @@ namespace mongo {
             return BSONObj();
         }
 
-        uassert(15916, str::stream() << "Can no longer connect to initial sync source: " << hn, missingObjReader.connect(hn));
+        const int retryMax = 3;
+        for (int retryCount = 1; retryCount <= retryMax; ++retryCount) {
+            if (retryCount != 1) {
+                // if we are retrying, sleep a bit to let the network possibly recover
+                sleepsecs(retryCount * retryCount);
+            }
+            try {
+                bool ok = missingObjReader.connect(hn);
+                if (!ok) {
+                    warning() << "network problem detected while connecting to the "
+                              << "sync source, attempt " << retryCount << " of "
+                              << retryMax << endl;
+                        continue;  // try again
+                }
+            } 
+            catch (const SocketException&) {
+                warning() << "network problem detected while connecting to the "
+                          << "sync source, attempt " << retryCount << " of "
+                          << retryMax << endl;
+                continue; // try again
+            }
 
-        // might be more than just _id in the update criteria
-        BSONObj query = BSONObjBuilder().append(o.getObjectField("o2")["_id"]).obj();
-        BSONObj missingObj;
-        try {
-            missingObj = missingObjReader.findOne(ns, query);
-        } catch(DBException& e) {
-            log() << "replication assertion fetching missing object: " << e.what() << endl;
-            throw;
+            // might be more than just _id in the update criteria
+            BSONObj query = BSONObjBuilder().append(o.getObjectField("o2")["_id"]).obj();
+            BSONObj missingObj;
+            try {
+                missingObj = missingObjReader.findOne(ns, query);
+            } 
+            catch (const SocketException&) {
+                warning() << "network problem detected while fetching a missing document from the "
+                          << "sync source, attempt " << retryCount << " of "
+                          << retryMax << endl;
+                continue; // try again
+            } 
+            catch (DBException& e) {
+                log() << "replication assertion fetching missing object: " << e.what() << endl;
+                throw;
+            }
+
+            // success!
+            return missingObj;
         }
-
-        return missingObj;
+        // retry count exceeded
+        msgasserted(15916, 
+                    str::stream() << "Can no longer connect to initial sync source: " << hn);
     }
 
     bool Sync::shouldRetry(const BSONObj& o) {

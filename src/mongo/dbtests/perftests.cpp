@@ -22,26 +22,27 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
-#include <boost/thread/thread.hpp>
-
-#include <fstream>
-#include "../db/db.h"
-#include "../db/instance.h"
-#include "../db/json.h"
-#include "../db/lasterror.h"
-#include "../db/taskqueue.h"
-#include "../util/timer.h"
-#include "dbtests.h"
-#include "../db/dur_stats.h"
-#include "../util/checksum.h"
-#include "../util/version.h"
-#include "../db/key.h"
-#include "../util/compress.h"
-#include "../util/concurrency/qlock.h"
-#include "../util/fail_point.h"
 #include <boost/filesystem/operations.hpp>
+#include <boost/thread/thread.hpp>
+#include <fstream>
+
+#include "mongo/db/db.h"
+#include "mongo/db/dur_stats.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/json.h"
+#include "mongo/db/key.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/db/taskqueue.h"
+#include "mongo/dbtests/dbtests.h"
+#include "mongo/dbtests/framework_options.h"
+#include "mongo/util/checksum.h"
+#include "mongo/util/compress.h"
+#include "mongo/util/concurrency/qlock.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/timer.h"
+#include "mongo/util/version.h"
 
 #if (__cplusplus >= 201103L)
 #include <mutex>
@@ -49,15 +50,7 @@
 
 using namespace bson;
 
-namespace mongo {
-    namespace dbtests {
-        extern unsigned perfHist;
-    }
-}
-
 namespace PerfTests {
-
-    using mongo::dbtests::perfHist;
 
     const bool profiling = false;
 
@@ -228,14 +221,16 @@ namespace PerfTests {
 
             if( conn && !conn->isFailed() ) {
                 const char *ns = "perf.pstats";
-                if( perfHist ) {
+                if(frameworkGlobalParams.perfHist) {
                     static bool needver = true;
                     try {
                         // try to report rps from last time */
                         Query q;
                         {
                             BSONObjBuilder b;
-                            b.append("host",_perfhostname).append("test",s).append("dur",cmdLine.dur);
+                            b.append("host", _perfhostname);
+                            b.append("test", s);
+                            b.append("dur", storageGlobalParams.dur);
                             DEV { b.append("info.DEBUG",true); }
                             else b.appendNull("info.DEBUG");
                             if( sizeof(int*) == 4 )
@@ -246,7 +241,7 @@ namespace PerfTests {
                         }
                         BSONObj fields = BSON( "rps" << 1 << "info" << 1 );
                         vector<BSONObj> v;
-                        conn->findN(v, ns, q, perfHist, 0, &fields);
+                        conn->findN(v, ns, q, frameworkGlobalParams.perfHist, 0, &fields);
                         for( vector<BSONObj>::iterator i = v.begin(); i != v.end(); i++ ) {
                             BSONObj o = *i;
                             double lastrps = o["rps"].Number();
@@ -270,8 +265,8 @@ namespace PerfTests {
                     b.append("test", s);
                     b.append("rps", (int) rps);
                     b.append("millis", ms);
-                    b.appendBool("dur", cmdLine.dur);
-                    if( showDurStats() && cmdLine.dur )
+                    b.appendBool("dur", storageGlobalParams.dur);
+                    if (showDurStats() && storageGlobalParams.dur)
                         b.append("durStats", dur::stats.curr->_asObj());
                     {
                         bob inf;
@@ -282,6 +277,9 @@ namespace PerfTests {
                         inf.append("os", "win");
 #endif
                         inf.append("git", gitVersion());
+#ifdef MONGO_SSL
+                        inf.append("OpenSSL", openSSLVersion());
+#endif
                         inf.append("boost", BOOST_VERSION);
                         b.append("info", inf.obj());
                     }
@@ -825,14 +823,14 @@ namespace PerfTests {
         if( dontOptimizeOutHopefully ) { 
             throw TestException();
         }
-        log() << "hmmm" << endl;
+        mongo::unittest::log() << "hmmm" << endl;
     }
     void thr2(int n) { 
         if( --n <= 0 ) {
             if( dontOptimizeOutHopefully ) { 
                 throw TestException();
             }
-            log() << "hmmm" << endl;
+            mongo::unittest::log() << "hmmm" << endl;
         }
         Z z;
         try { 
@@ -846,7 +844,7 @@ namespace PerfTests {
             if( dontOptimizeOutHopefully ) { 
                 throw TestException();
             }
-            log() << "hmmm" << endl;
+            mongo::unittest::log() << "hmmm" << endl;
         }
         try { 
             Z z;
@@ -860,7 +858,7 @@ namespace PerfTests {
             if( dontOptimizeOutHopefully ) { 
                 throw TestException();
             }
-            log() << "hmmm" << endl;
+            mongo::unittest::log() << "hmmm" << endl;
         }
         Z z;
         thr4(n-1);
@@ -1213,7 +1211,7 @@ namespace PerfTests {
         for( int i = 0; i < 20; i++ ) {
             sleepmillis(21);
             string fn = "/tmp/t1";
-            MongoMMF f;
+            DurableMappedFile f;
             unsigned long long len = 1 * 1024 * 1024;
             verify( f.create(fn, len, /*sequential*/rand()%2==0) );
             {
@@ -1222,7 +1220,7 @@ namespace PerfTests {
                 // write something to the private view as a test
                 strcpy(p, "hello");
             }
-            if( cmdLine.dur ) {
+            if (storageGlobalParams.dur) {
                 char *w = (char *) f.view_write();
                 strcpy(w + 6, "world");
             }
@@ -1230,6 +1228,108 @@ namespace PerfTests {
             ASSERT( ff.findByPath(fn) );
         }
     }
+
+    class StatusTestBase : public B {
+    public:
+        StatusTestBase()
+            : _message("Some string data that should not fit in a short string optimization") {
+        }
+
+        virtual int howLongMillis() { return 2000; }
+        virtual bool showDurStats() { return false; }
+    protected:
+        NOINLINE_DECL Status doThingOK() const {
+            return Status::OK();
+        }
+
+        NOINLINE_DECL Status doThingNotOK() const{
+            return Status(
+                ErrorCodes::InternalError,
+                _message,
+                42);
+        }
+    private:
+        const std::string _message;
+    };
+
+    class ReturnOKStatus : public StatusTestBase {
+    public:
+        string name() { return "return-ok-status"; }
+        void timed() {
+            doThingOK();
+        }
+    };
+
+    class ReturnNotOKStatus : public StatusTestBase {
+    public:
+        string name() { return "return-not-ok-status"; }
+        void timed() {
+            doThingNotOK();
+        }
+    };
+
+    class CopyOKStatus : public StatusTestBase {
+    public:
+        CopyOKStatus()
+            : _status(doThingOK()) {}
+
+        string name() { return "copy-ok-status"; }
+        void timed() {
+            const Status copy = _status;
+        }
+
+    private:
+        const Status _status;
+    };
+
+    class CopyNotOKStatus : public StatusTestBase {
+    public:
+        CopyNotOKStatus()
+            : _status(doThingNotOK()) {}
+
+        string name() { return "copy-not-ok-status"; }
+        void timed() {
+            const Status copy = _status;
+        }
+
+    private:
+        const Status _status;
+    };
+
+#if __cplusplus >= 201103L
+    class StatusMoveTestBase : public StatusTestBase {
+    public:
+        StatusMoveTestBase(bool ok)
+            : StatusTestBase()
+            , _a(ok ? doThingOK() : doThingNotOK())
+            , _b(_a.isOK() ? Status::OK() : Status(_a.code(), _a.reason().c_str(), _a.location())) {
+        }
+
+        void timed() {
+            Status temp(std::move(_a));
+            _a = std::move(_b);
+            _b = std::move(temp);
+        }
+
+    protected:
+        Status _a;
+        Status _b;
+    };
+
+    class MoveOKStatus : public StatusMoveTestBase  {
+    public:
+        MoveOKStatus()
+            : StatusMoveTestBase(true) {}
+        string name() { return "move-ok-status"; }
+    };
+
+    class MoveNotOKStatus : public StatusMoveTestBase {
+    public:
+        MoveNotOKStatus()
+            : StatusMoveTestBase(false) {}
+        string name() { return "move-not-ok-status"; }
+    };
+#endif
 
     class All : public Suite {
     public:
@@ -1263,7 +1363,23 @@ namespace PerfTests {
                 add< Throw< thr1 > >();
                 add< Throw< thr2 > >();
                 add< Throw< thr3 > >();
+
+#if !defined(__clang__) || !defined(MONGO_OPTIMIZED_BUILD)
+                // clang-3.2 (and earlier?) miscompiles this test when optimization is on (see
+                // SERVER-9767 and SERVER-11183 for additional details, including a link to the
+                // LLVM ticket and LLVM fix).
+                //
+                // Ideally, the test above would also say
+                // || (__clang_major__ > 3) || ((__clang_major__ == 3) && (__clang_minor__ > 2))
+                // so that the test would still run on known good vesrions of clang; see
+                // comments in SERVER-11183 for why that doesn't work.
+                //
+                // TODO: Remove this when we no longer need to support clang-3.2. We should
+                // also consider requiring clang > 3.2 in our configure tests once XCode 5 is
+                // ubiquitious.
                 add< Throw< thr4 > >();
+#endif
+
                 add< Timer >();
                 add< Sleep0Ms >();
 #if defined(__USE_XOPEN2K)
@@ -1305,6 +1421,15 @@ namespace PerfTests {
                 add< FailPointTest<false, false> >();
                 add< FailPointTest<true, false> >();
                 add< FailPointTest<true, true> >();
+
+                add< ReturnOKStatus >();
+                add< ReturnNotOKStatus >();
+                add< CopyOKStatus >();
+                add< CopyNotOKStatus >();
+#if __cplusplus >= 201103L
+                add< MoveOKStatus >();
+                add< MoveNotOKStatus >();
+#endif
             }
         }
     } myall;

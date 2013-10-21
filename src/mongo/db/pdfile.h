@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 /* pdfile.h
@@ -26,13 +38,16 @@
 #pragma once
 
 #include "mongo/db/client.h"
+#include "mongo/db/cursor.h"
+#include "mongo/db/database.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/jsobjmanipulator.h"
 #include "mongo/db/memconcept.h"
-#include "mongo/db/mongommf.h"
-#include "mongo/db/namespace-inl.h"
+#include "mongo/db/storage/data_file.h"
+#include "mongo/db/storage/durable_mapped_file.h"
+#include "mongo/db/storage/extent.h"
 #include "mongo/db/namespace_details-inl.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/pdfile_version.h"
 #include "mongo/platform/cstdint.h"
 #include "mongo/util/log.h"
@@ -50,11 +65,6 @@ namespace mongo {
     void dropDatabase(const std::string& db);
     bool repairDatabase(string db, string &errmsg, bool preserveClonedFilesOnFailure = false, bool backupOriginalFiles = false);
 
-    /* low level - only drops this ns */
-    void dropNS(const string& dropNs);
-
-    /* deletes this ns, indexes and cursors */
-    void dropCollection( const string &name, string &errmsg, BSONObjBuilder &result );
     bool userCreateNS(const char *ns, BSONObj j, string& err, bool logForReplication, bool *deferIdIndex = 0);
     shared_ptr<Cursor> findTableScan(const char *ns, const BSONObj& order, const DiskLoc &startLoc=DiskLoc());
 
@@ -62,69 +72,17 @@ namespace mongo {
 
     /*---------------------------------------------------------------------*/
 
-    class MongoDataFile {
-        friend class DataFileMgr;
-        friend class BasicCursor;
-    public:
-        MongoDataFile(int fn) : _mb(0), fileNo(fn) { }
-
-        /** @return true if found and opened. if uninitialized (prealloc only) does not open. */
-        bool openExisting( const char *filename );
-
-        /** creates if DNE */
-        void open(const char *filename, int requestedDataSize = 0, bool preallocateOnly = false);
-
-        /* allocate a new extent from this datafile.
-           @param capped - true if capped collection
-           @param loops is our recursion check variable - you want to pass in zero
-        */
-        Extent* createExtent(const char *ns, int approxSize, bool capped = false, int loops = 0);
-
-        DataFileHeader *getHeader() { return header(); }
-        HANDLE getFd() { return mmf.getFd(); }
-        unsigned long long length() const { return mmf.length(); }
-
-        /* return max size an extent may be */
-        static int maxSize();
-
-        /** fsync */
-        void flush( bool sync );
-
-        /** only use fore debugging */
-        Extent* debug_getExtent(DiskLoc loc) { return _getExtent( loc ); }
-    private:
-        void badOfs(int) const;
-        void badOfs2(int) const;
-        int defaultSize( const char *filename ) const;
-
-        Extent* getExtent(DiskLoc loc) const;
-        Extent* _getExtent(DiskLoc loc) const;
-        Record* recordAt(DiskLoc dl) const;
-        void grow(DiskLoc dl, int size);
-
-        char* p() const { return (char *) _mb; }
-        DataFileHeader* header() { return (DataFileHeader*) _mb; }
-
-        MongoMMF mmf;
-        void *_mb; // the memory mapped view
-        int fileNo;
-    };
-
     class DataFileMgr {
         friend class BasicCursor;
     public:
         DataFileMgr();
         void init(const string& path );
 
-        /* see if we can find an extent of the right size in the freelist. */
-        static Extent* allocFromFreeList(const char *ns, int approxSize, bool capped = false);
-
         /** @return DiskLoc where item ends up */
         // changedId should be initialized to false
         const DiskLoc updateRecord(
             const char *ns,
-            NamespaceDetails *d,
-            NamespaceDetailsTransient *nsdt,
+            Collection* collection,
             Record *toupdate, const DiskLoc& dl,
             const char *buf, int len, OpDebug& debug, bool god=false);
 
@@ -193,7 +151,7 @@ namespace mongo {
         mongo::mutex _precalcedMutex;
 
     private:
-        vector<MongoDataFile *> files;
+        vector<DataFile *> files;
         SortPhaseOne* _precalced;
     };
 
@@ -260,6 +218,9 @@ namespace mongo {
         const char * data() const { _accessing(); return _data; }
         char * data() { _accessing(); return _data; }
 
+        const char * dataNoThrowing() const { return _data; }
+        char * dataNoThrowing() { return _data; }
+
         int netLength() const { _accessing(); return _netLength(); }
 
         /* use this when a record is deleted. basically a union with next/prev fields */
@@ -270,14 +231,6 @@ namespace mongo {
         /* get the next record in the namespace, traversing extents as necessary */
         DiskLoc getNext(const DiskLoc& myLoc);
         DiskLoc getPrev(const DiskLoc& myLoc);
-
-        DiskLoc nextInExtent(const DiskLoc& myLoc) { 
-            _accessing();
-            if ( _nextOfs == DiskLoc::NullOfs )
-                return DiskLoc();
-            verify( _nextOfs );
-            return DiskLoc(myLoc.a(), _nextOfs);
-        }
 
         struct NP {
             int nextOfs;
@@ -309,8 +262,6 @@ namespace mongo {
         Record* accessed();
 
         static bool likelyInPhysicalMemory( const char* data );
-        
-        static bool blockCheckSupported();
 
         /**
          * this adds stats about page fault exceptions currently
@@ -341,199 +292,16 @@ namespace mongo {
 
         static bool MemoryTrackingEnabled;
     };
-
-    /* extents are datafile regions where all the records within the region
-       belong to the same namespace.
-
-    (11:12:35 AM) dm10gen: when the extent is allocated, all its empty space is stuck into one big DeletedRecord
-    (11:12:55 AM) dm10gen: and that is placed on the free list
-    */
-    class Extent {
-    public:
-        enum { extentSignature = 0x41424344 };
-        unsigned magic;
-        DiskLoc myLoc;
-        DiskLoc xnext, xprev; /* next/prev extent for this namespace */
-
-        /* which namespace this extent is for.  this is just for troubleshooting really
-           and won't even be correct if the collection were renamed!
-        */
-        Namespace nsDiagnostic;
-
-        int length;   /* size of the extent, including these fields */
-        DiskLoc firstRecord;
-        DiskLoc lastRecord;
-        char _extentData[4];
-
-        static int HeaderSize() { return sizeof(Extent)-4; }
-
-        bool validates(const DiskLoc diskLoc, BSONArrayBuilder* errors = NULL);
-
-        BSONObj dump() {
-            return BSON( "loc" << myLoc.toString() << "xnext" << xnext.toString() << "xprev" << xprev.toString()
-                      << "nsdiag" << nsDiagnostic.toString()
-                      << "size" << length << "firstRecord" << firstRecord.toString() << "lastRecord" << lastRecord.toString());
-        }
-
-        void dump(iostream& s) {
-            s << "    loc:" << myLoc.toString() << " xnext:" << xnext.toString() << " xprev:" << xprev.toString() << '\n';
-            s << "    nsdiag:" << nsDiagnostic.toString() << '\n';
-            s << "    size:" << length << " firstRecord:" << firstRecord.toString() << " lastRecord:" << lastRecord.toString() << '\n';
-        }
-
-        /* assumes already zeroed -- insufficient for block 'reuse' perhaps
-        Returns a DeletedRecord location which is the data in the extent ready for us.
-        Caller will need to add that to the freelist structure in namespacedetail.
-        */
-        DiskLoc init(const char *nsname, int _length, int _fileNo, int _offset, bool capped);
-
-        /* like init(), but for a reuse case */
-        DiskLoc reuse(const char *nsname, bool newUseIsAsCapped);
-
-        bool isOk() const { return magic == extentSignature; }
-        void assertOk() const { verify(isOk()); }
-
-        Record* newRecord(int len);
-
-        Record* getRecord(DiskLoc dl) {
-            verify( !dl.isNull() );
-            verify( dl.sameFile(myLoc) );
-            int x = dl.getOfs() - myLoc.getOfs();
-            verify( x > 0 );
-            return (Record *) (((char *) this) + x);
-        }
-
-        Extent* getNextExtent() { return xnext.isNull() ? 0 : DataFileMgr::getExtent(xnext); }
-        Extent* getPrevExtent() { return xprev.isNull() ? 0 : DataFileMgr::getExtent(xprev); }
-
-        static int maxSize();
-        static int minSize() { return 0x1000; }
-        /**
-         * @param len lengt of record we need
-         * @param lastRecord size of last extent which is a factor in next extent size
-         */
-        static int followupSize(int len, int lastExtentLen);
-
-        /** get a suggested size for the first extent in a namespace
-         *  @param len length of record we need to insert
-         */
-        static int initialSize(int len);
-
-        struct FL {
-            DiskLoc firstRecord;
-            DiskLoc lastRecord;
-        };
-        /** often we want to update just the firstRecord and lastRecord fields.
-            this helper is for that -- for use with getDur().writing() method
-        */
-        FL* fl() { return (FL*) &firstRecord; }
-
-        /** caller must declare write intent first */
-        void markEmpty();
-    private:
-        DiskLoc _reuse(const char *nsname, bool newUseIsAsCapped); // recycle an extent and reuse it for a different ns
-    };
-
-    /*  a datafile - i.e. the "dbname.<#>" files :
-
-          ----------------------
-          DataFileHeader
-          ----------------------
-          Extent (for a particular namespace)
-            Record
-            ...
-            Record (some chained for unused space)
-          ----------------------
-          more Extents...
-          ----------------------
-    */
-    class DataFileHeader {
-    public:
-        int version;
-        int versionMinor;
-        int fileLength;
-        DiskLoc unused; /* unused is the portion of the file that doesn't belong to any allocated extents. -1 = no more */
-        int unusedLength;
-        char reserved[8192 - 4*4 - 8];
-
-        char data[4]; // first extent starts here
-
-        enum { HeaderSize = 8192 };
-
-        bool isCurrentVersion() const {
-            return version == PDFILE_VERSION && ( versionMinor == PDFILE_VERSION_MINOR_22_AND_OLDER
-                                               || versionMinor == PDFILE_VERSION_MINOR_24_AND_NEWER
-                                                );
-        }
-
-        bool uninitialized() const { return version == 0; }
-
-        void init(int fileno, int filelength, const char* filename) {
-            if ( uninitialized() ) {
-                DEV log() << "datafileheader::init initializing " << filename << " n:" << fileno << endl;
-                if( !(filelength > 32768 ) ) { 
-                    massert(13640, str::stream() << "DataFileHeader looks corrupt at file open filelength:" << filelength << " fileno:" << fileno, false);
-                }
-
-                { 
-                    // "something" is too vague, but we checked for the right db to be locked higher up the call stack
-                    if( !Lock::somethingWriteLocked() ) { 
-                        LockState::Dump();
-                        log() << "*** TEMP NOT INITIALIZING FILE " << filename << ", not in a write lock." << endl;
-                        log() << "temp bypass until more elaborate change - case that is manifesting is benign anyway" << endl;
-                        return;
-/**
-                        log() << "ERROR can't create outside a write lock" << endl;
-                        printStackTrace();
-                        ::abort();
-**/
-                    }
-                }
-
-                getDur().createdFile(filename, filelength);
-                verify( HeaderSize == 8192 );
-                DataFileHeader *h = getDur().writing(this);
-                h->fileLength = filelength;
-                h->version = PDFILE_VERSION;
-                h->versionMinor = PDFILE_VERSION_MINOR_22_AND_OLDER; // All dbs start like this
-                h->unused.set( fileno, HeaderSize );
-                verify( (data-(char*)this) == HeaderSize );
-                h->unusedLength = fileLength - HeaderSize - 16;
-            }
-        }
-
-        bool isEmpty() const {
-            return uninitialized() || ( unusedLength == fileLength - HeaderSize - 16 );
-        }
-    };
-
 #pragma pack()
 
-    inline Extent* MongoDataFile::_getExtent(DiskLoc loc) const {
-        loc.assertOk();
-        Extent *e = (Extent *) (p()+loc.getOfs());
-        return e;
+    // XXX-ERH
+
+    inline Extent* Extent::getNextExtent() {
+        return xnext.isNull() ? 0 : DataFileMgr::getExtent(xnext);
     }
 
-    inline Extent* MongoDataFile::getExtent(DiskLoc loc) const {
-        Extent *e = _getExtent(loc);
-        e->assertOk();
-        memconcept::is(e, memconcept::concept::extent);
-        return e;
-    }
-
-} // namespace mongo
-
-#include "cursor.h"
-
-namespace mongo {
-
-    inline Record* MongoDataFile::recordAt(DiskLoc dl) const {
-        int ofs = dl.getOfs();
-        if (ofs < DataFileHeader::HeaderSize) {
-            badOfs(ofs); // will uassert - external call to keep out of the normal code path
-        }
-        return reinterpret_cast<Record*>(p() + ofs);
+    inline Extent* Extent::getPrevExtent() {
+        return xprev.isNull() ? 0 : DataFileMgr::getExtent(xprev);
     }
 
     inline DiskLoc Record::getNext(const DiskLoc& myLoc) {
@@ -610,13 +378,6 @@ namespace mongo {
         return (const BtreeBucket<V> *) r->data();
     }
 
-} // namespace mongo
-
-#include "database.h"
-#include "memconcept.h"
-
-namespace mongo {
-
     boost::intmax_t dbSize( const char *database );
 
     inline NamespaceIndex* nsindex(const StringData& ns) {
@@ -625,14 +386,14 @@ namespace mongo {
         memconcept::is(database, memconcept::concept::database, ns, sizeof(Database));
         DEV {
             StringData dbname = nsToDatabaseSubstring( ns );
-            if ( database->name != dbname ) {
+            if ( database->name() != dbname ) {
                 out() << "ERROR: attempt to write to wrong database\n";
                 out() << " ns:" << ns << '\n';
-                out() << " database->name:" << database->name << endl;
-                verify( database->name == dbname );
+                out() << " database->name:" << database->name() << endl;
+                verify( database->name() == dbname );
             }
         }
-        return &database->namespaceIndex;
+        return &database->namespaceIndex();
     }
 
     inline NamespaceDetails* nsdetails(const StringData& ns) {
@@ -646,12 +407,12 @@ namespace mongo {
 
     inline Extent* DataFileMgr::getExtent(const DiskLoc& dl) {
         verify( dl.a() != -1 );
-        return cc().database()->getFile(dl.a())->getExtent(dl);
+        return cc().database()->getExtentManager().getExtent(dl);
     }
 
     inline Record* DataFileMgr::getRecord(const DiskLoc& dl) {
         verify(dl.a() != -1);
-        return cc().database()->getFile(dl.a())->recordAt(dl);
+        return cc().database()->getExtentManager().recordFor( dl );
     }
 
     BOOST_STATIC_ASSERT( 16 == sizeof(DeletedRecord) );

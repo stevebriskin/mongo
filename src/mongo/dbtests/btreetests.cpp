@@ -17,45 +17,33 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
-#include "../db/db.h"
 #include "mongo/db/btree.h"
 #include "mongo/db/btreecursor.h"
+#include "mongo/db/db.h"
 #include "mongo/db/json.h"
-
-#include "dbtests.h"
+#include "mongo/dbtests/dbtests.h"
 
 #define BtreeBucket BtreeBucket<V0>
 #define btree btree<V0>
 #define btreemod btreemod<V0>
-#define Continuation IndexInsertionContinuationImpl<V0>
 #define testName "btree"
 #define BTVERSION 0
 namespace BtreeTests0 {
-#include "btreetests.inl"
+#include "mongo/dbtests/btreetests.inl"
 }
 
 #undef BtreeBucket
 #undef btree
 #undef btreemod
-#undef Continuation
 #define BtreeBucket BtreeBucket<V1>
 #define btree btree<V1>
 #define btreemod btreemod<V1>
-#define Continuation IndexInsertionContinuationImpl<V1>
 #undef testName
 #define testName "btree1"
 #undef BTVERSION
 #define BTVERSION 1
 namespace BtreeTests1 {
-#include "btreetests.inl"
-}
-
-#undef testName
-#define testName "btree1_twostep"
-#define TESTTWOSTEP 1
-
-namespace BtreeTests2 {
-#include "btreetests.inl"
+#include "mongo/dbtests/btreetests.inl"
 }

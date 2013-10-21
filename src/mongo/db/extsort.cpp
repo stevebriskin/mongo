@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -32,26 +44,67 @@
 #include <sys/types.h>
 
 #include "mongo/db/kill_current_op.h"
-#include "mongo/db/namespace-inl.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/platform/posix_fadvise.h"
 #include "mongo/util/file.h"
 
+#if MONGO_USE_NEW_SORTER
 namespace mongo {
 
+    namespace {
+        class OldExtSortComparator {
+        public:
+            typedef pair<BSONObj, DiskLoc> Data;
+
+            OldExtSortComparator(const ExternalSortComparison* comp,
+                                 boost::shared_ptr<const bool> mayInterrupt)
+                : _comp(comp)
+                , _mayInterrupt(mayInterrupt)
+            {}
+
+            int operator() (const Data& l, const Data& r) const {
+                RARELY if (*_mayInterrupt) {
+                    killCurrentOp.checkForInterrupt(!*_mayInterrupt);
+                }
+
+                return _comp->compare(l, r);
+            }
+
+        private:
+            const ExternalSortComparison* _comp;
+            boost::shared_ptr<const bool> _mayInterrupt;
+        };
+    }
+
+    BSONObjExternalSorter::BSONObjExternalSorter(const ExternalSortComparison* comp,
+                                                 long maxFileSize)
+        : _mayInterrupt(boost::make_shared<bool>(false))
+        , _sorter(Sorter<BSONObj, DiskLoc>::make(
+                    SortOptions().TempDir(storageGlobalParams.dbpath + "/_tmp")
+                                 .ExtSortAllowed()
+                                 .MaxMemoryUsageBytes(maxFileSize),
+                    OldExtSortComparator(comp, _mayInterrupt)))
+    {}
+}
+
+#include "mongo/db/sorter/sorter.cpp"
+MONGO_CREATE_SORTER(mongo::BSONObj, mongo::DiskLoc, mongo::OldExtSortComparator);
+
+#else
+
+namespace mongo {
     HLMutex BSONObjExternalSorter::_extSortMutex("s");
-    IndexInterface *BSONObjExternalSorter::extSortIdxInterface;
-    Ordering BSONObjExternalSorter::extSortOrder( Ordering::make(BSONObj()) );
     bool BSONObjExternalSorter::extSortMayInterrupt( false );
     unsigned long long BSONObjExternalSorter::_compares = 0;
     unsigned long long BSONObjExternalSorter::_uniqueNumber = 0;
+    const ExternalSortComparison* BSONObjExternalSorter::staticExtSortCmp = NULL;
     static SimpleMutex _uniqueNumberMutex( "uniqueNumberMutex" );
 
     /*static*/
-    int BSONObjExternalSorter::_compare(IndexInterface& i, const Data& l, const Data& r, const Ordering& order) { 
+    int BSONObjExternalSorter::_compare(const ExternalSortComparison* cmp,
+                                        const ExternalSortDatum& l, const ExternalSortDatum& r) {
         _compares++;
-        int x = i.keyCompare(l.first, r.first, order);
-        if ( x )
-            return x;
-        return l.second.compare( r.second );
+        return cmp->compare(l, r);
     }
 
     /*static*/
@@ -63,18 +116,19 @@ namespace mongo {
         // Some solaris gnu qsort implementations do not support callback exceptions.
         RARELY killCurrentOp.checkForInterrupt(!extSortMayInterrupt);
 #endif
-        Data * l = (Data*)lv;
-        Data * r = (Data*)rv;
-        return _compare(*extSortIdxInterface, *l, *r, extSortOrder);
+        ExternalSortDatum * l = (ExternalSortDatum*)lv;
+        ExternalSortDatum * r = (ExternalSortDatum*)rv;
+        return _compare(staticExtSortCmp, *l, *r);
     };
 
-    BSONObjExternalSorter::BSONObjExternalSorter( IndexInterface &i, const BSONObj & order , long maxFileSize )
-        : _idxi(i), _order( order.getOwned() ) , _maxFilesize( maxFileSize ) ,
-          _arraySize(1000000), _cur(0), _curSizeSoFar(0), _sorted(0) {
+    BSONObjExternalSorter::BSONObjExternalSorter(const ExternalSortComparison* cmp,
+                                                 long maxFileSize )
+        : _cmp(cmp), _maxFilesize(maxFileSize), _arraySize(1000000), _cur(0), _curSizeSoFar(0),
+          _sorted(0) {
 
         stringstream rootpath;
-        rootpath << dbpath;
-        if ( dbpath[dbpath.size()-1] != '/' )
+        rootpath << storageGlobalParams.dbpath;
+        if (storageGlobalParams.dbpath[storageGlobalParams.dbpath.size()-1] != '/')
             rootpath << "/";
 
         unsigned long long thisUniqueNumber;
@@ -105,9 +159,8 @@ namespace mongo {
         // extSortComp needs to use glpbals
         // qsort_r only seems available on bsd, which is what i really want to use
         HLMutex::scoped_lock lk(_extSortMutex);
-        extSortIdxInterface = &_idxi;
-        extSortOrder = Ordering::make(_order);
         extSortMayInterrupt = mayInterrupt;
+        staticExtSortCmp = _cmp;
         _cur->sort( BSONObjExternalSorter::extSortComp );
     }
 
@@ -118,7 +171,8 @@ namespace mongo {
 
         if ( _cur && _files.size() == 0 ) {
             _sortInMem( mayInterrupt );
-            LOG(1) << "\t\t not using file.  size:" << _curSizeSoFar << " _compares:" << _compares << endl;
+            LOG(1) << "\t\t not using file.  size:" << _curSizeSoFar << " _compares:"
+                   << _compares << endl;
             return;
         }
 
@@ -133,7 +187,6 @@ namespace mongo {
 
         if ( _files.size() == 0 )
             return;
-
     }
 
     void BSONObjExternalSorter::add( const BSONObj& o, const DiskLoc& loc, bool mayInterrupt ) {
@@ -143,7 +196,7 @@ namespace mongo {
             _cur = new InMemory( _arraySize );
         }
 
-        Data& d = _cur->getNext();
+        ExternalSortDatum& d = _cur->getNext();
         d.first = o.getOwned();
         d.second = loc;
 
@@ -154,7 +207,6 @@ namespace mongo {
             finishMap( mayInterrupt );
             LOG(1) << "finishing map" << endl;
         }
-
     }
 
     void BSONObjExternalSorter::finishMap( bool mayInterrupt ) {
@@ -170,10 +222,10 @@ namespace mongo {
         ss << _root.string() << "/file." << _files.size();
         string file = ss.str();
 
-        // todo: it may make sense to fadvise that this not be cached so that building the index doesn't 
-        //       eject other things the db is using from the file system cache.  while we will soon be reading 
-        //       this back, if it fit in ram, there wouldn't have been a need for an external sort in the first 
-        //       place.
+        // todo: it may make sense to fadvise that this not be cached so that building the index
+        // doesn't eject other things the db is using from the file system cache.  while we will
+        // soon be reading this back, if it fit in ram, there wouldn't have been a need for an
+        // external sort in the first place.
 
         ofstream out;
         out.open( file.c_str() , ios_base::out | ios_base::binary );
@@ -181,7 +233,7 @@ namespace mongo {
 
         int num = 0;
         for ( InMemory::iterator i=_cur->begin(); i != _cur->end(); ++i ) {
-            Data p = *i;
+            ExternalSortDatum p = *i;
             out.write( p.first.objdata() , p.first.objsize() );
             out.write( (char*)(&p.second) , sizeof( DiskLoc ) );
             num++;
@@ -198,11 +250,12 @@ namespace mongo {
     // ---------------------------------
 
     BSONObjExternalSorter::Iterator::Iterator( BSONObjExternalSorter * sorter ) :
-        _cmp( sorter->_idxi, sorter->_order ) , _in( 0 ) {
+        _cmp( sorter->_cmp), _in(0) {
 
         for ( list<string>::iterator i=sorter->_files.begin(); i!=sorter->_files.end(); i++ ) {
             _files.push_back( new FileIterator( *i ) );
-            _stash.push_back( pair<Data,bool>( Data( BSONObj() , DiskLoc() ) , false ) );
+            _stash.push_back( pair<ExternalSortDatum, bool>(
+                ExternalSortDatum( BSONObj() , DiskLoc() ) , false ) );
         }
 
         if ( _files.size() == 0 && sorter->_cur ) {
@@ -218,35 +271,33 @@ namespace mongo {
     }
 
     bool BSONObjExternalSorter::Iterator::more() {
-
         if ( _in )
             return _it != _in->end();
 
         for ( vector<FileIterator*>::iterator i=_files.begin(); i!=_files.end(); i++ )
             if ( (*i)->more() )
                 return true;
-        for ( vector< pair<Data,bool> >::iterator i=_stash.begin(); i!=_stash.end(); i++ )
-            if ( i->second )
-                return true;
+        for (vector< pair<ExternalSortDatum, bool> >::iterator i=_stash.begin();
+             i!=_stash.end(); i++ ) {
+            if ( i->second ) { return true; }
+        }
         return false;
     }
 
-    BSONObjExternalSorter::Data BSONObjExternalSorter::Iterator::next() {
-
+    ExternalSortDatum BSONObjExternalSorter::Iterator::next() {
         if ( _in ) {
-            Data& d = *_it;
+            ExternalSortDatum& d = *_it;
             ++_it;
             return d;
         }
 
-        Data best;
+        ExternalSortDatum best;
         int slot = -1;
 
         for ( unsigned i=0; i<_stash.size(); i++ ) {
-
             if ( ! _stash[i].second ) {
                 if ( _files[i]->more() )
-                    _stash[i] = pair<Data,bool>( _files[i]->next() , true );
+                    _stash[i] = pair<ExternalSortDatum,bool>( _files[i]->next() , true );
                 else
                     continue;
             }
@@ -255,7 +306,6 @@ namespace mongo {
                 best = _stash[i].first;
                 slot = i;
             }
-
         }
 
         verify( slot >= 0 );
@@ -325,7 +375,7 @@ namespace mongo {
         return true;
     }
     
-    BSONObjExternalSorter::Data BSONObjExternalSorter::FileIterator::next() {
+    ExternalSortDatum BSONObjExternalSorter::FileIterator::next() {
         // read BSONObj
 
         int size;
@@ -349,7 +399,7 @@ namespace mongo {
         _readSoFar += 8 + size;
         
         BSONObj::Holder* h = reinterpret_cast<BSONObj::Holder*>(buf);
-        return Data( BSONObj(h), l );
+        return ExternalSortDatum( BSONObj(h), l );
     }
-
 }
+#endif

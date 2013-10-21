@@ -9,10 +9,9 @@ db = m.getDB( "admin" );
 t = db[ baseName ];
 t.drop();
 
-users = db.getCollection( "system.users" );
-users.remove( {} );
+db.dropAllUsers();
 
-db.addUser( "eliot" , "eliot" );
+db.addUser({user:  "eliot" , pwd: "eliot", roles: jsTest.adminUserRoles});
 
 assert( db.auth( "eliot" , "eliot" ) , "auth failed" );
 

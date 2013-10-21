@@ -22,7 +22,10 @@
 
 #include "mongo/pch.h"
 
+#include <boost/function.hpp>
+
 #include "mongo/db/jsobj.h"
+#include "mongo/logger/log_severity.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/util/net/message.h"
 #include "mongo/util/net/message_port.h"
@@ -500,7 +503,7 @@ namespace mongo {
     /** Typically one uses the QUERY(...) macro to construct a Query object.
         Example: QUERY( "age" << 33 << "school" << "UCLA" )
     */
-#define QUERY(x) mongo::Query( BSON(x) )
+#define QUERY(x) ::mongo::Query( BSON(x) )
 
     // Useful utilities for namespaces
     /** @return the database name portion of an ns string */
@@ -578,9 +581,9 @@ namespace mongo {
         set<string> _seenIndexes;
     public:
         /** controls how chatty the client is about network errors & such.  See log.h */
-        int _logLevel;
+        logger::LogSeverity _logLevel;
 
-        DBClientWithCommands() : _logLevel(0),
+        DBClientWithCommands() : _logLevel(logger::LogSeverity::Log()),
                 _cachedAvailableOptions( (enum QueryOptions)0 ),
                 _haveCachedAvailableOptions(false) { }
 
@@ -615,9 +618,9 @@ namespace mongo {
          * are required depends on the mechanism, which is mandatory.
          *
          *     "mechanism": The string name of the sasl mechanism to use.  Mandatory.
-         *     "user": The string name of the principal to authenticate.  Mandatory.
+         *     "user": The string name of the user to authenticate.  Mandatory.
          *     "userSource": The database target of the auth command, which identifies the location
-         *         of the credential information for the principal.  May be "$external" if
+         *         of the credential information for the user.  May be "$external" if
          *         credential information is stored outside of the mongo cluster.  Mandatory.
          *     "pwd": The password data.
          *     "digestPassword": Boolean, set to true if the "pwd" is undigested (default).
@@ -658,7 +661,7 @@ namespace mongo {
         */
         virtual unsigned long long count(const string &ns, const BSONObj& query = BSONObj(), int options=0, int limit=0, int skip=0 );
 
-        string createPasswordDigest( const string &username , const string &clearTextPassword );
+        static string createPasswordDigest(const string &username, const string &clearTextPassword);
 
         /** returns true in isMaster parm if this db is the current master
            of a replica pair.
@@ -697,7 +700,9 @@ namespace mongo {
                             bool j = false,
                             int w = 0,
                             int wtimeout = 0);
-        // Same as above but defaults to using admin DB
+        /**
+         * Same as the form of getLastError that takes a dbname, but just uses the admin DB.
+         */
         string getLastError(bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
 
         /** Get error result from the last write operation (insert/update/delete) on this connection.
@@ -712,7 +717,9 @@ namespace mongo {
                                              bool j = false,
                                              int w = 0,
                                              int wtimeout = 0);
-        // Same as above but defaults to using admin DB
+        /**
+         * Same as the form of getLastErrorDetailed that takes a dbname, but just uses the admin DB.
+         */
         virtual BSONObj getLastErrorDetailed(bool fsync = false, bool j = false, int w = 0, int wtimeout = 0);
 
         /** Can be called with the returned value from getLastErrorDetailed to extract an error string. 
@@ -980,6 +987,15 @@ namespace mongo {
                           string& errmsg,
                           bool digestPassword);
 
+        /**
+         * Use the MONGODB-X509 protocol to authenticate as "username. The certificate details
+         * has already been communicated automatically as part of the connect call.
+         * Returns false on failure and set "errmsg".
+         */
+        bool _authX509(const string&dbname,
+                            const string &username,
+                            string& errmsg);
+
     private:
         enum QueryOptions _cachedAvailableOptions;
         bool _haveCachedAvailableOptions;
@@ -1082,6 +1098,11 @@ namespace mongo {
 
         virtual bool isFailed() const = 0;
 
+        /**
+         * if not checked recently, checks whether the underlying socket/sockets are still valid
+         */
+        virtual bool isStillConnected() = 0;
+
         virtual void killCursor( long long cursorID ) = 0;
 
         virtual bool callRead( Message& toSend , Message& response ) = 0;
@@ -1119,7 +1140,7 @@ namespace mongo {
            Connect timeout is fixed, but short, at 5 seconds.
          */
         DBClientConnection(bool _autoReconnect=false, DBClientReplicaSet* cp=0, double so_timeout=0) :
-            clientSet(cp), _failed(false), autoReconnect(_autoReconnect), lastReconnectTry(0), _so_timeout(so_timeout) {
+            clientSet(cp), _failed(false), autoReconnect(_autoReconnect), autoReconnectBackoff(1000, 2000), _so_timeout(so_timeout) {
             _numConnections++;
         }
 
@@ -1169,6 +1190,15 @@ namespace mongo {
                 throw ConnectException(string("can't connect ") + errmsg);
         }
 
+        /**
+         * Logs out the connection for the given database.
+         *
+         * @param dbname the database to logout from.
+         * @param info the result object for the logout command (provided for backwards
+         *     compatibility with mongo shell)
+         */
+        virtual void logout(const string& dbname, BSONObj& info);
+
         virtual auto_ptr<DBClientCursor> query(const string &ns, Query query=Query(), int nToReturn = 0, int nToSkip = 0,
                                                const BSONObj *fieldsToReturn = 0, int queryOptions = 0 , int batchSize = 0 ) {
             checkConnection();
@@ -1191,6 +1221,8 @@ namespace mongo {
                    a connection will transition back to an ok state after reconnecting.
          */
         bool isFailed() const { return _failed; }
+
+        bool isStillConnected() { return p ? p->isStillConnected() : true; }
 
         MessagingPort& port() { verify(p); return *p; }
 
@@ -1249,7 +1281,7 @@ namespace mongo {
         boost::scoped_ptr<SockAddr> server;
         bool _failed;
         const bool autoReconnect;
-        time_t lastReconnectTry;
+        Backoff autoReconnectBackoff;
         HostAndPort _server; // remember for reconnects
         string _serverString;
         void _checkConnection();
@@ -1265,7 +1297,7 @@ namespace mongo {
         static bool _lazyKillCursor; // lazy means we piggy back kill cursors on next op
 
 #ifdef MONGO_SSL
-        SSLManager* sslManager();
+        SSLManagerInterface* sslManager();
 #endif
     };
 

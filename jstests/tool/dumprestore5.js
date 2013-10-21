@@ -4,9 +4,9 @@ t = new ToolTest( "dumprestore5" );
 
 t.startDB( "foo" );
 
-db = t.db
+db = t.db.getSiblingDB("admin")
 
-db.addUser('user','password')
+db.addUser({user: 'user',pwd: 'password', roles: jsTest.basicUserRoles});
 
 assert.eq(1, db.system.users.count(), "setup")
 assert.eq(2, db.system.indexes.count(), "setup2")
@@ -24,8 +24,8 @@ assert.soon("db.system.users.findOne()", "no data after restore");
 assert.eq(1, db.system.users.find({user:'user'}).count(), "didn't restore users")
 assert.eq(2, db.system.indexes.count(), "didn't restore indexes")
 
-db.removeUser('user')
-db.addUser('user2', 'password2')
+db.dropUser('user')
+db.addUser({user: 'user2', pwd: 'password2', roles: jsTest.basicUserRoles});
 
 t.runTool("restore", "--dir", t.ext, "--drop")
 

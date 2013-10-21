@@ -13,6 +13,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 
@@ -23,9 +35,11 @@
 #include <string>
 #include <vector>
 
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/commands.h"
@@ -166,16 +180,16 @@ namespace mongo {
 
     CursorCache::~CursorCache() {
         // TODO: delete old cursors?
-        bool print = logLevel > 0;
+        bool print = logger::globalLogDomain()->shouldLog(logger::LogSeverity::Debug(1));
         if ( _cursors.size() || _refs.size() )
             print = true;
         verify(_refs.size() == _refsNS.size());
         
         if ( print ) 
-            cout << " CursorCache at shutdown - "
-                 << " sharded: " << _cursors.size()
-                 << " passthrough: " << _refs.size()
-                 << endl;
+            log() << " CursorCache at shutdown - "
+                  << " sharded: " << _cursors.size()
+                  << " passthrough: " << _refs.size()
+                  << endl;
     }
 
     ShardedClientCursorPtr CursorCache::get( long long id ) const {
@@ -275,7 +289,7 @@ namespace mongo {
         int n = *x++;
 
         if ( n > 2000 ) {
-            LOG( n < 30000 ? LL_WARNING : LL_ERROR ) << "receivedKillCursors, n=" << n << endl;
+            ( n < 30000 ? warning() : error() ) << "receivedKillCursors, n=" << n << endl;
         }
 
 
@@ -283,14 +297,14 @@ namespace mongo {
         uassert( 13287 , "too many cursors to kill" , n < 30000 );
 
         long long * cursors = (long long *)x;
-        AuthorizationManager* authManager =
-                ClientBasic::getCurrent()->getAuthorizationManager();
+        ClientBasic* client = ClientBasic::getCurrent();
+        AuthorizationSession* authSession = client->getAuthorizationSession();
         for ( int i=0; i<n; i++ ) {
             long long id = cursors[i];
             LOG(_myLogLevel) << "CursorCache::gotKillCursors id: " << id << endl;
 
             if ( ! id ) {
-                LOG( LL_WARNING ) << " got cursor id of 0 to kill" << endl;
+                warning() << " got cursor id of 0 to kill" << endl;
                 continue;
             }
 
@@ -300,8 +314,14 @@ namespace mongo {
 
                 MapSharded::iterator i = _cursors.find( id );
                 if ( i != _cursors.end() ) {
-                    if (authManager->checkAuthorization(i->second->getNS(),
-                                                        ActionType::killCursors)) {
+                    const bool isAuthorized = authSession->isAuthorizedForActionsOnNamespace(
+                            NamespaceString(i->second->getNS()), ActionType::killCursors);
+                    audit::logKillCursorsAuthzCheck(
+                            client,
+                            NamespaceString(i->second->getNS()),
+                            id,
+                            isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+                    if (isAuthorized) {
                         _cursors.erase( i );
                     }
                     continue;
@@ -310,11 +330,18 @@ namespace mongo {
                 MapNormal::iterator refsIt = _refs.find(id);
                 MapNormal::iterator refsNSIt = _refsNS.find(id);
                 if (refsIt == _refs.end()) {
-                    LOG( LL_WARNING ) << "can't find cursor: " << id << endl;
+                    warning() << "can't find cursor: " << id << endl;
                     continue;
                 }
                 verify(refsNSIt != _refsNS.end());
-                if (!authManager->checkAuthorization(refsNSIt->second, ActionType::killCursors)) {
+                const bool isAuthorized = authSession->isAuthorizedForActionsOnNamespace(
+                        NamespaceString(refsNSIt->second), ActionType::killCursors);
+                audit::logKillCursorsAuthzCheck(
+                        client,
+                        NamespaceString(refsNSIt->second),
+                        id,
+                        isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+                if (!isAuthorized) {
                     continue;
                 }
                 server = refsIt->second;
@@ -384,7 +411,7 @@ namespace mongo {
                                            std::vector<Privilege>* out) {
             ActionSet actions;
             actions.addAction(ActionType::cursorInfo);
-            out->push_back(Privilege(AuthorizationManager::SERVER_RESOURCE_NAME, actions));
+            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
         }
         virtual LockType locktype() const { return NONE; }
         bool run(const string&, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {

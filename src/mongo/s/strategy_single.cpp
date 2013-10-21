@@ -12,14 +12,28 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 // strategy_simple.cpp
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/audit.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/s/request.h"
 #include "mongo/s/cursors.h"
@@ -38,7 +52,9 @@ namespace mongo {
 
             LOG(3) << "single query: " << q.ns << "  " << q.query << "  ntoreturn: " << q.ntoreturn << " options : " << q.queryOptions << endl;
 
-            verify(r.isCommand()); // Regular queries are handled in strategy_shard.cpp
+            NamespaceString nss( r.getns() );
+            // Regular queries are handled in strategy_shard.cpp
+            verify( nss.isCommand() || nss.isSpecialCommand() );
 
             if ( handleSpecialNamespaces( r , q ) )
                 return;
@@ -118,8 +134,7 @@ namespace mongo {
         }
 
         bool handleSpecialNamespaces( Request& r , QueryMessage& q ) {
-            const char * ns = r.getns();
-            ns = strstr( r.getns() , ".$cmd.sys." );
+            const char * ns = strstr( r.getns() , ".$cmd.sys." );
             if ( ! ns )
                 return false;
             ns += 10;
@@ -127,14 +142,14 @@ namespace mongo {
             BSONObjBuilder b;
             vector<Shard> shards;
 
-            AuthorizationManager* authManager =
-                    ClientBasic::getCurrent()->getAuthorizationManager();
-
+            ClientBasic* client = ClientBasic::getCurrent();
+            AuthorizationSession* authSession = client->getAuthorizationSession();
             if ( strcmp( ns , "inprog" ) == 0 ) {
-                uassert(16545,
-                        "not authorized to run inprog",
-                        authManager->checkAuthorization(AuthorizationManager::SERVER_RESOURCE_NAME,
-                                                        ActionType::inprog));
+                const bool isAuthorized = authSession->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forClusterResource(), ActionType::inprog);
+                audit::logInProgAuthzCheck(
+                        client, q.query, isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+                uassert(ErrorCodes::Unauthorized, "not authorized to run inprog", isAuthorized);
 
                 Shard::getAllShards( shards );
 
@@ -173,10 +188,13 @@ namespace mongo {
                 arr.done();
             }
             else if ( strcmp( ns , "killop" ) == 0 ) {
-                uassert(16546,
-                        "not authorized to run killop",
-                        authManager->checkAuthorization(AuthorizationManager::SERVER_RESOURCE_NAME,
-                                                        ActionType::killop));
+                const bool isAuthorized = authSession->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forClusterResource(), ActionType::killop);
+                audit::logKillOpAuthzCheck(
+                        client,
+                        q.query,
+                        isAuthorized ? ErrorCodes::OK : ErrorCodes::Unauthorized);
+                uassert(ErrorCodes::Unauthorized, "not authorized to run killop", isAuthorized);
 
                 BSONElement e = q.query["op"];
                 if ( e.type() != String ) {
@@ -209,7 +227,7 @@ namespace mongo {
                 b.append( "err" , "can't do unlock through mongos" );
             }
             else {
-                LOG( LL_WARNING ) << "unknown sys command [" << ns << "]" << endl;
+                warning() << "unknown sys command [" << ns << "]" << endl;
                 return false;
             }
 

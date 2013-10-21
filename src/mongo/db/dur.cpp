@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 /*
@@ -55,25 +67,25 @@
      @see https://docs.google.com/drawings/edit?id=1TklsmZzm7ohIZkwgeK6rMvsdaR13KjtJYMsfLr175Zc
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include <boost/thread/thread.hpp>
 
-#include "cmdline.h"
-#include "client.h"
-#include "dur.h"
-#include "dur_journal.h"
-#include "dur_commitjob.h"
-#include "dur_recover.h"
-#include "dur_stats.h"
-#include "../util/concurrency/race.h"
-#include "../util/mongoutils/hash.h"
-#include "../util/mongoutils/str.h"
-#include "../util/timer.h"
-#include "mongo/util/stacktrace.h"
-#include "../server.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/dur.h"
+#include "mongo/db/dur_commitjob.h"
+#include "mongo/db/dur_journal.h"
+#include "mongo/db/dur_recover.h"
+#include "mongo/db/dur_stats.h"
+#include "mongo/db/storage_options.h"
+#include "mongo/server.h"
+#include "mongo/util/concurrency/race.h"
+#include "mongo/util/mongoutils/hash.h"
+#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/stacktrace.h"
+#include "mongo/util/timer.h"
 
 using namespace mongoutils;
 
@@ -150,8 +162,8 @@ namespace mongo {
                              "writeToDataFiles" << (unsigned) (_writeToDataFilesMicros/1000) <<
                              "remapPrivateView" << (unsigned) (_remapPrivateViewMicros/1000)
                            );
-            if( cmdLine.journalCommitInterval != 0 )
-                b << "journalCommitIntervalMs" << cmdLine.journalCommitInterval;
+            if (storageGlobalParams.journalCommitInterval != 0)
+                b << "journalCommitIntervalMs" << storageGlobalParams.journalCommitInterval;
             return b.obj();
         }
 
@@ -338,12 +350,12 @@ namespace mongo {
             static int n;
             ++n;
 
-            verify(debug && cmdLine.dur);
+            verify(debug && storageGlobalParams.dur);
             if (commitJob.writes().empty())
                 return;
             const WriteIntent &i = commitJob.lastWrite();
             size_t ofs;
-            MongoMMF *mmf = privateViews.find(i.start(), ofs);
+            DurableMappedFile *mmf = privateViews.find(i.start(), ofs);
             if( mmf == 0 )
                 return;
             size_t past = ofs + i.length();
@@ -378,8 +390,8 @@ namespace mongo {
         public:
             validateSingleMapMatches(unsigned long long& bytes) :_bytes(bytes)  {}
             void operator () (MongoFile *mf) {
-                if( mf->isMongoMMF() ) {
-                    MongoMMF *mmf = (MongoMMF*) mf;
+                if( mf->isDurableMappedFile() ) {
+                    DurableMappedFile *mmf = (DurableMappedFile*) mf;
                     const unsigned char *p = (const unsigned char *) mmf->getView();
                     const unsigned char *w = (const unsigned char *) mmf->view_write();
 
@@ -437,7 +449,7 @@ namespace mongo {
         /** (SLOW) diagnostic to check that the private view and the non-private view are in sync.
         */
         void debugValidateAllMapsMatch() {
-            if( ! (cmdLine.durOptions & CmdLine::DurParanoid) )
+            if (!(storageGlobalParams.durOptions & StorageGlobalParams::DurParanoid))
                 return;
 
             unsigned long long bytes = 0;
@@ -466,16 +478,18 @@ namespace mongo {
             // remapping.
             unsigned long long now = curTimeMicros64();
             double fraction = (now-lastRemap)/2000000.0;
-            if( cmdLine.durOptions & CmdLine::DurAlwaysRemap )
+            if (storageGlobalParams.durOptions & StorageGlobalParams::DurAlwaysRemap)
                 fraction = 1;
             lastRemap = now;
 
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__sunos__)
             // Note that this negatively affects performance.
-            // We must grab the exclusive lock here because remapThePrivateView() on Windows needs
-            // to grab it as well, due to the lack of a non-atomic way to remap a memory mapped file.
+            // We must grab the exclusive lock here because remapPrivateView() on Windows and
+            // Solaris need to grab it as well, due to the lack of an atomic way to remap a
+            // memory mapped file.
             // See SERVER-5723 for performance improvement.
-            // See SERVER-5680 to see why this code is necessary.
+            // See SERVER-5680 to see why this code is necessary on Windows.
+            // See SERVER-8795 to see why this code is necessary on Solaris.
             LockMongoFilesExclusive lk;
 #else
             LockMongoFilesShared lk;
@@ -513,8 +527,8 @@ namespace mongo {
             Timer t;
             for( unsigned x = 0; x < ntodo; x++ ) {
                 dassert( i != e );
-                if( (*i)->isMongoMMF() ) {
-                    MongoMMF *mmf = (MongoMMF*) *i;
+                if( (*i)->isDurableMappedFile() ) {
+                    DurableMappedFile *mmf = (DurableMappedFile*) *i;
                     verify(mmf);
                     if( mmf->willNeedRemap() ) {
                         mmf->willNeedRemap() = false;
@@ -690,7 +704,7 @@ namespace mongo {
             else {
                 stats.curr->_commitsInWriteLock++;
                 // however, if we are already write locked, we must do it now -- up the call tree someone
-                // may do a write without a new lock acquisition.  this can happen when MongoMMF::close() calls
+                // may do a write without a new lock acquisition.  this can happen when DurableMappedFile::close() calls
                 // this method when a file (and its views) is about to go away.
                 //
                 REMAPPRIVATEVIEW();
@@ -702,7 +716,7 @@ namespace mongo {
             @param lwg set if the durcommitthread *only* -- then we will upgrade the lock 
                    to W so we can remapprivateview. only durcommitthread as more than one 
                    thread upgrading would potentially deadlock
-            @see MongoMMF::close()
+            @see DurableMappedFile::close()
         */
         static void groupCommit(Lock::GlobalWrite *lgw) {
             try {
@@ -732,7 +746,9 @@ namespace mongo {
 
             const int N = 10;
             static int n;
-            if( privateMapBytes < UncommittedBytesLimit && ++n % N && (cmdLine.durOptions&CmdLine::DurAlwaysRemap)==0 ) {
+            if (privateMapBytes < UncommittedBytesLimit && ++n % N &&
+                (storageGlobalParams.durOptions &
+                 StorageGlobalParams::DurAlwaysRemap) == 0) {
                 // limited locks version doesn't do any remapprivateview at all, so only try this if privateMapBytes
                 // is in an acceptable range.  also every Nth commit, we do everything so we can do some remapping;
                 // remapping a lot all at once could cause jitter from a large amount of copy-on-writes all at once.
@@ -749,11 +765,11 @@ namespace mongo {
             groupCommit(&w);
         }
 
-        /** called when a MongoMMF is closing -- we need to go ahead and group commit in that case before its
+        /** called when a DurableMappedFile is closing -- we need to go ahead and group commit in that case before its
             views disappear
         */
         void closingFileNotification() {
-            if (!cmdLine.dur)
+            if (!storageGlobalParams.dur)
                 return;
 
             if( Lock::isLocked() ) {
@@ -775,7 +791,8 @@ namespace mongo {
 
             bool samePartition = true;
             try {
-                const string dbpathDir = boost::filesystem::path(dbpath).string();
+                const std::string dbpathDir =
+                    boost::filesystem::path(storageGlobalParams.dbpath).string();
                 samePartition = onSamePartition(getJournalDir().string(), dbpathDir);
             }
             catch(...) {
@@ -784,7 +801,7 @@ namespace mongo {
             while( !inShutdown() ) {
                 RACECHECK
 
-                unsigned ms = cmdLine.journalCommitInterval;
+                unsigned ms = storageGlobalParams.journalCommitInterval;
                 if( ms == 0 ) { 
                     // use default
                     ms = samePartition ? 100 : 30;
@@ -827,17 +844,17 @@ namespace mongo {
 
         /** at startup, recover, and then start the journal threads */
         void startup() {
-            if( !cmdLine.dur )
+            if (!storageGlobalParams.dur)
                 return;
 
 #if defined(_DURABLEDEFAULTON)
             DEV { 
                 if( time(0) & 1 ) {
-                    cmdLine.durOptions |= CmdLine::DurAlwaysCommit;
+                    storageGlobalParams.durOptions |= StorageGlobalParams::DurAlwaysCommit;
                     log() << "_DEBUG _DURABLEDEFAULTON : forcing DurAlwaysCommit mode for this run" << endl;
                 }
                 if( time(0) & 2 ) {
-                    cmdLine.durOptions |= CmdLine::DurAlwaysRemap;
+                    storageGlobalParams.durOptions |= StorageGlobalParams::DurAlwaysRemap;
                     log() << "_DEBUG _DURABLEDEFAULTON : forcing DurAlwaysRemap mode for this run" << endl;
                 }
             }
@@ -890,7 +907,7 @@ namespace mongo {
             virtual bool includeByDefault() const { return true; }
             
             BSONObj generateSection(const BSONElement& configElement) const {
-                if ( ! cmdLine.dur )
+                if (!storageGlobalParams.dur)
                     return BSONObj();
                 return dur::stats.asObj();
             }

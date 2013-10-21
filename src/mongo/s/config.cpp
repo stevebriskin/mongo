@@ -14,16 +14,26 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "pcrecpp.h"
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
-#include "mongo/client/model.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/pdfile.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/chunk_version.h"
@@ -95,10 +105,16 @@ namespace mongo {
 
         BSONObjBuilder val;
         val.append(CollectionType::ns(), ns);
-        val.appendDate(CollectionType::DEPRECATED_lastmod(), time(0));
+        val.appendDate(CollectionType::DEPRECATED_lastmod(), jsTime());
         val.appendBool(CollectionType::dropped(), _dropped);
-        if ( _cm )
+        if ( _cm ) {
+            // This also appends the lastmodEpoch.
             _cm->getInfo( val );
+        }
+        else {
+            // lastmodEpoch is a required field so we also need to do it here.
+            val.append(CollectionType::DEPRECATED_lastmodEpoch(), ChunkVersion::DROPPED().epoch());
+        }
 
         conn->update(CollectionType::ConfigNS, key, val.obj(), true);
         string err = conn->getLastError();
@@ -171,6 +187,25 @@ namespace mongo {
 
             log() << "enable sharding on: " << ns << " with shard key: " << fieldsAndOrder << endl;
 
+            // Record start in changelog
+            BSONObjBuilder collectionDetail;
+            collectionDetail.append("shardKey", fieldsAndOrder.key());
+            collectionDetail.append("collection", ns);
+            collectionDetail.append("primary", getPrimary().toString());
+            BSONArray a;
+            if (initShards == NULL)
+                a = BSONArray();
+            else {
+                BSONArrayBuilder b;
+                for (unsigned i = 0; i < initShards->size(); i++) {
+                    b.append((*initShards)[i].getName());
+                }
+                a = b.arr();
+            }
+            collectionDetail.append("initShards", a);
+            collectionDetail.append("numChunks", (int)(initPoints->size() + 1));
+            configServer.logChange("shardCollection.start", ns, collectionDetail.obj());
+
             ChunkManager* cm = new ChunkManager( ns, fieldsAndOrder, unique );
             cm->createFirstChunks( configServer.getPrimary().getConnString(),
                                    getPrimary(), initPoints, initShards );
@@ -203,6 +238,11 @@ namespace mongo {
             }
             sleepsecs( i );
         }
+
+        // Record finish in changelog
+        BSONObjBuilder finishDetail;
+        finishDetail.append("version", manager->getVersion().toString());
+        configServer.logChange("shardCollection", ns, finishDetail.obj());
 
         return manager;
     }
@@ -735,7 +775,15 @@ namespace mongo {
         }
 
         for ( set<string>::iterator i=hosts.begin(); i!=hosts.end(); i++ ) {
+
             string host = *i;
+
+            // If this is a CUSTOM connection string (for testing) don't do DNS resolution
+            string errMsg;
+            if ( ConnectionString::parse( host, errMsg ).type() == ConnectionString::CUSTOM ) {
+                continue;
+            }
+
             bool ok = false;
             for ( int x=10; x>0; x-- ) {
                 if ( ! hostbyname( host.c_str() ).empty() ) {
@@ -751,11 +799,38 @@ namespace mongo {
 
         _config = configHosts;
 
+        string errmsg;
+        if( ! checkHostsAreUnique(configHosts, &errmsg) ) {
+            error() << errmsg << endl;;
+            return false;
+        }
+
         string fullString;
         joinStringDelim( configHosts, &fullString, ',' );
         _primary.setAddress( ConnectionString( fullString , ConnectionString::SYNC ) );
         LOG(1) << " config string : " << fullString << endl;
 
+        return true;
+    }
+
+    bool ConfigServer::checkHostsAreUnique( const vector<string>& configHosts, string* errmsg ) {
+
+        //If we have one host, its always unique
+        if ( configHosts.size() == 1 ) {
+            return true;
+        }
+
+        //Compare each host with all other hosts.
+        set<string> hostsTest;
+        pair<set<string>::iterator,bool> ret;
+        for ( size_t x=0; x < configHosts.size(); x++) {
+            ret = hostsTest.insert( configHosts[x] );
+            if ( ret.second == false ) {
+               *errmsg = str::stream() << "config servers " << configHosts[x]
+                                       << " exists twice in config listing.";
+               return false;
+            }
+        }
         return true;
     }
 
@@ -776,7 +851,11 @@ namespace mongo {
             try {
                 conn.reset( new ScopedDbConnection( _config[i], 30.0 ) );
 
-                if ( ! conn->get()->simpleCommand( "config" , &result, "dbhash" ) ) {
+                if ( ! conn->get()->runCommand( "config",
+                                                BSON( "dbhash" << 1 <<
+                                                      "collections" << BSON_ARRAY( "chunks" <<
+                                                                                   "databases" ) ),
+                                                result ) ) {
 
                     // TODO: Make this a helper
                     error = result["errmsg"].eoo() ? "" : result["errmsg"].String();
@@ -819,7 +898,7 @@ namespace mongo {
         }
 
         if ( up == 1 ) {
-            LOG( LL_WARNING ) << "only 1 config server reachable, continuing" << endl;
+            warning() << "only 1 config server reachable, continuing" << endl;
             return true;
         }
 
@@ -839,7 +918,7 @@ namespace mongo {
 
             stringstream ss;
             ss << "config servers " << _config[firstGood] << " and " << _config[i] << " differ";
-            LOG( LL_WARNING ) << ss.str() << endl;
+            warning() << ss.str() << endl;
             if ( tries <= 1 ) {
                 ss << "\n" << c1 << "\t" << c2 << "\n" << d1 << "\t" << d2;
                 errmsg = ss.str();
@@ -859,7 +938,7 @@ namespace mongo {
         if ( checkConsistency ) {
             string errmsg;
             if ( ! checkConfigServersConsistent( errmsg ) ) {
-                LOG( LL_ERROR ) << "could not verify that config servers are in sync" << causedBy(errmsg) << warnings;
+                error() << "could not verify that config servers are in sync" << causedBy(errmsg) << warnings;
                 return false;
             }
         }
@@ -986,7 +1065,7 @@ namespace mongo {
 
         if ( withPort ) {
             stringstream ss;
-            ss << name << ":" << CmdLine::ConfigServerPort;
+            ss << name << ":" << ServerGlobalParams::ConfigServerPort;
             return ss.str();
         }
 

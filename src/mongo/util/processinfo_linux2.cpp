@@ -36,9 +36,9 @@ namespace mongo {
 
     class LinuxProc {
     public:
-        LinuxProc( pid_t pid = getpid() ) {
+        LinuxProc( ProcessId pid ) {
             char name[128];
-            sprintf( name , "/proc/%d/stat"  , pid );
+            sprintf( name , "/proc/%d/stat"  , pid.asUInt32() );
 
             FILE * f = fopen( name , "r");
             if ( ! f ) {
@@ -49,7 +49,7 @@ namespace mongo {
                 msgassertedNoTrace( 13538 , s.c_str() );
             }
             int found = fscanf(f,
-                               "%d %s %c "
+                               "%d %127s %c "
                                "%d %d %d %d %d "
                                "%lu %lu %lu %lu %lu "
                                "%lu %lu %ld %ld "  /* utime stime cutime cstime */
@@ -343,17 +343,21 @@ namespace mongo {
                 // trim whitespace and append 000 to replace kB.
                 while ( isspace( meminfo.at( lineOff ) ) ) lineOff++;
                 meminfo = meminfo.substr( lineOff );
+
+                unsigned long long systemMem = 0;
+                if ( mongo::parseNumberFromString( meminfo, &systemMem ).isOK() )   {
+                    return systemMem * 1024; // convert from kB to bytes
+                }
+                else
+                    log() << "Unable to collect system memory information" << endl;
             }
-            else {
-                meminfo = "";
-            }
-            return atoll(meminfo.c_str()) * 1024;   // convert from kB to bytes
+            return 0;
         }
 
     };
 
 
-    ProcessInfo::ProcessInfo( pid_t pid ) : _pid( pid ) {
+    ProcessInfo::ProcessInfo( ProcessId pid ) : _pid( pid ) {
     }
 
     ProcessInfo::~ProcessInfo() {
@@ -432,8 +436,19 @@ namespace mongo {
     * Determine if the process is running with (cc)NUMA
     */
     bool ProcessInfo::checkNumaEnabled() {
-        if ( boost::filesystem::exists( "/sys/devices/system/node/node1" ) && 
-             boost::filesystem::exists( "/proc/self/numa_maps" ) ) {
+        bool hasMultipleNodes = false;
+        bool hasNumaMaps = false;
+
+        try {
+            hasMultipleNodes = boost::filesystem::exists("/sys/devices/system/node/node1");
+            hasNumaMaps = boost::filesystem::exists("/proc/self/numa_maps");
+        } catch(boost::filesystem::filesystem_error& e) {
+            log() << "WARNING: Cannot detect if NUMA interleaving is enabled. " <<
+                     "Failed to probe \"" << e.path1().string() << "\": " << e.code().message();
+            return false;
+        }
+
+        if ( hasMultipleNodes && hasNumaMaps ) {
             // proc is populated with numa entries
 
             // read the second column of first line to determine numa state

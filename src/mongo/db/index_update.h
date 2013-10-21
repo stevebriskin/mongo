@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
@@ -26,7 +38,8 @@ namespace mongo {
     class Record;
 
     // unindex all keys in index for this record. 
-    void unindexRecord(NamespaceDetails *d, Record *todelete, const DiskLoc& dl, bool noWarn = false);
+    void unindexRecord(NamespaceDetails *d, Record *todelete, const DiskLoc& dl,
+                       bool noWarn = false);
 
     // Build an index in the foreground
     // If background is false, uses fast index builder
@@ -34,66 +47,18 @@ namespace mongo {
     void buildAnIndex(const std::string& ns,
                       NamespaceDetails *d,
                       IndexDetails& idx,
-                      bool background,
                       bool mayInterrupt);
 
     // add index keys for a newly inserted record 
-    // done in two steps/phases to allow potential deferal of write lock portion in the future
-    void indexRecordUsingTwoSteps(const char *ns, NamespaceDetails *d, BSONObj obj,
-                                         DiskLoc loc, bool shouldBeUnlocked);
+    void indexRecord(const char *ns, NamespaceDetails *d, const BSONObj& obj, const DiskLoc &loc);
 
-    // Given an object, populate "inserter" with information necessary to update indexes.
-    void fetchIndexInserters(BSONObjSet & /*out*/keys,
-                             IndexInterface::IndexInserter &inserter,
-                             NamespaceDetails *d,
-                             int idxNo,
-                             const BSONObj& obj,
-                             DiskLoc recordLoc,
-                             const bool allowDups = false);
-
-    bool dropIndexes( NamespaceDetails *d, const char *ns, const char *name, string &errmsg, BSONObjBuilder &anObjBuilder, bool maydeleteIdIndex );
+    bool dropIndexes(NamespaceDetails *d, const StringData& ns, const StringData& name, string &errmsg,
+                     BSONObjBuilder &anObjBuilder, bool maydeleteIdIndex );
 
     /**
      * Add an _id index to namespace @param 'ns' if not already present.
      * @param mayInterrupt When true, killop may interrupt the function call.
      */
     void ensureHaveIdIndex(const char* ns, bool mayInterrupt);
-
-    ////// The remaining functions are only included in this header file for unit testing.
-
-    class BSONObjExternalSorter;
-    class CurOp;
-    class ProgressMeter;
-    class ProgressMeterHolder;
-    struct SortPhaseOne;
-    class Timer;
-
-    /** Extract index keys from the @param 'ns' to the external sorter in @param 'phaseOne'. */
-    void addKeysToPhaseOne( const char* ns,
-                            const IndexDetails& idx,
-                            const BSONObj& order,
-                            SortPhaseOne* phaseOne,
-                            int64_t nrecords,
-                            ProgressMeter* progressMeter,
-                            bool mayInterrupt );
-
-    /** Popuate the index @param 'idx' using the keys contained in @param 'sorter'. */
-    template< class V >
-    void buildBottomUpPhases2And3( bool dupsAllowed,
-                                   IndexDetails& idx,
-                                   BSONObjExternalSorter& sorter,
-                                   bool dropDups,
-                                   set<DiskLoc>& dupsToDrop,
-                                   CurOp* op,
-                                   SortPhaseOne* phase1,
-                                   ProgressMeterHolder& pm,
-                                   Timer& t,
-                                   bool mayInterrupt );
-
-    /** Drop duplicate documents from the set @param 'dupsToDrop'. */
-    void doDropDups( const char* ns,
-                     NamespaceDetails* d,
-                     const set<DiskLoc>& dupsToDrop,
-                     bool mayInterrupt );
 
 } // namespace mongo

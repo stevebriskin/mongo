@@ -15,7 +15,7 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/client/dbclient_rs.h"
 
@@ -31,10 +31,136 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/util/background.h"
+#include "mongo/util/concurrency/mutex.h" // for StaticObserver
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
+
+    /*  Replica Set statics:
+     *      If a program (such as one built with the C++ driver) exits (by either calling exit()
+     *      or by returning from main()), static objects will be destroyed in the reverse order
+     *      of their creation (within each translation unit (source code file)).  This makes it
+     *      vital that the order be explicitly controlled within the source file so that destroyed
+     *      objects never reference objects that have been destroyed earlier.
+     *
+     *      The order chosen below is intended to allow safe destruction in reverse order from
+     *      construction order:
+     *          _setsLock                -- mutex protecting _seedServers and _sets, destroyed last
+     *          _seedServers             -- list (map) of servers
+     *          _sets                    -- list (map) of ReplicaSetMonitors
+     *          replicaSetMonitorWatcher -- background job to check Replica Set members
+     *          staticObserver           -- sentinel to detect process termination
+     *
+     *      Related to:
+     *          SERVER-8891 -- Simple client fail with segmentation fault in mongoclient library
+     */
+    mongo::mutex ReplicaSetMonitor::_setsLock( "ReplicaSetMonitor" );
+    map<string, vector<HostAndPort> > ReplicaSetMonitor::_seedServers;
+    map<string, ReplicaSetMonitorPtr> ReplicaSetMonitor::_sets;
+
+    // global background job responsible for checking every X amount of time
+    class ReplicaSetMonitorWatcher : public BackgroundJob {
+    public:
+        ReplicaSetMonitorWatcher():
+            _monitorMutex("ReplicaSetMonitorWatcher::_safego"),
+            _started(false),
+            _stopRequested(false) {
+        }
+
+        ~ReplicaSetMonitorWatcher() {
+            stop();
+
+            // We relying on the fact that if the monitor was rerun again, wait will not hang
+            // because _destroyingStatics will make the run method exit immediately.
+            dassert(StaticObserver::_destroyingStatics);
+            if (running()) {
+                wait();
+            }
+        }
+
+        virtual string name() const { return "ReplicaSetMonitorWatcher"; }
+
+        void safeGo() {
+            // check outside of lock for speed
+            if ( _started )
+                return;
+
+            scoped_lock lk( _monitorMutex );
+            if ( _started )
+                return;
+
+            _started = true;
+            _stopRequested = false;
+
+            go();
+        }
+
+        /**
+         * Stops monitoring the sets and wait for the monitoring thread to terminate.
+         */
+        void stop() {
+            scoped_lock sl( _monitorMutex );
+            _stopRequested = true;
+            _stopRequestedCV.notify_one();
+        }
+
+    protected:
+        void run() {
+            log() << "starting" << endl;
+
+            // Added only for patching timing problems in test. Remove after tests
+            // are fixed - see 392b933598668768bf12b1e41ad444aa3548d970.
+            // Should not be needed after SERVER-7533 gets implemented and tests start
+            // using it.
+            if (!inShutdown() && !StaticObserver::_destroyingStatics) {
+                scoped_lock sl( _monitorMutex );
+                _stopRequestedCV.timed_wait(sl.boost(), boost::posix_time::seconds(10));
+            }
+
+            while ( !inShutdown() &&
+                    !StaticObserver::_destroyingStatics ) {
+                {
+                    scoped_lock sl( _monitorMutex );
+                    if (_stopRequested) {
+                        break;
+                    }
+                }
+
+                try {
+                    ReplicaSetMonitor::checkAll();
+                }
+                catch ( std::exception& e ) {
+                    error() << "check failed: " << e.what() << endl;
+                }
+                catch ( ... ) {
+                    error() << "unknown error" << endl;
+                }
+
+                scoped_lock sl( _monitorMutex );
+                if (_stopRequested) {
+                    break;
+                }
+
+                _stopRequestedCV.timed_wait(sl.boost(), boost::posix_time::seconds(10));
+            }
+
+            scoped_lock sl( _monitorMutex );
+            _started = false;
+        }
+
+        // protects _started, _stopRequested
+        mongo::mutex _monitorMutex;
+        bool _started;
+
+        boost::condition _stopRequestedCV;
+        bool _stopRequested;
+
+    } replicaSetMonitorWatcher;
+
+    static StaticObserver staticObserver;
+
+
     /*
      * Set of commands that can be used with $readPreference
      */
@@ -154,6 +280,10 @@ namespace mongo {
             }
 
             if (secOnly && !node.okForSecondaryQueries()) {
+                LOG(3) << "dbclient_rs not selecting " << node
+                                  << ", not ok for secondary queries ("
+                                  << ( !node.secondary ? "not secondary" : "hidden" ) << ")"
+                                  << endl;
                 continue;
             }
 
@@ -164,8 +294,8 @@ namespace mongo {
 
                 if (node.isLocalSecondary(localThresholdMillis)) {
                     // found a local node.  return early.
-                    LOG(2) << "dbclient_rs _selectNode found local secondary for queries: "
-                           << nextNodeIndex << ", ping time: " << node.pingTimeMillis << endl;
+                    LOG(2) << "dbclient_rs selecting local secondary " << fallbackHost
+                                      << ", ping time: " << node.pingTimeMillis << endl;
                     *lastHost = fallbackHost;
                     return fallbackHost;
                 }
@@ -174,6 +304,14 @@ namespace mongo {
 
         if (!fallbackHost.empty()) {
             *lastHost = fallbackHost;
+        }
+
+        if ( fallbackHost.empty() ) {
+            LOG(3) << "dbclient_rs no node selected for tag " << readPreferenceTag << endl;
+        }
+        else {
+            LOG(3) << "dbclient_rs node " << fallbackHost << " selected for tag "
+                              << readPreferenceTag << endl;
         }
 
         return fallbackHost;
@@ -260,19 +398,30 @@ namespace mongo {
 
     /**
      * @return the connection associated with the monitor node. Will also attempt
-     *     to establish connection if NULL. Can still return NULL if reconnect failed.
+     *     to establish connection if NULL or broken in background.
+     * Can still return NULL if reconnect failed.
      */
-    shared_ptr<DBClientConnection> _getConnWithRefresh(ReplicaSetMonitor::Node& node) {
-        if (node.conn.get() == NULL) {
-            ConnectionString connStr(node.addr);
+    shared_ptr<DBClientConnection> _getConnWithRefresh( ReplicaSetMonitor::Node& node ) {
+        if ( node.conn.get() == NULL || !node.conn->isStillConnected() ) {
+
+            // Note: This constructor only works with MASTER connections
+            ConnectionString connStr( node.addr );
             string errmsg;
 
             try {
-                node.conn.reset(dynamic_cast<DBClientConnection*>(
-                        connStr.connect(errmsg, ReplicaSetMonitor::SOCKET_TIMEOUT_SECS)));
+                DBClientBase* conn = connStr.connect( errmsg,
+                                                      ReplicaSetMonitor::SOCKET_TIMEOUT_SECS );
+                if ( conn == NULL ) {
+                    node.ok = false;
+                    node.conn.reset();
+                }
+                else {
+                    node.conn.reset( dynamic_cast<DBClientConnection*>( conn ) );
+                }
             }
-            catch (const AssertionException&) {
+            catch ( const AssertionException& ) {
                 node.ok = false;
+                node.conn.reset();
             }
         }
 
@@ -282,47 +431,6 @@ namespace mongo {
     // --------------------------------
     // ----- ReplicaSetMonitor ---------
     // --------------------------------
-
-    // global background job responsible for checking every X amount of time
-    class ReplicaSetMonitorWatcher : public BackgroundJob {
-    public:
-        ReplicaSetMonitorWatcher() : _safego("ReplicaSetMonitorWatcher::_safego") , _started(false) {}
-
-        virtual string name() const { return "ReplicaSetMonitorWatcher"; }
-        
-        void safeGo() {
-            // check outside of lock for speed
-            if ( _started )
-                return;
-            
-            scoped_lock lk( _safego );
-            if ( _started )
-                return;
-            _started = true;
-
-            go();
-        }
-    protected:
-        void run() {
-            log() << "starting" << endl;
-            while ( ! inShutdown() ) {
-                sleepsecs( 10 );
-                try {
-                    ReplicaSetMonitor::checkAll( true );
-                }
-                catch ( std::exception& e ) {
-                    error() << "check failed: " << e.what() << endl;
-                }
-                catch ( ... ) {
-                    error() << "unkown error" << endl;
-                }
-            }
-        }
-
-        mongo::mutex _safego;
-        bool _started;
-
-    } replicaSetMonitorWatcher;
 
     string seedString( const vector<HostAndPort>& servers ){
         string seedStr;
@@ -343,7 +451,8 @@ namespace mongo {
         : _lock( "ReplicaSetMonitor instance" ),
           _checkConnectionLock( "ReplicaSetMonitor check connection lock" ),
           _name( name ), _master(-1),
-          _nextSlave(0), _failedChecks(0), _localThresholdMillis(cmdLine.defaultLocalThresholdMillis) {
+          _nextSlave(0), _failedChecks(0),
+          _localThresholdMillis(serverGlobalParams.defaultLocalThresholdMillis) {
 
         uassert( 13642 , "need at least 1 node for a replica set" , servers.size() > 0 );
 
@@ -364,7 +473,6 @@ namespace mongo {
     // delete ReplicaSetMonitors from ReplicaSetMonitor::remove.
     ReplicaSetMonitor::~ReplicaSetMonitor() {
         scoped_lock lk ( _lock );
-        log() << "deleting replica set monitor for: " << _getServerAddress_inlock() << endl;
         _cacheServerAddresses_inlock();
         pool.removeHost( _getServerAddress_inlock() );
         _nodes.clear();
@@ -418,7 +526,7 @@ namespace mongo {
         }
     }
 
-    void ReplicaSetMonitor::checkAll( bool checkAllSecondaries ) {
+    void ReplicaSetMonitor::checkAll() {
         set<string> seen;
 
         while ( true ) {
@@ -439,7 +547,7 @@ namespace mongo {
             if ( ! m )
                 break;
 
-            m->check( checkAllSecondaries );
+            m->check();
             {
                 scoped_lock lk( _setsLock );
                 if ( m->_failedChecks >= _maxFailedChecks ) {
@@ -526,7 +634,7 @@ namespace mongo {
                 return _nodes[_master].addr;
         }
         
-        _check( false );
+        _check();
 
         scoped_lock lk( _lock );
         uassert( 10009 , str::stream() << "ReplicaSetMonitor no master found for set: " << _name , _master >= 0 );
@@ -620,59 +728,6 @@ namespace mongo {
         int x = _find_inlock( server );
         if ( x >= 0 ) {
             _nodes[x].ok = false;
-        }
-    }
-
-    void ReplicaSetMonitor::_checkStatus( const string& hostAddr ) {
-        BSONObj status;
-
-        /* replSetGetStatus requires admin auth so use a connection from the pool,
-         * and tell it to use the internal credentials.
-         */
-        ScopedDbConnection authenticatedConn(hostAddr, 5.0);
-
-        if ( !authenticatedConn->runCommand( "admin",
-                                             BSON( "replSetGetStatus" << 1 ),
-                                             status )) {
-            LOG(1) << "dbclient_rs replSetGetStatus failed" << status << endl;
-            authenticatedConn.done(); // connection worked properly, but we got an error from server
-            return;
-        }
-
-        // Make sure we return when finished
-        authenticatedConn.done();
-
-        if( !status.hasField("members") ) { 
-            log() << "dbclient_rs error expected members field in replSetGetStatus result" << endl;
-            return;
-        }
-        if( status["members"].type() != Array) {
-            log() << "dbclient_rs error expected members field in replSetGetStatus result to be an array" << endl;
-            return;
-        }
-
-        BSONObjIterator hi(status["members"].Obj());
-        while (hi.more()) {
-            BSONObj member = hi.next().Obj();
-            string host = member["name"].String();
-
-            int m = -1;
-            if ((m = _find(host)) < 0) {
-                LOG(1) << "dbclient_rs _checkStatus couldn't _find(" << host << ')' << endl;
-                continue;
-            }
-
-            double state = member["state"].Number();
-            if (member["health"].Number() == 1 && (state == 1 || state == 2)) {
-                LOG(1) << "dbclient_rs nodes["<<m<<"].ok = true " << host << endl;
-                scoped_lock lk( _lock );
-                _nodes[m].ok = true;
-            }
-            else {
-                LOG(1) << "dbclient_rs nodes["<<m<<"].ok = false " << host << endl;
-                scoped_lock lk( _lock );
-                _nodes[m].ok = false;
-            }
         }
     }
 
@@ -871,6 +926,7 @@ namespace mongo {
                 node.hidden = o["hidden"].trueValue();
                 node.secondary = o["secondary"].trueValue();
                 node.ismaster = o["ismaster"].trueValue();
+                node.ok = node.secondary || node.ismaster;
 
                 node.lastIsMaster = o.copy();
             }
@@ -894,7 +950,6 @@ namespace mongo {
             }
             
             _checkHosts( b.arr(), changed);
-            _checkStatus( conn->getServerAddress() );
 
         }
         catch ( std::exception& e ) {
@@ -919,26 +974,13 @@ namespace mongo {
         return isMaster;
     }
 
-    void ReplicaSetMonitor::_check( bool checkAllSecondaries ) {
+    void ReplicaSetMonitor::_check() {
         LOG(1) <<  "_check : " << getServerAddress() << endl;
 
         int newMaster = -1;
         shared_ptr<DBClientConnection> nodeConn;
 
         for ( int retry = 0; retry < 2; retry++ ) {
-            bool triedQuickCheck = false;
-
-            if ( !checkAllSecondaries ) {
-                scoped_lock lk( _lock );
-                verify(_master < static_cast<int>(_nodes.size()));
-                if ( _master >= 0 && _nodes[_master].ok ) {
-                  /* Nothing else to do since another thread already
-                   * found a usable _master
-                   */
-                  return;
-                }
-            }
-
             for ( unsigned i = 0; /* should not check while outside of lock! */ ; i++ ) {
                 {
                     scoped_lock lk( _lock );
@@ -957,9 +999,6 @@ namespace mongo {
                                   << " changed to " << _nodes[newMaster].addr << endl;
                         }
                         _master = i;
-
-                        if ( !checkAllSecondaries )
-                            return;
                     }
                     else {
                         /*
@@ -967,55 +1006,6 @@ namespace mongo {
                          * _master, so try again.
                          */
                         break;
-                    }
-                }
-
-
-                if ( ! triedQuickCheck && ! maybePrimary.empty() ) {
-                    int probablePrimaryIdx = -1;
-                    shared_ptr<DBClientConnection> probablePrimaryConn;
-
-                    {
-                        scoped_lock lk( _lock );
-                        probablePrimaryIdx = _find_inlock( maybePrimary );
-
-                        if (probablePrimaryIdx >= 0) {
-                            probablePrimaryConn = _getConnWithRefresh(
-                                    _nodes[probablePrimaryIdx]);
-                            if (probablePrimaryConn.get() == NULL) continue;
-                        }
-                    }
-
-                    if ( probablePrimaryIdx >= 0 ) {
-                        triedQuickCheck = true;
-
-                        string dummy;
-                        if ( _checkConnection( probablePrimaryConn.get(), dummy,
-                                false, probablePrimaryIdx ) ) {
-
-                            scoped_lock lk( _lock );
-
-                            if ( _checkConnMatch_inlock( probablePrimaryConn.get(),
-                                                         probablePrimaryIdx )) {
-                              
-
-                                newMaster = probablePrimaryIdx;
-                                if ( newMaster != _master ) {
-                                    log() << "Primary for replica set " << _name << " changed to " << _nodes[newMaster].addr << endl;
-                                }
-                                _master = probablePrimaryIdx;
-
-                                if ( ! checkAllSecondaries )
-                                    return;
-                            }
-                            else {
-                                /*
-                                 * Somebody modified _nodes and most likely set the
-                                 * new _master, so try again.
-                                 */
-                                break;
-                            }
-                        }
                     }
                 }
             }
@@ -1030,26 +1020,27 @@ namespace mongo {
             warning() << "No primary detected for set " << _name << endl;
             scoped_lock lk( _lock );
             _master = -1;
+            bool hasOKNode = false;
 
-            for (vector<Node>::iterator iter = _nodes.begin(); iter < _nodes.end(); ++iter) {
-                iter->ismaster = false;
-            }
-
-            if (checkAllSecondaries) {
-                for ( unsigned i = 0; i < _nodes.size(); i++ ) {
-                    if ( _nodes[i].ok ) {
-                        _failedChecks = 0;
-                        return;
-                    }
+            for ( unsigned i = 0; i < _nodes.size(); i++ ) {
+                _nodes[i].ismaster = false;
+                if ( _nodes[i].ok ) {
+                    hasOKNode = true;
                 }
-                // None of the nodes are ok.
-                _failedChecks++;
-                log() << "All nodes for set " << _name << " are down. This has happened for " << _failedChecks << " checks in a row. Polling will stop after " << _maxFailedChecks - _failedChecks << " more failed checks" << endl;
             }
+            if (hasOKNode) {
+                _failedChecks = 0;
+                return;
+            }
+            // None of the nodes are ok.
+            _failedChecks++;
+            log() << "All nodes for set " << _name << " are down. This has happened for " <<
+                    _failedChecks << " checks in a row. Polling will stop after " <<
+                    _maxFailedChecks - _failedChecks << " more failed checks" << endl;
         }
     }
 
-    void ReplicaSetMonitor::check( bool checkAllSecondaries ) {
+    void ReplicaSetMonitor::check() {
         bool isNodeEmpty = false;
 
         {
@@ -1067,31 +1058,8 @@ namespace mongo {
             return;
         }
 
-        shared_ptr<DBClientConnection> masterConn;
-
-        {
-            scoped_lock lk( _lock );
-
-            // first see if the current master is fine
-            if ( _master >= 0 ) {
-                verify(_master < static_cast<int>(_nodes.size()));
-                masterConn = _getConnWithRefresh(_nodes[_master]);
-            }
-        }
-
-        if ( masterConn.get() != NULL ) {
-            string temp;
-
-            if ( _checkConnection( masterConn.get(), temp, false, _master )) {
-                if ( ! checkAllSecondaries ) {
-                    // current master is fine, so we're done
-                    return;
-                }
-            }
-        }
-
         // we either have no master, or the current is dead
-        _check( checkAllSecondaries );
+        _check();
     }
 
     int ReplicaSetMonitor::_find( const string& server ) const {
@@ -1163,9 +1131,14 @@ namespace mongo {
         }
 
         if (candidate.empty()) {
-            // mimic checkMaster behavior, which refreshes the local view of the replica set
-            _check(false);
 
+            LOG( 3 ) << "dbclient_rs no compatible nodes found, refreshing view of replica set "
+                                << _name << endl;
+
+            // mimic checkMaster behavior, which refreshes the local view of the replica set
+            _check();
+
+            tags->reset();
             scoped_lock lk(_lock);
             return ReplicaSetMonitor::selectNode(_nodes, preference, tags, _localThresholdMillis,
                     &_lastReadPrefHost, isPrimarySelected);
@@ -1322,7 +1295,7 @@ namespace mongo {
         }
 
         // Check everything to get the first data
-        _check(true);
+        _check();
     }
 
     bool ReplicaSetMonitor::isAnyNodeOk() const {
@@ -1336,6 +1309,19 @@ namespace mongo {
         }
 
         return false;
+    }
+
+    void ReplicaSetMonitor::cleanup() {
+        {
+            scoped_lock lock(_setsLock);
+            _sets.clear();
+            _seedServers.clear();
+
+            replicaSetMonitorWatcher.stop();
+        }
+
+        // Join thread outside of _setsLock to avoid deadlock.
+        replicaSetMonitorWatcher.wait();
     }
 
     bool ReplicaSetMonitor::Node::matchesTag(const BSONObj& tag) const {
@@ -1419,9 +1405,6 @@ namespace mongo {
         return builder.obj();
     }
 
-    mongo::mutex ReplicaSetMonitor::_setsLock( "ReplicaSetMonitor" );
-    map<string,ReplicaSetMonitorPtr> ReplicaSetMonitor::_sets;
-    map<string,vector<HostAndPort> > ReplicaSetMonitor::_seedServers;
     ReplicaSetMonitor::ConfigChangeHook ReplicaSetMonitor::_hook;
     int ReplicaSetMonitor::_maxFailedChecks = 30; // At 1 check every 10 seconds, 30 checks takes 5 minutes
 
@@ -1456,6 +1439,30 @@ namespace mongo {
             return str::stream() << _setName << "/" ;
         }
         return rsm->getServerAddress();
+    }
+
+    // A replica set connection is never disconnected, since it controls its own reconnection
+    // logic.
+    //
+    // Has the side effect of proactively clearing any cached connections which have been
+    // disconnected in the background.
+    bool DBClientReplicaSet::isStillConnected() {
+
+        if ( _master && !_master->isStillConnected() ) {
+            _master.reset();
+            _masterHost = HostAndPort();
+            // Don't notify monitor of bg failure, since it's not clear how long ago it happened
+        }
+
+        if ( _lastSlaveOkConn && !_lastSlaveOkConn->isStillConnected() ) {
+            _lastSlaveOkConn.reset();
+            _lastSlaveOkHost = HostAndPort();
+            // Reset read pref too, since we're re-selecting the slaveOk host anyway
+            _lastReadPref.reset();
+            // Don't notify monitor of bg failure, since it's not clear how long ago it happened
+        }
+
+        return true;
     }
 
     DBClientConnection * DBClientReplicaSet::checkMaster() {
@@ -1523,8 +1530,8 @@ namespace mongo {
             }
             catch (const UserException&) {
                 warning() << "cached auth failed for set: " << _setName <<
-                    " db: " << i->second[saslCommandPrincipalSourceFieldName].str() <<
-                    " user: " << i->second[saslCommandPrincipalFieldName].str() << endl;
+                    " db: " << i->second[saslCommandUserSourceFieldName].str() <<
+                    " user: " << i->second[saslCommandUserFieldName].str() << endl;
             }
         }
     }
@@ -1564,17 +1571,19 @@ namespace mongo {
             try {
                 _lastSlaveOkConn->auth(params);
             }
-            catch (const DBException&) {
-                /* Swallow exception. _lastSlaveOkConn is now in failed state.
-                 * The next time we create a new secondary connection it will
-                 * be authenticated with the credentials from _auths.
-                 */
-                verify(_lastSlaveOkConn->isFailed());
+            catch (const DBException& ex) {
+                LOG(1) << "Failed to authenticate secondary, clearing cached connection: "
+                       << causedBy(ex) << endl;
+                // We need to clear the cached connection because it will not match the set
+                // of cached username/pwd. Anything can be wrong here: user was removed in between
+                // authenticating to primary and secondary, user not yet replicated to secondary,
+                // secondary connection failed, etc.
+                invalidateLastSlaveOkCache();
             }
         }
 
         // now that it does, we should save so that for a new node we can auth
-        _auths[params[saslCommandPrincipalSourceFieldName].str()] = params.getOwned();
+        _auths[params[saslCommandUserSourceFieldName].str()] = params.getOwned();
     }
 
     void DBClientReplicaSet::logout(const string &dbname, BSONObj& info) {
@@ -1624,8 +1633,20 @@ namespace mongo {
                                                        const BSONObj *fieldsToReturn,
                                                        int queryOptions,
                                                        int batchSize) {
-        if (_isQueryOkToSecondary(ns, queryOptions, query.obj)) {
+
+        if ( _isQueryOkToSecondary( ns, queryOptions, query.obj ) ) {
+
             shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(query.obj));
+
+            LOG( 3 ) << "dbclient_rs query using secondary or tagged node selection in "
+                                << _getMonitor()->getName() << ", read pref is "
+                                << readPref->toBSON() << " (primary : "
+                                << ( _master.get() != NULL ?
+                                        _master->getServerAddress() : "[not cached]" )
+                                << ", lastTagged : "
+                                << ( _lastSlaveOkConn.get() != NULL ?
+                                        _lastSlaveOkConn->getServerAddress() : "[not cached]" )
+                                << ")" << endl;
 
             for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                 try {
@@ -1642,15 +1663,18 @@ namespace mongo {
                     return checkSlaveQueryResult(cursor);
                 }
                 catch (const DBException &dbExcep) {
-                    LOG(1) << "can't query replica set slave " << _lastSlaveOkHost
+                    LOG(1) << "can't query replica set node " << _lastSlaveOkHost
                            << ": " << causedBy(dbExcep) << endl;
                     invalidateLastSlaveOkCache();
                 }
             }
 
-            uasserted(16370, str::stream() << "Failed to do query, no good nodes in "
-                        << _getMonitor()->getName());
+            uasserted( 16370,
+                       str::stream() << "Failed to do query, no good nodes in "
+                               << _getMonitor()->getName() );
         }
+
+        LOG( 3 ) << "dbclient_rs query to primary node in " << _getMonitor()->getName() << endl;
 
         return checkMaster()->query(ns, query, nToReturn, nToSkip, fieldsToReturn,
                 queryOptions, batchSize);
@@ -1661,7 +1685,18 @@ namespace mongo {
                                         const BSONObj *fieldsToReturn,
                                         int queryOptions) {
         if (_isQueryOkToSecondary(ns, queryOptions, query.obj)) {
+
             shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(query.obj));
+
+            LOG( 3 ) << "dbclient_rs findOne using secondary or tagged node selection in "
+                                << _getMonitor()->getName() << ", read pref is "
+                                << readPref->toBSON() << " (primary : "
+                                << ( _master.get() != NULL ?
+                                        _master->getServerAddress() : "[not cached]" )
+                                << ", lastTagged : "
+                                << ( _lastSlaveOkConn.get() != NULL ?
+                                        _lastSlaveOkConn->getServerAddress() : "[not cached]" )
+                                << ")" << endl;
 
             for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                 try {
@@ -1673,9 +1708,9 @@ namespace mongo {
 
                     return conn->findOne(ns,query,fieldsToReturn,queryOptions);
                 }
-                catch (const DBException &dbExcep) {
-                    LOG(1) << "can't findone replica set slave " << _lastSlaveOkHost
-                           << ": " << causedBy(dbExcep) << endl;
+                catch ( const DBException &dbExcep ) {
+                    LOG(1) << "can't findone replica set node " << _lastSlaveOkHost << ": "
+                                      << causedBy( dbExcep ) << endl;
                     invalidateLastSlaveOkCache();
                 }
             }
@@ -1683,6 +1718,9 @@ namespace mongo {
             uasserted(16379, str::stream() << "Failed to call findOne, no good nodes in "
                         << _getMonitor()->getName());
         }
+
+        LOG( 3 ) << "dbclient_rs findOne to primary node in " << _getMonitor()->getName()
+                            << endl;
 
         return checkMaster()->findOne(ns,query,fieldsToReturn,queryOptions);
     }
@@ -1717,7 +1755,8 @@ namespace mongo {
 
         // If the error code here ever changes, we need to change this code also
         BSONElement code = error["code"];
-        if( code.isNumber() && code.Int() == 13436 /* not master or secondary */ ){
+        if( code.isNumber() &&
+            code.Int() == NotMasterOrSecondaryCode /* not master or secondary */ ) {
             isntSecondary();
             throw DBException( str::stream() << "slave " << _lastSlaveOkHost.toString()
                     << " is no longer secondary", 14812 );
@@ -1736,6 +1775,10 @@ namespace mongo {
     DBClientConnection* DBClientReplicaSet::selectNodeUsingTags(
             shared_ptr<ReadPreferenceSetting> readPref) {
         if (checkLastHost(readPref.get())) {
+
+            LOG( 3 ) << "dbclient_rs selecting compatible last used node " << _lastSlaveOkHost
+                                << endl;
+
             return _lastSlaveOkConn.get();
         }
 
@@ -1745,6 +1788,9 @@ namespace mongo {
                 &isPrimarySelected);
 
         if ( _lastSlaveOkHost.empty() ){
+
+            LOG( 3 ) << "dbclient_rs no compatible node found" << endl;
+
             return NULL;
         }
 
@@ -1758,6 +1804,9 @@ namespace mongo {
             checkMaster();
             _lastSlaveOkConn = _master;
             _lastSlaveOkHost = _masterHost; // implied, but still assign just to be safe
+
+            LOG( 3 ) << "dbclient_rs selecting primary node " << _lastSlaveOkHost << endl;
+
             return _master.get();
         }
 
@@ -1771,14 +1820,16 @@ namespace mongo {
 
         // Assert here instead of returning NULL since the contract of this method is such
         // that returning NULL means none of the nodes were good, which is not the case here.
-        uassert(16532, str::stream() << "Failed to connect to "
-                << _lastSlaveOkHost.toString(true),
+        uassert(16532, str::stream() << "Failed to connect to " << _lastSlaveOkHost.toString(),
                 newConn != NULL);
 
         _lastSlaveOkConn.reset(newConn);
         _lastSlaveOkConn->setReplSetClientCallback(this);
 
         _auth(_lastSlaveOkConn.get());
+
+        LOG( 3 ) << "dbclient_rs selecting node " << _lastSlaveOkHost << endl;
+
         return _lastSlaveOkConn.get();
     }
 
@@ -1797,7 +1848,18 @@ namespace mongo {
 
             const bool slaveOk = qm.queryOptions & QueryOption_SlaveOk;
             if (_isQueryOkToSecondary(qm.ns, qm.queryOptions, qm.query)) {
+
                 shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(qm.query));
+
+                LOG( 3 ) << "dbclient_rs say using secondary or tagged node selection in "
+                                    << _getMonitor()->getName() << ", read pref is "
+                                    << readPref->toBSON() << " (primary : "
+                                    << ( _master.get() != NULL ?
+                                            _master->getServerAddress() : "[not cached]" )
+                                    << ", lastTagged : "
+                                    << ( _lastSlaveOkConn.get() != NULL ?
+                                            _lastSlaveOkConn->getServerAddress() : "[not cached]" )
+                                    << ")" << endl;
 
                 for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                     _lazyState._retries = retry;
@@ -1818,9 +1880,9 @@ namespace mongo {
                         _lazyState._slaveOk = slaveOk;
                         _lazyState._lastClient = conn;
                     }
-                    catch (const DBException& DBExcep) {
-                        LOG(1) << "can't callLazy replica set slave " << _lastSlaveOkHost
-                                << ": " << causedBy(DBExcep) << endl;
+                    catch ( const DBException& DBExcep ) {
+                        LOG(1) << "can't callLazy replica set node " << _lastSlaveOkHost << ": "
+                                          << causedBy( DBExcep ) << endl;
                         invalidateLastSlaveOkCache();
                         continue;
                     }
@@ -1832,6 +1894,9 @@ namespace mongo {
                          << _getMonitor()->getName());
             }
         }
+
+        LOG( 3 ) << "dbclient_rs say to primary node in " << _getMonitor()->getName()
+                            << endl;
 
         DBClientConnection* master = checkMaster();
         if (actualServer)
@@ -1856,7 +1921,7 @@ namespace mongo {
             return _lazyState._lastClient->recv( m );
         }
         catch( DBException& e ){
-            log() << "could not receive data from " << _lazyState._lastClient << causedBy( e ) << endl;
+            log() << "could not receive data from " << _lazyState._lastClient->toString() << causedBy( e ) << endl;
             return false;
         }
     }
@@ -1887,7 +1952,8 @@ namespace mongo {
 
             // Check the error code for a slave not secondary error
             if( nReturned == -1 ||
-                ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo() && dataObj["code"].Int() == 13436 ) ){
+                ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo()
+                  && dataObj["code"].Int() == NotMasterOrSecondaryCode ) ){
 
                 bool wasMaster = false;
                 if( _lazyState._lastClient == _lastSlaveOkConn.get() ){
@@ -1916,7 +1982,8 @@ namespace mongo {
             // slaveOk is not set, just mark the master as bad
 
             if( nReturned == -1 ||
-               ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo() && dataObj["code"].Int() == 13435 ) )
+               ( hasErrField( dataObj ) &&  ! dataObj["code"].eoo()
+                 && dataObj["code"].Int() == NotMasterNoSlaveOkCode ) )
             {
                 if( _lazyState._lastClient == _master.get() ){
                     isntMaster();
@@ -1939,7 +2006,18 @@ namespace mongo {
             ns = qm.ns;
 
             if (_isQueryOkToSecondary(ns, qm.queryOptions, qm.query)) {
+
                 shared_ptr<ReadPreferenceSetting> readPref(_extractReadPref(qm.query));
+
+                LOG( 3 ) << "dbclient_rs call using secondary or tagged node selection in "
+                                    << _getMonitor()->getName() << ", read pref is "
+                                    << readPref->toBSON() << " (primary : "
+                                    << ( _master.get() != NULL ?
+                                            _master->getServerAddress() : "[not cached]" )
+                                    << ", lastTagged : "
+                                    << ( _lastSlaveOkConn.get() != NULL ?
+                                            _lastSlaveOkConn->getServerAddress() : "[not cached]" )
+                                    << ")" << endl;
 
                 for (size_t retry = 0; retry < MAX_RETRY; retry++) {
                     try {
@@ -1955,12 +2033,11 @@ namespace mongo {
 
                         return conn->call(toSend, response, assertOk);
                     }
-                    catch (const DBException& dbExcep) {
-                        LOG(1) << "can't call replica set slave " << _lastSlaveOkHost
-                               << ": " << causedBy(dbExcep) << endl;
+                    catch ( const DBException& dbExcep ) {
+                        LOG(1) << "can't call replica set node " << _lastSlaveOkHost << ": "
+                                          << causedBy( dbExcep ) << endl;
 
-                        if (actualServer)
-                            *actualServer = "";
+                        if ( actualServer ) *actualServer = "";
 
                         invalidateLastSlaveOkCache();
                     }
@@ -1971,6 +2048,8 @@ namespace mongo {
             }
         }
         
+        LOG( 3 ) << "dbclient_rs call to primary node in " << _getMonitor()->getName() << endl;
+
         DBClientConnection* m = checkMaster();
         if ( actualServer )
             *actualServer = m->getServerAddress();
@@ -2006,32 +2085,40 @@ namespace mongo {
         _lastSlaveOkConn.reset();
     }
 
-    TagSet::TagSet() : _isExhausted(true), _tagIterator(_tags) {
+    TagSet::TagSet():
+            _isExhausted(true),
+            _tagIterator(new BSONArrayIteratorSorted(_tags)) {
     }
 
     TagSet::TagSet(const TagSet& other) :
             _isExhausted(false),
             _tags(other._tags.getOwned()),
-            _tagIterator(_tags) {
+            _tagIterator(new BSONArrayIteratorSorted(_tags)) {
         next();
     }
 
     TagSet::TagSet(const BSONArray& tags) :
             _isExhausted(false),
             _tags(tags.getOwned()),
-            _tagIterator(_tags) {
+            _tagIterator(new BSONArrayIteratorSorted(_tags)) {
         next();
     }
 
     void TagSet::next() {
-        if (_tagIterator.more()) {
-            const BSONElement& nextTag = _tagIterator.next();
+        if (_tagIterator->more()) {
+            const BSONElement& nextTag = _tagIterator->next();
             uassert(16357, "Tags should be a BSON object", nextTag.isABSONObj());
             _currentTag = nextTag.Obj();
         }
         else {
             _isExhausted = true;
         }
+    }
+
+    void TagSet::reset() {
+        _isExhausted = false;
+        _tagIterator.reset(new BSONArrayIteratorSorted(_tags));
+        next();
     }
 
     const BSONObj& TagSet::getCurrentTag() const {
@@ -2049,5 +2136,33 @@ namespace mongo {
 
     bool TagSet::equals(const TagSet& other) const {
         return _tags.equal(other._tags);
+    }
+
+    const BSONArray& TagSet::getTagBSON() const {
+        return _tags;
+    }
+
+    string readPrefToString( ReadPreference pref ) {
+        switch ( pref ) {
+        case ReadPreference_PrimaryOnly:
+            return "primary only";
+        case ReadPreference_PrimaryPreferred:
+            return "primary pref";
+        case ReadPreference_SecondaryOnly:
+            return "secondary only";
+        case ReadPreference_SecondaryPreferred:
+            return "secondary pref";
+        case ReadPreference_Nearest:
+            return "nearest";
+        default:
+            return "Unknown";
+        }
+    }
+
+    BSONObj ReadPreferenceSetting::toBSON() const {
+        BSONObjBuilder bob;
+        bob.append( "pref", readPrefToString( pref ) );
+        bob.append( "tags", tags.getTagBSON() );
+        return bob.obj();
     }
 }

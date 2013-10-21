@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include "mongo/s/cluster_client_internal.h"
@@ -20,7 +32,7 @@
 #include <vector>
 
 #include "mongo/client/connpool.h"
-#include "mongo/s/field_parser.h"
+#include "mongo/db/field_parser.h"
 #include "mongo/s/type_changelog.h"
 #include "mongo/s/type_mongos.h"
 #include "mongo/s/type_shard.h"
@@ -163,18 +175,18 @@ namespace mongo {
                 scoped_ptr<ScopedDbConnection> serverConnPtr;
 
                 bool resultOk;
-                BSONObj serverStatus;
+                BSONObj buildInfo;
 
                 try {
                     serverConnPtr.reset(new ScopedDbConnection(serverLoc, 30));
                     ScopedDbConnection& serverConn = *serverConnPtr;
 
                     resultOk = serverConn->runCommand("admin",
-                                                      BSON("serverStatus" << 1),
-                                                      serverStatus);
+                                                      BSON("buildInfo" << 1),
+                                                      buildInfo);
                 }
                 catch (const DBException& e) {
-                    warning() << "could not run server status command on " << serverLoc.toString()
+                    warning() << "could not run buildInfo command on " << serverLoc.toString()
                               << causedBy(e) << ", you must manually verify this mongo server is "
                               << "offline (for at least 5 minutes) or of a version >= 2.2" << endl;
                     continue;
@@ -183,14 +195,14 @@ namespace mongo {
                 // TODO: Make running commands saner such that we can consolidate error handling
                 if (!resultOk) {
                     return Status(ErrorCodes::UnknownError,
-                                  stream() << DBClientConnection::getLastErrorString(serverStatus)
-                                           << causedBy(serverStatus.toString()));
+                                  stream() << DBClientConnection::getLastErrorString(buildInfo)
+                                           << causedBy(buildInfo.toString()));
                 }
 
                 serverConnPtr->done();
 
-                verify(serverStatus["version"].type() == String);
-                string mongoVersion = serverStatus["version"].String();
+                verify(buildInfo["version"].type() == String);
+                string mongoVersion = buildInfo["version"].String();
 
                 if (versionCmp(mongoVersion, minMongoVersion) < 0) {
                     return Status(ErrorCodes::RemoteValidationError,
@@ -224,7 +236,7 @@ namespace mongo {
                 // Replace with unique_ptr (also owned ptr map goes away)
                 auto_ptr<CollectionType> coll(new CollectionType());
                 string errMsg;
-                coll->parseBSON(collDoc, &errMsg);
+                bool parseOk = coll->parseBSON(collDoc, &errMsg);
 
                 // Needed for the v3 to v4 upgrade
                 bool epochNotSet = !coll->isEpochSet() || !coll->getEpoch().isSet();
@@ -233,7 +245,7 @@ namespace mongo {
                     coll->setEpoch(OID::gen());
                 }
 
-                if (errMsg != "" || !coll->isValid(&errMsg)) {
+                if (!parseOk || !coll->isValid(&errMsg)) {
                     return Status(ErrorCodes::UnsupportedFormat,
                                   stream() << "invalid collection " << collDoc
                                            << " read from the config server" << causedBy(errMsg));

@@ -16,47 +16,30 @@
 
 #include "mongo/pch.h"
 
-#include <boost/program_options.hpp>
 #include <fstream>
 #include <iostream>
 
-#include "mongo/base/initializer.h"
 #include "mongo/db/json.h"
-#include "mongo/tools/tool.h"
 #include "mongo/tools/stat_util.h"
-#include "mongo/util/text.h"
-
-namespace po = boost::program_options;
+#include "mongo/tools/mongotop_options.h"
+#include "mongo/tools/tool.h"
+#include "mongo/util/options_parser/option_section.h"
 
 namespace mongo {
 
     class TopTool : public Tool {
     public:
 
-        TopTool() : Tool( "top" , REMOTE_SERVER , "admin" ) {
-            _sleep = 1;
-
-            add_hidden_options()
-            ( "sleep" , po::value<int>() , "time to sleep between calls" )
-            ;
-            add_options()
-            ( "locks" , "use db lock info instead of top" )
-            ;
-            addPositionArg( "sleep" , 1 );
-
+        TopTool() : Tool() {
             _autoreconnect = true;
         }
 
-        virtual void printExtraHelp( ostream & out ) {
-            out << "View live MongoDB collection statistics.\n" << endl;
-        }
-        
-        bool useLocks() {
-            return hasParam( "locks" );
+        virtual void printHelp( ostream & out ) {
+            printMongoTopHelp(&out);
         }
 
         NamespaceStats getData() {
-            if ( useLocks() )
+            if (mongoTopGlobalParams.useLocks)
                 return getDataLocks();
             return getDataTop();
         }
@@ -64,8 +47,8 @@ namespace mongo {
         NamespaceStats getDataLocks() {
 
             BSONObj out;
-            if ( ! conn().simpleCommand( _db , &out , "serverStatus" ) ) {
-                cout << "error: " << out << endl;
+            if (!conn().simpleCommand(toolGlobalParams.db, &out, "serverStatus")) {
+                toolError() << "error: " << out << std::endl;
                 return NamespaceStats();
             }
 
@@ -76,13 +59,13 @@ namespace mongo {
             NamespaceStats stats;
 
             BSONObj out;
-            if ( ! conn().simpleCommand( _db , &out , "top" ) ) {
-                cout << "error: " << out << endl;
+            if (!conn().simpleCommand(toolGlobalParams.db, &out, "top")) {
+                toolError() << "error: " << out << std::endl;
                 return stats;
             }
 
             if ( ! out["totals"].isABSONObj() ) {
-                cout << "error: invalid top\n" << out << endl;
+                toolError() << "error: invalid top\n" << out << std::endl;
                 return stats;
             }
 
@@ -116,7 +99,7 @@ namespace mongo {
             for ( unsigned i=0; i < data.size(); i++ ) {
                 const string& ns = data[i].ns;
 
-                if ( ! useLocks() && ns.find( '.' ) == string::npos )
+                if (!mongoTopGlobalParams.useLocks && ns.find('.') == string::npos)
                     continue;
 
                 if ( ns.size() > longest )
@@ -126,7 +109,7 @@ namespace mongo {
             int numberWidth = 10;
 
             cout << "\n"
-                 << setw(longest) << ( useLocks() ? "db" : "ns" )
+                 << setw(longest) << (mongoTopGlobalParams.useLocks ? "db" : "ns")
                  << setw(numberWidth+2) << "total"
                  << setw(numberWidth+2) << "read"
                  << setw(numberWidth+2) << "write"
@@ -134,7 +117,7 @@ namespace mongo {
                  << endl;
             for ( int i=data.size()-1; i>=0 && data.size() - i < 10 ; i-- ) {
                 
-                if ( ! useLocks() && data[i].ns.find( '.' ) == string::npos )
+                if (!mongoTopGlobalParams.useLocks && data[i].ns.find('.') == string::npos)
                     continue;
 
                 cout << setw(longest) << data[i].ns 
@@ -147,24 +130,22 @@ namespace mongo {
         }
 
         int run() {
-            _sleep = getParam( "sleep" , _sleep );
-
             if (isMongos()) {
-                log() << "mongotop only works on instances of mongod." << endl;
+                toolError() << "mongotop only works on instances of mongod." << std::endl;
                 return EXIT_FAILURE;
             }
 
             NamespaceStats prev = getData();
 
             while ( true ) {
-                sleepsecs( _sleep );
+                sleepsecs(mongoTopGlobalParams.sleep);
                 
                 NamespaceStats now;
                 try {
                     now = getData();
                 }
                 catch ( std::exception& e ) {
-                    cout << "can't get data: " << e.what() << endl;
+                    toolError() << "can't get data: " << e.what() << std::endl;
                     continue;
                 }
 
@@ -175,7 +156,7 @@ namespace mongo {
                     printDiff( prev , now );
                 }
                 catch ( AssertionException& e ) {
-                    cout << "\nerror: " << e.what() << endl;
+                    toolError() << "\nerror: " << e.what() << std::endl;
                 }
 
                 prev = now;
@@ -183,33 +164,8 @@ namespace mongo {
 
             return 0;
         }
-
-    private:
-        int _sleep;
     };
 
-}
+    REGISTER_MONGO_TOOL(TopTool);
 
-int toolMain( int argc , char ** argv, char ** envp ) {
-    mongo::runGlobalInitializersOrDie(argc, argv, envp);
-    mongo::TopTool top;
-    return top.main( argc , argv );
 }
-
-#if defined(_WIN32)
-// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
-// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
-// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
-// and makes them available through the argv() and envp() members.  This enables toolMain()
-// to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    mongo::WindowsCommandLine wcl(argc, argvW, envpW);
-    int exitCode = toolMain(argc, wcl.argv(), wcl.envp());
-    ::_exit(exitCode);
-}
-#else
-int main(int argc, char* argv[], char** envp) {
-    int exitCode = toolMain(argc, argv, envp);
-    ::_exit(exitCode);
-}
-#endif

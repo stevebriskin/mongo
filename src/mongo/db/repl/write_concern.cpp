@@ -12,15 +12,30 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
 
 #include "mongo/db/repl/write_concern.h"
 
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/client.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/instance.h"
-#include "mongo/db/replutil.h"
+#include "mongo/db/repl/is_master.h"
 #include "mongo/util/background.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -66,6 +81,7 @@ namespace mongo {
 
         void run() {
             Client::initThread( "slaveTracking" );
+            cc().getAuthorizationSession()->grantInternalAuthorization();
             DBDirectClient db;
             while ( ! inShutdown() ) {
                 sleepsecs( 1 );
@@ -121,20 +137,22 @@ namespace mongo {
 
             scoped_lock mylk(_mutex);
 
-            _slaves[ident] = last;
-            _dirty = true;
+            if (last > _slaves[ident]) {
+                _slaves[ident] = last;
+                _dirty = true;
 
-            if (theReplSet && theReplSet->isPrimary()) {
-                theReplSet->ghost->updateSlave(ident.obj["_id"].OID(), last);
-            }
+                if (theReplSet && theReplSet->isPrimary()) {
+                    theReplSet->ghost->updateSlave(ident.obj["_id"].OID(), last);
+                }
 
-            if ( ! _started ) {
-                // start background thread here since we definitely need it
-                _started = true;
-                go();
+                if ( ! _started ) {
+                    // start background thread here since we definitely need it
+                    _started = true;
+                    go();
+                }
+
+                _threadsWaitingForReplication.notify_all();
             }
-            
-            _threadsWaitingForReplication.notify_all();
         }
 
         bool opReplicatedEnough( OpTime op , BSONElement w ) {
@@ -167,7 +185,9 @@ namespace mongo {
         }
 
         bool replicatedToNum(OpTime& op, int w) {
-            if ( w <= 1 || ! _isMaster() )
+            massert( 16805, "replicatedToNum called but not master anymore", _isMaster() );
+
+            if ( w <= 1 )
                 return true;
 
             w--; // now this is the # of slaves i need
@@ -176,7 +196,11 @@ namespace mongo {
         }
 
         bool waitForReplication(OpTime& op, int w, int maxSecondsToWait) {
-            if ( w <= 1 || ! _isMaster() )
+            static const int noLongerMasterAssertCode = 16806;
+            massert(noLongerMasterAssertCode, 
+                    "waitForReplication called but not master anymore", _isMaster() );
+
+            if ( w <= 1 )
                 return true;
 
             w--; // now this is the # of slaves i need
@@ -187,8 +211,13 @@ namespace mongo {
             
             scoped_lock mylk(_mutex);
             while ( ! _replicatedToNum_slaves_locked( op, w ) ) {
-                if ( ! _threadsWaitingForReplication.timed_wait( mylk.boost() , xt ) )
+                if ( ! _threadsWaitingForReplication.timed_wait( mylk.boost() , xt ) ) {
+                    massert(noLongerMasterAssertCode,
+                            "waitForReplication called but not master anymore", _isMaster());
                     return false;
+                }
+                massert(noLongerMasterAssertCode, 
+                        "waitForReplication called but not master anymore", _isMaster());
             }
             return true;
         }
@@ -241,6 +270,27 @@ namespace mongo {
 
     const char * SlaveTracking::NS = "local.slaves";
 
+    // parse optimes from replUpdatePositionCommand and pass them to SyncSourceFeedback
+    void updateSlaveLocations(BSONArray optimes) {
+        BSONForEach(elem, optimes) {
+            BSONObj entry = elem.Obj();
+            BSONObj id = BSON("_id" << entry["_id"].OID());
+            OpTime ot = entry["optime"]._opTime();
+            BSONObj config = entry["config"].Obj();
+
+            // update locally
+            // This updates the slave tracking map, as well as updates
+            // the GhostSlave cache, and updates the tag groups
+            slaveTracking.update(id, config, "local.oplog.rs", ot);
+
+            if (theReplSet && !theReplSet->isPrimary()) {
+                // pass along if we are not primary
+                LOG(2) << "percolating " << ot.toString() << " from " << entry << endl;
+                theReplSet->syncSourceFeedback.percolate(entry["_id"].OID(), ot);
+            }
+        }
+    }
+
     void updateSlaveLocation( CurOp& curop, const char * ns , OpTime lastOp ) {
         if ( lastOp.isNull() )
             return;
@@ -267,8 +317,9 @@ namespace mongo {
         if (theReplSet && !theReplSet->isPrimary()) {
             // we don't know the slave's port, so we make the replica set keep
             // a map of rids to slaves
-            LOG(2) << "percolating " << lastOp.toString() << " from " << rid << endl;
-            theReplSet->ghost->send( boost::bind(&GhostSync::percolate, theReplSet->ghost, rid, lastOp) );
+            // pass along if we are not primary
+            LOG(2) << "getmore percolating " << lastOp.toString() << " from " << rid << endl;
+            theReplSet->syncSourceFeedback.percolate(rid["_id"].OID(), lastOp);
         }
     }
 

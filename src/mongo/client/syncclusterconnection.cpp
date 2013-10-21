@@ -16,14 +16,14 @@
  */
 
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/client/syncclusterconnection.h"
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/dbmessage.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 
 // error codes 8000-8009
 
@@ -82,22 +82,23 @@ namespace mongo {
         bool ok = true;
         errmsg = "";
         for ( size_t i=0; i<_conns.size(); i++ ) {
-            BSONObj res;
+            string singleErr;
             try {
-                if ( _conns[i]->simpleCommand( "admin" , &res , "fsync" ) )
+                // this is fsync=true
+                // which with journalling on is a journal commit
+                // without journalling, is a full fsync
+                _conns[i]->simpleCommand( "admin", NULL, "resetError" );
+                singleErr = _conns[i]->getLastError( true );
+
+                if ( singleErr.size() == 0 )
                     continue;
+
             }
             catch ( DBException& e ) {
-                errmsg += e.toString();
-            }
-            catch ( std::exception& e ) {
-                errmsg += e.what();
-            }
-            catch ( ... ) {
-                warning() << "unknown exception in SyncClusterConnection::fsync" << endl;
+                singleErr = e.toString();
             }
             ok = false;
-            errmsg += " " + _conns[i]->toString() + ":" + res.toString();
+            errmsg += " " + _conns[i]->toString() + ":" + singleErr;
         }
         return ok;
     }
@@ -181,7 +182,7 @@ namespace mongo {
             if ( lockType > 0 ) { // write $cmd
                 string errmsg;
                 if ( ! prepare( errmsg ) )
-                    throw UserException( 13104 , (string)"SyncClusterConnection::findOne prepare failed: " + errmsg );
+                    throw UserException( PrepareConfigsFailedCode , (string)"SyncClusterConnection::findOne prepare failed: " + errmsg );
 
                 vector<BSONObj> all;
                 for ( size_t i=0; i<_conns.size(); i++ ) {
@@ -316,8 +317,8 @@ namespace mongo {
     void SyncClusterConnection::insert( const string &ns, BSONObj obj , int flags) {
 
         uassert(13119,
-                (string)"SyncClusterConnection::insert obj has to have an _id: " + obj.jsonString(),
-                 NamespaceString(ns).coll == "system.indexes" || obj["_id"].type());
+                str::stream() << "SyncClusterConnection::insert obj has to have an _id: " << obj,
+                nsToCollectionSubstring(ns) == "system.indexes" || obj["_id"].type());
 
         string errmsg;
         if ( ! prepare( errmsg ) )
@@ -336,7 +337,31 @@ namespace mongo {
             return;
         }
 
-        uassert( 10023 , "SyncClusterConnection bulk insert not implemented" , 0);
+        for (vector<BSONObj>::const_iterator it = v.begin(); it != v.end(); ++it ) {
+            BSONObj obj = *it;
+            if ( obj["_id"].type() == EOO ) {
+                string assertMsg = "SyncClusterConnection::insert (batched) obj misses an _id: ";
+                uasserted( 16743, assertMsg + obj.jsonString() );
+            }
+        }
+
+        // fsync all connections before starting the batch.
+        string errmsg;
+        if ( ! prepare( errmsg ) ) {
+            string assertMsg = "SyncClusterConnection::insert (batched) prepare failed: ";
+            throw UserException( 16744, assertMsg + errmsg );
+        }
+
+        // We still want one getlasterror per document, even if they're batched.
+        for ( size_t i=0; i<_conns.size(); i++ ) {
+            for ( vector<BSONObj>::const_iterator it = v.begin(); it != v.end(); ++it ) {
+                _conns[i]->insert( ns, *it, flags );
+                _conns[i]->getLastErrorDetailed();
+            }
+        }
+
+        // We issue a final getlasterror, but this time with an fsync.
+        _checkLast();
     }
 
     void SyncClusterConnection::remove( const string &ns , Query query, int flags ) {
@@ -360,7 +385,7 @@ namespace mongo {
         if ( _writeConcern ) {
             string errmsg;
             if ( ! prepare( errmsg ) )
-                throw UserException( 8005 , (string)"SyncClusterConnection::udpate prepare failed: " + errmsg );
+                throw UserException( 8005 , (string)"SyncClusterConnection::update prepare failed: " + errmsg );
         }
 
         for ( size_t i = 0; i < _conns.size(); i++ ) {
@@ -465,6 +490,18 @@ namespace mongo {
     void SyncClusterConnection::killCursor( long long cursorID ) {
         // should never need to do this
         verify(0);
+    }
+
+    // A SCC should be reused only if all the existing connections haven't been broken in the
+    // background.
+    // Note: an SCC may have missing connections if a config server is temporarily offline,
+    // but reading from the others is still allowed.
+    bool SyncClusterConnection::isStillConnected() {
+        for ( size_t i = 0; i < _conns.size(); i++ ) {
+            if ( _conns[i] && !_conns[i]->isStillConnected() ) return false;
+
+        }
+        return true;
     }
 
     void SyncClusterConnection::setAllSoTimeouts( double socketTimeout ){

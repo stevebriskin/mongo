@@ -14,19 +14,35 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/db/ttl.h"
 
 #include "mongo/base/counter.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/auth/user_name.h"
+#include "mongo/db/client.h"
 #include "mongo/db/commands/fsync.h"
 #include "mongo/db/commands/server_status.h"
-#include "mongo/db/databaseholder.h"
+#include "mongo/db/database_holder.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/ops/delete.h"
-#include "mongo/db/replutil.h"
+#include "mongo/db/repl/is_master.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/util/background.h"
 
 namespace mongo {
@@ -37,7 +53,7 @@ namespace mongo {
     ServerStatusMetricField<Counter64> ttlPassesDisplay("ttl.passes", &ttlPasses);
     ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocuments", &ttlDeletedDocuments);
 
-
+    MONGO_EXPORT_SERVER_PARAMETER( ttlMonitorEnabled, bool, true );
     
     class TTLMonitor : public BackgroundJob {
     public:
@@ -50,8 +66,7 @@ namespace mongo {
         
         void doTTLForDB( const string& dbName ) {
 
-            Client::GodScope god;
-
+            bool isMaster = isMasterNs( dbName.c_str() );
             vector<BSONObj> indexes;
             {
                 auto_ptr<DBClientCursor> cursor =
@@ -100,11 +115,11 @@ namespace mongo {
                         nsd->syncUserFlags( ns );
                     }
                     // only do deletes if on master
-                    if ( ! isMasterNs( dbName.c_str() ) ) {
+                    if ( ! isMaster ) {
                         continue;
                     }
 
-                    n = deleteObjects( ns.c_str() , query , false , true );
+                    n = deleteObjects( ns , query , false , true );
                     ttlDeletedDocuments.increment( n );
                 }
 
@@ -116,11 +131,17 @@ namespace mongo {
 
         virtual void run() {
             Client::initThread( name().c_str() );
+            cc().getAuthorizationSession()->grantInternalAuthorization();
 
             while ( ! inShutdown() ) {
                 sleepsecs( 60 );
                 
                 LOG(3) << "TTLMonitor thread awake" << endl;
+
+                if ( !ttlMonitorEnabled ) {
+                   LOG(1) << "TTLMonitor is disabled" << endl;
+                   continue;
+                }
                 
                 if ( lockedForWriting() ) {
                     // note: this is not perfect as you can go into fsync+lock between 

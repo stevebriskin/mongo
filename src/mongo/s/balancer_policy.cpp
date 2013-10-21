@@ -13,16 +13,29 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
+
+#include <algorithm>
 
 #include "mongo/s/balancer_policy.h"
 #include "mongo/s/config.h"
 #include "mongo/util/stringutils.h"
 #include "mongo/util/text.h"
 
-#include <algorithm>
 
 namespace mongo {
 
@@ -77,8 +90,18 @@ namespace mongo {
         unsigned minChunks = numeric_limits<unsigned>::max();
 
         for ( ShardInfoMap::const_iterator i = _shardInfo.begin(); i != _shardInfo.end(); ++i ) {
-            if ( i->second.isSizeMaxed() || i->second.isDraining() || i->second.hasOpsQueued() ) {
-                LOG(1) << i->first << " is unavailable" << endl;
+            if ( i->second.isSizeMaxed() ) {
+                LOG(1) << i->first << " has already reached the maximum total chunk size." << endl;
+                continue;
+            }
+
+            if ( i->second.isDraining() ) {
+                LOG(1) << i->first << " is currently draining." << endl;
+                continue;
+            }
+
+            if ( i->second.hasOpsQueued() ) {
+                LOG(1) << i->first << " has writebacks queued." << endl;
                 continue;
             }
 
@@ -447,7 +470,7 @@ namespace mongo {
     string ChunkInfo::toString() const {
         StringBuilder buf;
         buf << " min: " << min;
-        buf << " max: " << min;
+        buf << " max: " << max;
         return buf.str();
     }
 

@@ -27,19 +27,12 @@ namespace mongo {
     class DBClientBase;
 
     /**
-     * install database access functions
-     */
-    void installDBAccess(V8Scope* scope);
-
-    /**
-     * install BSON types and helpers
-     */
-    void installBSONTypes(V8Scope* scope);
-
-    /**
      * get the DBClientBase connection from JS args
      */
-    mongo::DBClientBase* getConnection(const v8::Arguments& args);
+    mongo::DBClientBase* getConnection(V8Scope* scope, const v8::Arguments& args);
+
+    // Internal Cursor
+    v8::Handle<v8::FunctionTemplate> getInternalCursorFunctionTemplate(V8Scope* scope);
 
     // Mongo constructors
     v8::Handle<v8::Value> mongoConsLocal(V8Scope* scope, const v8::Arguments& args);
@@ -53,6 +46,7 @@ namespace mongo {
     v8::Handle<v8::Value> mongoUpdate(V8Scope* scope, const v8::Arguments& args);
     v8::Handle<v8::Value> mongoAuth(V8Scope* scope, const v8::Arguments& args);
     v8::Handle<v8::Value> mongoLogout(V8Scope* scope, const v8::Arguments& args);
+    v8::Handle<v8::Value> mongoCursorFromId(V8Scope* scope, const v8::Arguments& args);
 
     // Cursor object
     v8::Handle<v8::Value> internalCursorCons(V8Scope* scope, const v8::Arguments& args);
@@ -68,12 +62,14 @@ namespace mongo {
     v8::Handle<v8::Value> binDataToHex(V8Scope* scope, const v8::Arguments& args);
 
     // NumberLong object
+    long long numberLongVal(V8Scope* scope, const v8::Handle<v8::Object>& it);
     v8::Handle<v8::Value> numberLongInit(V8Scope* scope, const v8::Arguments& args);
     v8::Handle<v8::Value> numberLongToNumber(V8Scope* scope, const v8::Arguments& args);
     v8::Handle<v8::Value> numberLongValueOf(V8Scope* scope, const v8::Arguments& args);
     v8::Handle<v8::Value> numberLongToString(V8Scope* scope, const v8::Arguments& args);
 
-    // Number object
+    // NumberInt object
+    int numberIntVal(V8Scope* scope, const v8::Handle<v8::Object>& it);
     v8::Handle<v8::Value> numberIntInit(V8Scope* scope, const v8::Arguments& args);
     v8::Handle<v8::Value> numberIntToNumber(V8Scope* scope, const v8::Arguments& args);
     v8::Handle<v8::Value> numberIntValueOf(V8Scope* scope, const v8::Arguments& args);
@@ -112,6 +108,11 @@ namespace mongo {
 
     // Object.bsonsize()
     v8::Handle<v8::Value> bsonsize(V8Scope* scope, const v8::Arguments& args);
+
+    // global method
+    // Accepts 2 objects, converts them to BSONObj and calls woCompare on the first against the
+    // second.
+    v8::Handle<v8::Value> bsonWoCompare(V8Scope* scope, const v8::Arguments& args);
 
     // 'db.collection' property handlers
     v8::Handle<v8::Value> collectionGetter(v8::Local<v8::String> name,

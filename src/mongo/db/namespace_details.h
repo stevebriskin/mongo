@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
@@ -20,14 +32,15 @@
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/diskloc.h"
 #include "mongo/db/index.h"
+#include "mongo/db/index_names.h"
 #include "mongo/db/index_set.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/mongommf.h"
-#include "mongo/db/namespace.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/storage/durable_mapped_file.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/querypattern.h"
+#include "mongo/db/storage/namespace.h"
+#include "mongo/db/storage/namespace_index.h"
 #include "mongo/platform/unordered_map.h"
-#include "mongo/util/hashtab.h"
 
 namespace mongo {
     class Database;
@@ -36,7 +49,7 @@ namespace mongo {
         For example <dbname>.system.users is ok for regular clients to update.
         @param write used when .system.js
     */
-    bool legalClientSystemNS( const string& ns , bool write );
+    bool legalClientSystemNS( const StringData& ns , bool write );
 
     /* deleted lists -- linked lists of deleted records -- are placed in 'buckets' of various sizes
        so you can look for a deleterecord about the right size.
@@ -54,9 +67,13 @@ namespace mongo {
     public:
         enum { NIndexesMax = 64, NIndexesExtra = 30, NIndexesBase  = 10 };
 
+    private:
+
         /*-------- data fields, as present on disk : */
-        DiskLoc firstExtent;
-        DiskLoc lastExtent;
+
+        DiskLoc _firstExtent;
+        DiskLoc _lastExtent;
+
         /* NOTE: capped collections v1 override the meaning of deletedList.
                  deletedList[0] points to a list of free records (DeletedRecord's) for all extents in
                  the capped namespace.
@@ -64,16 +81,18 @@ namespace mongo {
                  changes, this value is updated.  !deletedList[1].isValid() when this value is not
                  yet computed.
         */
-        DiskLoc deletedList[Buckets];
+        DiskLoc _deletedList[Buckets];
+
         // ofs 168 (8 byte aligned)
         struct Stats {
             // datasize and nrecords MUST Be adjacent code assumes!
             long long datasize; // this includes padding, but not record headers
             long long nrecords;
-        } stats;
-        int lastExtentSize;
-        int nIndexes;
-    private:
+        } _stats;
+
+        int _lastExtentSize;
+        int _nIndexes;
+
         // ofs 192
         IndexDetails _indexes[NIndexesBase];
 
@@ -84,21 +103,22 @@ namespace mongo {
         double _paddingFactor;                 // 1.0 = no padding.
         // ofs 386 (16)
         int _systemFlags; // things that the system sets/cares about
-    public:
-        DiskLoc capExtent; // the "current" extent we're writing too for a capped collection
-        DiskLoc capFirstNewRecord;
-        unsigned short dataFileVersion;       // NamespaceDetails version.  So we can do backward compatibility in the future. See filever.h
-        unsigned short indexFileVersion;
-        unsigned long long multiKeyIndexBits;
-    private:
+
+        DiskLoc _capExtent; // the "current" extent we're writing too for a capped collection
+        DiskLoc _capFirstNewRecord;
+
+        unsigned short _dataFileVersion;       // NamespaceDetails version.  So we can do backward compatibility in the future. See filever.h
+        unsigned short _indexFileVersion;
+        unsigned long long _multiKeyIndexBits;
+
         // ofs 400 (16)
-        unsigned long long reservedA;
-        long long extraOffset;                // where the $extra info is located (bytes relative to this)
-    public:
-        int indexBuildsInProgress;            // Number of indexes currently being built
-    private:
+        unsigned long long _reservedA;
+        long long _extraOffset;               // where the $extra info is located (bytes relative to this)
+
+        int _indexBuildsInProgress;            // Number of indexes currently being built
+
         int _userFlags;
-        char reserved[72];
+        char _reserved[72];
         /*-------- end data 496 bytes */
     public:
         explicit NamespaceDetails( const DiskLoc &loc, bool _capped );
@@ -129,8 +149,8 @@ namespace mongo {
             }
         };
         Extra* extra() {
-            if( extraOffset == 0 ) return 0;
-            return (Extra *) (((char *) this) + extraOffset);
+            if( _extraOffset == 0 ) return 0;
+            return (Extra *) (((char *) this) + _extraOffset);
         }
         /* add extra space for indexes when more than 10 */
         Extra* allocExtra(const char *ns, int nindexessofar);
@@ -142,8 +162,15 @@ namespace mongo {
         /* dump info on all extents for this namespace.  for debugging. */
         void dumpExtents();
 
+    public:
+        const DiskLoc& capExtent() const { return _capExtent; }
+        const DiskLoc capFirstNewRecord() const { return _capFirstNewRecord; }
+
+        DiskLoc& capExtent() { return _capExtent; }
+        DiskLoc& capFirstNewRecord() { return _capFirstNewRecord; }
+
     private:
-        Extent *theCapExtent() const { return capExtent.ext(); }
+        Extent *theCapExtent() const { return _capExtent.ext(); }
         void advanceCapExtent( const char *ns );
         DiskLoc __capAlloc(int len);
         DiskLoc cappedAlloc(const char *ns, int len);
@@ -152,19 +179,51 @@ namespace mongo {
 
     public:
 
+        const DiskLoc& firstExtent() const { return _firstExtent; }
+        const DiskLoc& lastExtent() const { return _lastExtent; }
+
+        DiskLoc& firstExtent() { return _firstExtent; }
+        DiskLoc& lastExtent() { return _lastExtent; }
+
+        void setFirstExtent( DiskLoc newFirstExtent );
+        void setLastExtent( DiskLoc newLastExtent );
+
+        void setFirstExtentInvalid();
+        void setLastExtentInvalid();
+
+
+        long long dataSize() const { return _stats.datasize; }
+        long long numRecords() const { return _stats.nrecords; }
+
+        void incrementStats( long long dataSizeIncrement,
+                             long long numRecordsIncrement );
+
+        void setStats( long long dataSizeIncrement,
+                       long long numRecordsIncrement );
+
+
         bool isCapped() const { return _isCapped; }
         long long maxCappedDocs() const;
         void setMaxCappedDocs( long long max );
+
+        int lastExtentSize() const { return _lastExtentSize; }
+        void setLastExtentSize( int newMax );
+
+        const DiskLoc& deletedListEntry( int bucket ) const { return _deletedList[bucket]; }
+        DiskLoc& deletedListEntry( int bucket ) { return _deletedList[bucket]; }
+
+        void orphanDeletedList();
+
         /**
          * @param max in and out, will be adjusted
          * @return if the value is valid at all
          */
         static bool validMaxCappedDocs( long long* max );
 
-        DiskLoc& cappedListOfAllDeletedRecords() { return deletedList[0]; }
-        DiskLoc& cappedLastDelRecLastExtent()    { return deletedList[1]; }
+        DiskLoc& cappedListOfAllDeletedRecords() { return _deletedList[0]; }
+        DiskLoc& cappedLastDelRecLastExtent()    { return _deletedList[1]; }
         void cappedDumpDelInfo();
-        bool capLooped() const { return _isCapped && capFirstNewRecord.isValid();  }
+        bool capLooped() const { return _isCapped && _capFirstNewRecord.isValid();  }
         bool inCapExtent( const DiskLoc &dl ) const;
         void cappedCheckMigrate();
         /**
@@ -180,7 +239,11 @@ namespace mongo {
         /* when a background index build is in progress, we don't count the index in nIndexes until
            complete, yet need to still use it in _indexRecord() - thus we use this function for that.
         */
-        int getTotalIndexCount() const { return nIndexes + indexBuildsInProgress; }
+        int getTotalIndexCount() const { return _nIndexes + _indexBuildsInProgress; }
+
+        int getCompletedIndexCount() const { return _nIndexes; }
+
+        int getIndexBuildsInProgress() const { return _indexBuildsInProgress; }
 
         /* NOTE: be careful with flags.  are we manipulating them in read locks?  if so,
                  this isn't thread safe.  TODO
@@ -218,7 +281,7 @@ namespace mongo {
              for a single document. see multikey in docs.
            for these, we have to do some dedup work on queries.
         */
-        bool isMultikey(int i) const { return (multiKeyIndexBits & (((unsigned long long) 1) << i)) != 0; }
+        bool isMultikey(int i) const { return (_multiKeyIndexBits & (((unsigned long long) 1) << i)) != 0; }
         void setIndexIsMultikey(const char *thisns, int i, bool multikey = true);
 
         /**
@@ -228,10 +291,9 @@ namespace mongo {
         IndexDetails& getNextIndexDetails(const char* thisns);
 
         /**
-         * Add a new index.  This does not add it to system.indexes etc. - just to NamespaceDetails.
-         * This resets the transient namespace details.
+         * incremements _nIndexes
          */
-        void addIndex(const char* thisns);
+        void addIndex();
 
         void aboutToDeleteAnIndex() { 
             clearSystemFlag( Flag_HaveIdIndex );
@@ -279,7 +341,7 @@ namespace mongo {
                    can pushes this down considerably. further tweaking will be a good idea but 
                    this should be an adequate starting point.
                 */
-                double N = min(nIndexes,7) + 3;
+                double N = min(_nIndexes,7) + 3;
                 double x = _paddingFactor + (0.001 * N);
                 if ( x <= 2.0 ) {
                     setPaddingFactor( x );
@@ -288,15 +350,16 @@ namespace mongo {
         }
 
         // @return offset in indexes[]
-        int findIndexByName(const char *name);
+        int findIndexByName(const StringData& name, bool includeBackgroundInProgress = false);
 
         // @return offset in indexes[]
-        int findIndexByKeyPattern(const BSONObj& keyPattern);
+        int findIndexByKeyPattern(const BSONObj& keyPattern, 
+                                  bool includeBackgroundInProgress = false);
 
         void findIndexByType( const string& name , vector<int>& matches ) {
             IndexIterator i = ii();
             while ( i.more() ) {
-                if ( i.next().getSpec().getTypeName() == name )
+                if ( IndexNames::findPluginName(i.next().keyPattern()) == name )
                     matches.push_back( i.pos() - 1 );
             }
         }
@@ -307,6 +370,26 @@ namespace mongo {
          */
         const IndexDetails* findIndexByPrefix( const BSONObj &keyPattern ,
                                                bool requireSingleKey );
+
+        void removeIndex( int idx );
+
+        /**
+         * removes things beteen getCompletedIndexCount() and getTotalIndexCount()
+         * this should only be used for crash recovery
+         */
+        void blowAwayInProgressIndexEntries();
+
+        /**
+         * @return the info for the index to retry
+         */
+        BSONObj prepOneUnfinishedIndex();
+
+        /**
+         * swaps all meta data for 2 indexes
+         * a and b are 2 index ids, whose contents will be swapped
+         * must have a lock on the entire collection to do this
+         */
+        void swapIndex( const char* ns, int a, int b );
 
         /* Updates the expireAfterSeconds field of the given index to the value in newExpireSecs.
          * The specified index must already contain an expireAfterSeconds field, and the value in
@@ -322,10 +405,9 @@ namespace mongo {
 
         const int userFlags() const { return _userFlags; }
         bool isUserFlagSet( int flag ) const { return _userFlags & flag; }
-        
-        
+
         /**
-         * these methods only modify NamespaceDetails and do not 
+         * these methods only modify NamespaceDetails and do not
          * sync changes back to system.namespaces
          * a typical call might
          if ( nsd->setUserFlag( 4 ) ) {
@@ -333,7 +415,7 @@ namespace mongo {
          }
          * these methods all return true iff only something was modified
          */
-        
+
         bool setUserFlag( int flag );
         bool clearUserFlag( int flag );
         bool replaceUserFlags( int flags );
@@ -352,7 +434,7 @@ namespace mongo {
             return -1;
         }
 
-        bool haveIdIndex() { 
+        bool haveIdIndex() {
             return isSystemFlagSet( NamespaceDetails::Flag_HaveIdIndex ) || findIdIndex() >= 0;
         }
 
@@ -399,9 +481,9 @@ namespace mongo {
         long long storageSize( int * numExtents = 0 , BSONArrayBuilder * extentInfo = 0 ) const;
 
         int averageObjectSize() {
-            if ( stats.nrecords == 0 )
+            if ( _stats.nrecords == 0 )
                 return 5;
-            return (int) (stats.datasize / stats.nrecords);
+            return (int) (_stats.datasize / _stats.nrecords);
         }
 
         NamespaceDetails *writingWithoutExtra() {
@@ -410,7 +492,20 @@ namespace mongo {
         /** Make all linked Extra objects writeable as well */
         NamespaceDetails *writingWithExtra();
 
+        class IndexBuildBlock {
+        public:
+            IndexBuildBlock( const string& ns, const string& indexName );
+            ~IndexBuildBlock();
+
+        private:
+            string _ns;
+            string _indexName;
+        };
+
     private:
+
+        void _removeIndex( int idx );
+
         DiskLoc _alloc(const char *ns, int len);
         void maybeComplain( const char *ns, int len ) const;
         DiskLoc __stdAlloc(int len, bool willBeAt);
@@ -431,208 +526,5 @@ namespace mongo {
         BOOST_STATIC_ASSERT( sizeof(NamespaceDetails::Extra) == 496 );
     }; // NamespaceDetails
 #pragma pack()
-
-    /* NamespaceDetailsTransient
-
-       these are things we know / compute about a namespace that are transient -- things
-       we don't actually store in the .ns file.  so mainly caching of frequently used
-       information.
-
-       CAUTION: Are you maintaining this properly on a collection drop()?  A dropdatabase()?  Be careful.
-                The current field "allIndexKeys" may have too many keys in it on such an occurrence;
-                as currently used that does not cause anything terrible to happen.
-
-       todo: cleanup code, need abstractions and separation
-    */
-    // todo: multiple db's with the same name (repairDatabase) is not handled herein.  that may be
-    //       the way to go, if not used by repair, but need some sort of enforcement / asserts.
-    class NamespaceDetailsTransient : boost::noncopyable {
-        BOOST_STATIC_ASSERT( sizeof(NamespaceDetails) == 496 );
-
-        //Database *database;
-        const string _ns;
-        void reset();
-        
-        // < db -> < fullns -> NDT > >
-        typedef unordered_map< string, shared_ptr<NamespaceDetailsTransient> > CMap;
-        typedef unordered_map< string, CMap*, NamespaceDBHash, NamespaceDBEquals > DMap;
-        static DMap _nsdMap;
-
-        NamespaceDetailsTransient(Database*,const string& ns);
-    public:
-        ~NamespaceDetailsTransient();
-        void addedIndex() { reset(); }
-        void deletedIndex() { reset(); }
-
-        /**
-         * reset stats for a given collection
-         */
-        static void resetCollection(const string& ns );
-
-        /**
-         * remove entry for a collection
-         */
-        static void eraseCollection(const string& ns);
-
-        /**
-         * remove all entries for db
-         */
-        static void eraseDB(const string& db);
-
-        /* indexKeys() cache ---------------------------------------------------- */
-        /* assumed to be in write lock for this */
-    private:
-        bool _keysComputed;
-        IndexPathSet _indexedPaths;
-        void computeIndexKeys();
-    public:
-        /* get set of index keys for this namespace.  handy to quickly check if a given
-           field is indexed (Note it might be a secondary component of a compound index.)
-        */
-        const IndexPathSet& indexKeys() {
-            DEV Lock::assertWriteLocked(_ns);
-            if ( !_keysComputed )
-                computeIndexKeys();
-            return _indexedPaths;
-        }
-
-        /* IndexSpec caching */
-    private:
-        map<const IndexDetails*,IndexSpec> _indexSpecs;
-        static SimpleMutex _isMutex;
-    public:
-        const IndexSpec& getIndexSpec( const IndexDetails * details ) {
-            IndexSpec& spec = _indexSpecs[details];
-            if ( ! spec._finishedInit ) {
-                SimpleMutex::scoped_lock lk(_isMutex);
-                if ( ! spec._finishedInit ) {
-                    spec.reset( details );
-                    verify( spec._finishedInit );
-                }
-            }
-            return spec;
-        }
-
-        /* query cache (for query optimizer) ------------------------------------- */
-    private:
-        int _qcWriteCount;
-        map<QueryPattern,CachedQueryPlan> _qcCache;
-        static NamespaceDetailsTransient& make_inlock(const string& ns);
-        static CMap& get_cmap_inlock(const string& ns);
-    public:
-        static SimpleMutex _qcMutex;
-
-        /* you must be in the qcMutex when calling this.
-           A NamespaceDetailsTransient object will not go out of scope on you if you are
-           d.dbMutex.atLeastReadLocked(), so you do't have to stay locked.
-           Creates a NamespaceDetailsTransient before returning if one DNE. 
-           todo: avoid creating too many on erroneous ns queries.
-           */
-        static NamespaceDetailsTransient& get_inlock(const string& ns);
-
-        static NamespaceDetailsTransient& get(const char *ns) {
-            // todo : _qcMutex will create bottlenecks in our parallelism
-            SimpleMutex::scoped_lock lk(_qcMutex);
-            return get_inlock(ns);
-        }
-
-        void clearQueryCache() {
-            _qcCache.clear();
-            _qcWriteCount = 0;
-        }
-        /* you must notify the cache if you are doing writes, as query plan utility will change */
-        void notifyOfWriteOp() {
-            if ( _qcCache.empty() )
-                return;
-            if ( ++_qcWriteCount >= 100 )
-                clearQueryCache();
-        }
-        CachedQueryPlan cachedQueryPlanForPattern( const QueryPattern &pattern ) {
-            return _qcCache[ pattern ];
-        }
-        void registerCachedQueryPlanForPattern( const QueryPattern &pattern,
-                                               const CachedQueryPlan &cachedQueryPlan ) {
-            _qcCache[ pattern ] = cachedQueryPlan;
-        }
-
-    }; /* NamespaceDetailsTransient */
-
-    inline NamespaceDetailsTransient& NamespaceDetailsTransient::get_inlock(const string& ns) {
-        CMap& m = get_cmap_inlock(ns);
-        CMap::iterator i = m.find( ns );
-        if ( i != m.end() && 
-             i->second.get() ) { // could be null ptr from clearForPrefix
-            return *i->second;
-        }
-        return make_inlock(ns);
-    }
-
-    /* NamespaceIndex is the ".ns" file you see in the data directory.  It is the "system catalog"
-       if you will: at least the core parts.  (Additional info in system.* collections.)
-    */
-    class NamespaceIndex {
-    public:
-        NamespaceIndex(const string &dir, const string &database) :
-            ht( 0 ), dir_( dir ), database_( database ) {}
-
-        /* returns true if new db will be created if we init lazily */
-        bool exists() const;
-
-        void init() {
-            if( !ht ) 
-                _init();
-        }
-
-        void add_ns(const char *ns, DiskLoc& loc, bool capped);
-        void add_ns( const char *ns, const NamespaceDetails &details );
-
-        NamespaceDetails* details(const StringData& ns) {
-            if ( !ht )
-                return 0;
-            Namespace n(ns);
-            NamespaceDetails *d = ht->get(n);
-            if ( d && d->isCapped() )
-                d->cappedCheckMigrate();
-            return d;
-        }
-
-        void kill_ns(const char *ns);
-
-        bool find(const char *ns, DiskLoc& loc) {
-            NamespaceDetails *l = details(ns);
-            if ( l ) {
-                loc = l->firstExtent;
-                return true;
-            }
-            return false;
-        }
-
-        bool allocated() const { return ht != 0; }
-
-        void getNamespaces( list<string>& tofill , bool onlyCollections = true ) const;
-
-        NamespaceDetails::Extra* newExtra(const char *ns, int n, NamespaceDetails *d);
-
-        boost::filesystem::path path() const;
-
-        unsigned long long fileLength() const { return f.length(); }
-
-    private:
-        void _init();
-        void maybeMkdir() const;
-
-        MongoMMF f;
-        HashTable<Namespace,NamespaceDetails> *ht;
-        string dir_;
-        string database_;
-    };
-
-    extern string dbpath; // --dbpath parm
-    extern bool directoryperdb;
-
-    // Rename a namespace within current 'client' db.
-    // (Arguments should include db name)
-    void renameNamespace( const char *from, const char *to, bool stayTemp);
-
 
 } // namespace mongo

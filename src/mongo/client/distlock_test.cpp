@@ -15,13 +15,13 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
-#include "distlock.h"
+#include "mongo/client/distlock.h"
 
-#include <vector>
-#include <iostream>
 #include <boost/thread/thread.hpp>
+#include <iostream>
+#include <vector>
 
 #include "mongo/base/init.h"
 #include "mongo/db/auth/action_set.h"
@@ -29,6 +29,7 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/commands.h"
 #include "mongo/util/bson_util.h"
+#include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/timer.h"
 
 // Modify some config options for the RNG, since they cause MSVC to fail

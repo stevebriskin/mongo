@@ -12,21 +12,34 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 // strategy_sharded.cpp
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/index.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/s/client_info.h"
 #include "mongo/s/chunk.h"
@@ -44,19 +57,22 @@ namespace mongo {
     class ShardStrategy : public Strategy {
 
         bool _isSystemIndexes( const char* ns ) {
-            return NamespaceString(ns).coll == "system.indexes";
+            return nsToCollectionSubstring(ns) == "system.indexes";
         }
 
         virtual void queryOp( Request& r ) {
 
-            verify(!r.isCommand()); // Commands are handled in strategy_single.cpp
+            // Commands are handled in strategy_single.cpp
+            verify( !NamespaceString( r.getns() ).isCommand() );
 
             QueryMessage q( r.d() );
 
-            AuthorizationManager* authManager =
-                    ClientBasic::getCurrent()->getAuthorizationManager();
-            Status status = authManager->checkAuthForQuery(q.ns);
-            uassert(16549, status.reason(), status.isOK());
+            NamespaceString ns(q.ns);
+            ClientBasic* client = ClientBasic::getCurrent();
+            AuthorizationSession* authSession = client->getAuthorizationSession();
+            Status status = authSession->checkAuthForQuery(ns, q.query);
+            audit::logQueryAuthzCheck(client, ns, q.query, status.code());
+            uassertStatusOK(status);
 
             LOG(3) << "shard query: " << q.ns << "  " << q.query << endl;
 
@@ -145,14 +161,17 @@ namespace mongo {
             }
         }
 
-        virtual void commandOp( const string& db, const BSONObj& command, int options,
-                                const string& versionedNS, const BSONObj& filter,
-                                map<Shard,BSONObj>& results )
+        virtual void commandOp( const string& db,
+                                const BSONObj& command,
+                                int options,
+                                const string& versionedNS,
+                                const BSONObj& targetingQuery,
+                                vector<CommandResult>* results )
         {
 
             QuerySpec qSpec(db + ".$cmd", command, BSONObj(), 0, 1, options);
 
-            ParallelSortClusteredCursor cursor( qSpec, CommandInfo( versionedNS, filter ) );
+            ParallelSortClusteredCursor cursor( qSpec, CommandInfo( versionedNS, targetingQuery ) );
 
             // Initialize the cursor
             cursor.init();
@@ -161,7 +180,14 @@ namespace mongo {
             cursor.getQueryShards( shards );
 
             for( set<Shard>::iterator i = shards.begin(), end = shards.end(); i != end; ++i ){
-                results[ *i ] = cursor.getShardCursor( *i )->peekFirst().getOwned();
+                CommandResult result;
+                result.shardTarget = *i;
+                string errMsg; // ignored, should never be invalid b/c an exception thrown earlier
+                result.target =
+                        ConnectionString::parse( cursor.getShardCursor( *i )->originalHost(),
+                                                 errMsg );
+                result.result = cursor.getShardCursor( *i )->peekFirst().getOwned();
+                results->push_back( result );
             }
 
         }
@@ -170,38 +196,35 @@ namespace mongo {
 
             const char *ns = r.getns();
 
-            AuthorizationManager* authManager =
-                    ClientBasic::getCurrent()->getAuthorizationManager();
-            Status status = authManager->checkAuthForGetMore(ns);
-            uassert(16539, status.reason(), status.isOK());
-
             // TODO:  Handle stale config exceptions here from coll being dropped or sharded during op
             // for now has same semantics as legacy request
             ChunkManagerPtr info = r.getChunkManager();
 
             //
-            // TODO: Cleanup and consolidate into single codepath
+            // TODO: Cleanup cursor cache, consolidate into single codepath
             //
 
-            if( ! info ){
+            int ntoreturn = r.d().pullInt();
+            long long id = r.d().pullInt64();
+            string host = cursorCache.getRef( id );
+            ShardedClientCursorPtr cursor = cursorCache.get( id );
+
+            // Cursor ids should not overlap between sharded and unsharded cursors
+            massert( 17012, str::stream() << "duplicate sharded and unsharded cursor id "
+                                          << id << " detected for " << ns
+                                          << ", duplicated on host " << host,
+                     NULL == cursorCache.get( id ).get() || host.empty() );
+
+            ClientBasic* client = ClientBasic::getCurrent();
+            NamespaceString nsString(ns);
+            AuthorizationSession* authSession = client->getAuthorizationSession();
+            Status status = authSession->checkAuthForGetMore( nsString, id );
+            audit::logGetMoreAuthzCheck( client, nsString, id, status.code() );
+            uassertStatusOK(status);
+
+            if( !host.empty() ){
 
                 LOG(3) << "single getmore: " << ns << endl;
-
-                long long id = r.d().getInt64( 4 );
-
-                string host = cursorCache.getRef( id );
-
-                if( host.size() == 0 ){
-
-                    //
-                    // Match legacy behavior here by throwing an exception when we can't find
-                    // the cursor, but make the exception more informative
-                    //
-
-                    uasserted( 16336,
-                               str::stream() << "could not find cursor in cache for id " << id
-                                             << " over collection " << ns );
-                }
 
                 // we used ScopedDbConnection because we don't get about config versions
                 // not deleting data is handled elsewhere
@@ -222,18 +245,7 @@ namespace mongo {
                 conn.done();
                 return;
             }
-            else {
-                int ntoreturn = r.d().pullInt();
-                long long id = r.d().pullInt64();
-
-                LOG(6) << "want cursor : " << id << endl;
-
-                ShardedClientCursorPtr cursor = cursorCache.get( id );
-                if ( ! cursor ) {
-                    LOG(6) << "\t invalid cursor :(" << endl;
-                    replyToQuery( ResultFlag_CursorNotFound , r.p() , r.m() , 0 , 0 , 0 );
-                    return;
-                }
+            else if ( cursor ) {
 
                 // TODO: Try to match logic of mongod, where on subsequent getMore() we pull lots more data?
                 BufBuilder buffer( ShardedClientCursor::INIT_REPLY_BUFFER_SIZE );
@@ -252,6 +264,14 @@ namespace mongo {
 
                 replyToQuery( 0, r.p(), r.m(), buffer.buf(), buffer.len(), docCount,
                         startFrom, hasMore ? cursor->getId() : 0 );
+                return;
+            }
+            else {
+
+                LOG( 3 ) << "could not find cursor " << id << " in cache for " << ns << endl;
+
+                replyToQuery( ResultFlag_CursorNotFound , r.p() , r.m() , 0 , 0 , 0 );
+                return;
             }
         }
 
@@ -512,12 +532,6 @@ namespace mongo {
 
             const string& ns = r.getns();
 
-            AuthorizationManager* authManager =
-                    ClientBasic::getCurrent()->getAuthorizationManager();
-            Status status = authManager->checkAuthForInsert(ns);
-            uassert(16540, status.reason(), status.isOK());
-
-
             int flags = 0;
 
             if (d.reservedField() & Reserved_InsertOption_ContinueOnError) flags |=
@@ -565,6 +579,16 @@ namespace mongo {
                 // We should always have a shard if we have any inserts
                 verify(group.inserts.size() == 0 || group.shard.get());
 
+                NamespaceString nsString(ns);
+                for (vector<BSONObj>::iterator it = group.inserts.begin();
+                        it != group.inserts.end(); ++it) {
+                    ClientBasic* client = ClientBasic::getCurrent();
+                    AuthorizationSession* authSession = client->getAuthorizationSession();
+                    Status status = authSession->checkAuthForInsert(nsString, *it);
+                    audit::logInsertAuthzCheck(client, nsString, *it, status.code());
+                    uassertStatusOK(status);
+                }
+
                 if (group.inserts.size() > 0 && group.hasException()) {
                     warning() << "problem preparing batch insert detected, first inserting "
                               << group.inserts.size() << " intermediate documents" << endl;
@@ -587,7 +611,7 @@ namespace mongo {
                                 << "inserting "
                                 << group.inserts.size()
                                 << " documents to shard "
-                                << group.shard
+                                << group.shard->toString()
                                 << " at version "
                                 << (group.manager.get() ?
                                     group.manager->getVersion().toString() :
@@ -979,7 +1003,7 @@ namespace mongo {
                     return;
                 }
 
-                if( query.hasField("$atomic") ){
+                if( query.hasField("$atomic") || query.hasField("$isolated") ){
 
                     // We can't run an atomic operation on more than one shard
 
@@ -992,7 +1016,7 @@ namespace mongo {
                     _sleepForVerifiedLocalError();
 
                     uasserted( 13506, str::stream()
-                        << "$atomic not supported sharded : " << query );
+                        << "$atomic/$isolated not supported sharded : " << query );
                 }
 
                 return;
@@ -1007,14 +1031,24 @@ namespace mongo {
             const BSONObj query = d.nextJsObj();
 
             bool upsert = flags & UpdateOption_Upsert;
-            AuthorizationManager* authManager =
-                    ClientBasic::getCurrent()->getAuthorizationManager();
-            Status status = authManager->checkAuthForUpdate(ns, upsert);
-            uassert(16537, status.reason(), status.isOK());
 
             uassert( 10201 ,  "invalid update" , d.moreJSObjs() );
 
             const BSONObj toUpdate = d.nextJsObj();
+
+            NamespaceString nsString(ns);
+            ClientBasic* client = ClientBasic::getCurrent();
+            AuthorizationSession* authzSession = client->getAuthorizationSession();
+            Status status = authzSession->checkAuthForUpdate(nsString, query, toUpdate, upsert);
+            audit::logUpdateAuthzCheck(
+                    client,
+                    nsString,
+                    query,
+                    toUpdate,
+                    upsert,
+                    flags & UpdateOption_Multi,
+                    status.code());
+            uassertStatusOK(status);
 
             if( d.reservedField() & Reserved_FromWriteback ){
                 flags |= WriteOption_FromWriteback;
@@ -1131,7 +1165,7 @@ namespace mongo {
                 return;
             }
 
-            if( query.hasField( "$atomic" ) ){
+            if( query.hasField( "$atomic" ) || query.hasField( "$isolated" ) ){
 
                 // Retry reloading the config data once
                 if( ! reloadConfigData ){
@@ -1143,7 +1177,7 @@ namespace mongo {
                 _sleepForVerifiedLocalError();
 
                 uasserted( 13505, str::stream()
-                    << "$atomic not supported for sharded delete : " << query );
+                    << "$atomic/$isolated not supported for sharded delete : " << query );
             }
             else if( justOne && ! query.hasField( "_id" ) ){
 
@@ -1168,14 +1202,16 @@ namespace mongo {
             const string& ns = r.getns();
             int flags = d.pullInt();
 
-            AuthorizationManager* authManager =
-                    ClientBasic::getCurrent()->getAuthorizationManager();
-            Status status = authManager->checkAuthForDelete(ns);
-            uassert(16541, status.reason(), status.isOK());
-
             uassert( 10203 ,  "bad delete message" , d.moreJSObjs() );
 
             const BSONObj query = d.nextJsObj();
+
+            NamespaceString nsString(ns);
+            ClientBasic* client = ClientBasic::getCurrent();
+            AuthorizationSession* authSession = client->getAuthorizationSession();
+            Status status = authSession->checkAuthForDelete(nsString, query);
+            audit::logDeleteAuthzCheck(client, nsString, query, status.code());
+            uassertStatusOK(status);
 
             if( d.reservedField() & Reserved_FromWriteback ){
                 flags |= WriteOption_FromWriteback;
@@ -1237,11 +1273,23 @@ namespace mongo {
                 if (op == dbInsert) {
                     // Insert is the only write op allowed on system.indexes, so it's the only one
                     // we check auth for.
-                    AuthorizationManager* authManager =
-                            ClientBasic::getCurrent()->getAuthorizationManager();
-                    uassert(16547,
-                            mongoutils::str::stream() << "not authorized to create index on " << ns,
-                            authManager->checkAuthorization(ns, ActionType::ensureIndex));
+                    ClientBasic* client = ClientBasic::getCurrent();
+                    AuthorizationSession* authSession = client->getAuthorizationSession();
+                    DbMessage& d = r.d();
+                    NamespaceString nsAsNs(ns);
+                    while (d.moreJSObjs()) {
+                        BSONObj toInsert = d.nextJsObj();
+                        Status status = authSession->checkAuthForInsert(
+                                nsAsNs,
+                                toInsert);
+                        audit::logInsertAuthzCheck(
+                                client,
+                                nsAsNs,
+                                toInsert,
+                                status.code());
+                        uassertStatusOK(status);
+                    }
+                    d.markReset();
                 }
 
                 if ( r.getConfig()->isShardingEnabled() ){

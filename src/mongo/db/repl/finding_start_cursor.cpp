@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/repl/finding_start_cursor.h"
@@ -105,26 +117,26 @@ namespace mongo {
     
     DiskLoc FindingStartCursor::extentFirstLoc( const DiskLoc &rec ) {
         Extent *e = rec.rec()->myExtent( rec );
-        if ( !_qp.nsd()->capLooped() || ( e->myLoc != _qp.nsd()->capExtent ) )
+        if ( !_qp.nsd()->capLooped() || ( e->myLoc != _qp.nsd()->capExtent() ) )
             return e->firstRecord;
         // Likely we are on the fresh side of capExtent, so return first fresh record.
         // If we are on the stale side of capExtent, then the collection is small and it
         // doesn't matter if we start the extent scan with capFirstNewRecord.
-        return _qp.nsd()->capFirstNewRecord;
+        return _qp.nsd()->capFirstNewRecord();
     }
-    
+
     DiskLoc FindingStartCursor::prevExtentFirstLoc( const DiskLoc& rec ) const {
         Extent *e = rec.rec()->myExtent( rec );
         if ( _qp.nsd()->capLooped() ) {
             while( true ) {
                 // Advance e to preceding extent (looping to lastExtent if necessary).
                 if ( e->xprev.isNull() ) {
-                    e = _qp.nsd()->lastExtent.ext();
+                    e = _qp.nsd()->lastExtent().ext();
                 }
                 else {
                     e = e->xprev.ext();
                 }
-                if ( e->myLoc == _qp.nsd()->capExtent ) {
+                if ( e->myLoc == _qp.nsd()->capExtent() ) {
                     // Reached the extent containing the oldest data in the collection.
                     return DiskLoc();
                 }
@@ -191,7 +203,7 @@ namespace mongo {
         while( !finder->done() ) {
             if ( yieldCondition.intervalHasElapsed() ) {
                 if ( finder->prepareToYield() ) {
-                    ClientCursor::staticYield( -1, ns, 0 );
+                    ClientCursor::staticYield( 0, ns, 0 );
                     finder->recoverFromYield();
                 }
             }

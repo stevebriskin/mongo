@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
@@ -191,7 +203,12 @@ namespace mongo {
         unsigned char _a[3];
         unsigned long long Z() const { 
             // endian
-            return *((unsigned long long*)this) & 0x00ffffffffffffffULL;
+            unsigned long long result = ofs;
+            char* cursor = reinterpret_cast<char *>(&result);
+            *reinterpret_cast<uint16_t*>(cursor + 4) = *reinterpret_cast<const uint16_t*>(&_a[0]);
+            *reinterpret_cast<uint8_t*>(cursor + 6) = *reinterpret_cast<const uint8_t*>(&_a[2]);
+            *reinterpret_cast<uint8_t*>(cursor + 7) = uint8_t(0);
+            return result;
         }
         enum { 
             // first bit of offsets used in _KeyNode we don't use -1 here.
@@ -588,9 +605,6 @@ namespace mongo {
     };
 
     class IndexDetails;
-    class IndexInsertionContinuation;
-    template< class V>
-    struct IndexInsertionContinuationImpl;
 
     /**
      * This class adds functionality for manipulating buckets that are assembled
@@ -623,7 +637,6 @@ namespace mongo {
     template< class V >
     class BtreeBucket : public BucketBasics<V> {
         friend class BtreeCursor;
-        friend struct IndexInsertionContinuationImpl<V>;
     public:
         // make compiler happy:
         typedef typename V::Key Key;
@@ -699,11 +712,6 @@ namespace mongo {
         int bt_insert(const DiskLoc thisLoc, const DiskLoc recordLoc,
                       const BSONObj& key, const Ordering &order, bool dupsAllowed,
                       IndexDetails& idx, bool toplevel = true) const;
-
-        /** does the insert in two steps - can then use an upgradable lock for step 1, which 
-            is the part which may have page faults.  also that step is most of the computational work.
-        */
-        void twoStepInsert(DiskLoc thisLoc, IndexInsertionContinuationImpl<V> &c, bool dupsAllowed) const;
 
         /**
          * Preconditions:
@@ -956,9 +964,6 @@ namespace mongo {
         int _insert(const DiskLoc thisLoc, const DiskLoc recordLoc,
                     const Key& key, const Ordering &order, bool dupsAllowed,
                     const DiskLoc lChild, const DiskLoc rChild, IndexDetails &idx) const;
-
-        void insertStepOne(
-                DiskLoc thisLoc, IndexInsertionContinuationImpl<V>& c, bool dupsAllowed) const;
 
         bool find(const IndexDetails& idx, const Key& key, const DiskLoc &recordLoc, const Ordering &order, int& pos, bool assertIfDup) const;        
         static bool customFind( int l, int h, const BSONObj &keyBegin, int keyBeginLen, bool afterKey, const vector< const BSONElement * > &keyEnd, const vector< bool > &keyEndInclusive, const Ordering &order, int direction, DiskLoc &thisLoc, int &keyOfs, pair< DiskLoc, int > &bestParent ) ;

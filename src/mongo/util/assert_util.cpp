@@ -15,7 +15,7 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/util/assert_util.h"
 
@@ -55,7 +55,8 @@ namespace mongo {
     bool DBException::traceExceptions = false;
 
     string DBException::toString() const {
-        stringstream ss; ss << getCode() << " " << what(); return ss.str();
+        stringstream ss;
+        ss << getCode() << " " << what();
         return ss.str();
     }
 
@@ -126,6 +127,21 @@ namespace mongo {
 
     NOINLINE_DECL void fassertFailed( int msgid ) {
         problem() << "Fatal Assertion " << msgid << endl;
+        logContext();
+        breakpoint();
+        log() << "\n\n***aborting after fassert() failure\n\n" << endl;
+        abort();
+    }
+
+    NOINLINE_DECL void fassertFailedNoTrace( int msgid ) {
+        problem() << "Fatal Assertion " << msgid << endl;
+        breakpoint();
+        log() << "\n\n***aborting after fassert() failure\n\n" << endl;
+        ::_exit(EXIT_ABRUPT); // bypass our handler for SIGABRT, which prints a stack trace.
+    }
+
+    MONGO_COMPILER_NORETURN void fassertFailedWithStatus(int msgid, const Status& status) {
+        problem() << "Fatal assertion " <<  msgid << " " << status;
         logContext();
         breakpoint();
         log() << "\n\n***aborting after fassert() failure\n\n" << endl;

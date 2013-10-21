@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 
@@ -25,6 +37,13 @@
 
 namespace mongo {
 
+    /**
+     * Authenticates conn using the server's cluster-membership credentials.
+     *
+     * Returns true on successful authentication.
+     */
+    bool replAuthenticate(DBClientBase* conn);
+
     /* started abstracting out the querying of the primary/master's oplog
        still fairly awkward but a start.
     */
@@ -32,10 +51,9 @@ namespace mongo {
     class OplogReader {
         shared_ptr<DBClientConnection> _conn;
         shared_ptr<DBClientCursor> cursor;
-        bool _doHandshake;
         int _tailingQueryOptions;
     public:
-        OplogReader( bool doHandshake = true );
+        OplogReader();
         ~OplogReader() { }
         void resetCursor() { cursor.reset(); }
         void resetConnection() {
@@ -50,10 +68,15 @@ namespace mongo {
             return findOne(ns, Query().sort(reverseNaturalObj));
         }
 
+        /* SO_TIMEOUT (send/recv time out) for our DBClientConnections */
+        static const int tcp_timeout = 30;
+
         /* ok to call if already connected */
         bool connect(const std::string& hostname);
 
-        bool connect(const BSONObj& rid, const int from, const string& to);
+        bool connect(const std::string& hostname, const BSONObj& me);
+
+        bool connect(const mongo::OID& rid, const int from, const string& to);
 
         void tailCheck() {
             if( cursor.get() && cursor->isDead() ) {
@@ -85,6 +108,12 @@ namespace mongo {
             query(ns, q2.done());
         }
         */
+
+        void query(const char *ns,
+                   Query query,
+                   int nToReturn,
+                   int nToSkip,
+                   const BSONObj* fields=0);
 
         void tailingQuery(const char *ns, const BSONObj& query, const BSONObj* fields=0);
 
@@ -131,7 +160,7 @@ namespace mongo {
     private:
         /** @return true iff connection was successful */ 
         bool commonConnect(const string& hostName);
-        bool passthroughHandshake(const BSONObj& rid, const int f);
+        bool passthroughHandshake(const mongo::OID& rid, const int f);
     };
 
 }

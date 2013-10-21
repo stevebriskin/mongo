@@ -53,8 +53,7 @@ namespace mutablebson {
      *    act much like STL iterators that walk over the Document tree. One important
      *    difference is that Elements are never invalidated, even when 'remove' is called. If
      *    you have two Elements that alias the same element in the Document tree, modifications
-     *    through one Element will be visible via the other (modulo one exception noted below
-     *    for Element::setValueElement).
+     *    through one Element will be visible via the other.
      *
      *  - Value access: These methods provide access to the value in the Document tree that the
      *    current Element represents. All leaf (a.k.a. 'primitive', or non-Object and
@@ -101,6 +100,19 @@ namespace mutablebson {
     public:
         typedef uint32_t RepIdx;
 
+        // Some special RepIdx values. These are really implementation details, but they are
+        // here so that we can inline Element::OK, which gets called very frequently, and they
+        // need to be public so some free functions in document.cpp can use them. You must not
+        // use these values explicitly.
+
+        // Used to signal an invalid Element.
+        static const RepIdx kInvalidRepIdx = RepIdx(-1);
+
+        // A rep that points to an unexamined entity
+        static const RepIdx kOpaqueRepIdx = RepIdx(-2);
+
+        // This is the highest valid rep that does not overlap flag values.
+        static const RepIdx kMaxRepIdx = RepIdx(-3);
 
         //
         // Topology mutation API. Element arguments must belong to the same Document.
@@ -157,6 +169,11 @@ namespace mutablebson {
          */
         Element rightChild() const;
 
+        /** Returns true if this element has children. Always returns false if this Element is
+         *  not an Object or Array.
+         */
+        bool hasChildren() const;
+
         /** Returns either this Element's left sibling, or a non-ok Element if no left sibling
          *  exists.
          */
@@ -205,6 +222,16 @@ namespace mutablebson {
          *  Element can provide a BSONElement.
          */
         bool hasValue() const;
+
+        /** Returns true if this element is a numeric type (e.g. NumberLong). Currently, the
+         *  only numeric BSON types are NumberLong, NumberInt, and NumberDouble.
+         */
+        bool isNumeric() const;
+
+        /** Returns true if this element is one of the integral numeric types (e.g. NumberLong
+         *  or NumberInt).
+         */
+         bool isIntegral() const;
 
         /** Get the value of this element if available. Note that not all elements have a
          *  representation as a BSONElement. For elements that do have a representation, this
@@ -270,7 +297,7 @@ namespace mutablebson {
         inline bool isValueMaxKey() const;
 
         /** Returns the numeric value as a SafeNum */
-        inline SafeNum getValueSafeNum() const;
+        SafeNum getValueSafeNum() const;
 
 
         //
@@ -348,7 +375,7 @@ namespace mutablebson {
         Status setValueUndefined();
 
         /** Set the value of this Element to the given OID. */
-        Status setValueOID(const OID& value);
+        Status setValueOID(OID value);
 
         /** Set the value of this Element to the given boolean. */
         Status setValueBool(bool value);
@@ -363,7 +390,7 @@ namespace mutablebson {
         Status setValueRegex(const StringData& re, const StringData& flags);
 
         /** Set the value of this Element to the given db ref parameters. */
-        Status setValueDBRef(const StringData& ns, const OID& oid);
+        Status setValueDBRef(const StringData& ns, OID oid);
 
         /** Set the value of this Element to the given code data. */
         Status setValueCode(const StringData& value);
@@ -394,21 +421,6 @@ namespace mutablebson {
         // Value mutation API from variant types.
         //
 
-        /** Set the name, type, and value of this Element to those of the provided Element. The
-         *  Element 'value' must be in a "detached" state, meaning that it is newly constructed
-         *  and not attached to any other Element in the Document.
-         *
-         *  WARNING: This is the one violation of the 'no Element invalidation rule'. The
-         *  Element passed in as 'value' will be modified to point to this Element because the
-         *  source Element referred to by 'value' *is invalidated*. Any Element objects that
-         *  alias 'value' are therefore also invalidated. This shouldn't be a problem since you
-         *  should pass the return value of Document::makeElement[Type] immediately to this
-         *  call, meaning you should never construct an Element that aliases value. Accessing
-         *  the invalidated Element after this call will result in undefined behavior. You have
-         *  been warned.
-         */
-        Status setValueElement(Element* value);
-
         /** Set the value of this element to equal the value of the provided BSONElement
          *  'value'. The name of this Element is not modified.
          *
@@ -419,7 +431,7 @@ namespace mutablebson {
         /** Set the value of this Element to a numeric type appropriate to hold the given
          *  SafeNum value.
          */
-        Status setValueSafeNum(const SafeNum& value);
+        Status setValueSafeNum(const SafeNum value);
 
 
         //
@@ -427,7 +439,7 @@ namespace mutablebson {
         //
 
         /** Returns true if this Element represents a valid part of the Document. */
-        bool ok() const;
+        inline bool ok() const;
 
         /** Returns the Document to which this Element belongs. */
         inline Document& getDocument();
@@ -484,7 +496,7 @@ namespace mutablebson {
         Status appendUndefined(const StringData& fieldName);
 
         /** Append the provided OID as a new field with the provided name. */
-        Status appendOID(const StringData& fieldName, const mongo::OID& value);
+        Status appendOID(const StringData& fieldName, mongo::OID value);
 
         /** Append the provided bool as a new field with the provided name. */
         Status appendBool(const StringData& fieldName, bool value);
@@ -501,7 +513,7 @@ namespace mutablebson {
 
         /** Append the provided DBRef data as a new field with the provided name. */
         Status appendDBRef(const StringData& fieldName,
-                           const StringData& ns, const mongo::OID& oid);
+                           const StringData& ns, mongo::OID oid);
 
         /** Append the provided code data as a new field with the iven name. */
         Status appendCode(const StringData& fieldName, const StringData& value);
@@ -536,8 +548,14 @@ namespace mutablebson {
          */
         Status appendSafeNum(const StringData& fieldName, SafeNum value);
 
+        /** Convert this element to its JSON representation if ok(),
+         *  otherwise return !ok() message */
+        std::string toString() const;
+
     private:
         friend class Document;
+        friend class ConstElement;
+
         friend bool operator==(const Element&, const Element&);
 
         inline Element(Document* doc, RepIdx repIdx);
@@ -546,10 +564,10 @@ namespace mutablebson {
 
         StringData getValueStringOrSymbol() const;
 
-        Status setValue(Element* newValue);
+        Status setValue(Element::RepIdx newValueIdx);
 
         template<typename Builder>
-        inline void writeElement(Builder* builder) const;
+        inline void writeElement(Builder* builder, const StringData* fieldName = NULL) const;
 
         template<typename Builder>
         inline void writeChildren(Builder* builder) const;

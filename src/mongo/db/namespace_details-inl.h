@@ -1,4 +1,4 @@
-// @file namespace-inl.h
+// namespace_details-inl.h
 
 /**
 *    Copyright (C) 2009 10gen Inc.
@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
@@ -56,8 +68,9 @@ namespace mongo {
         return -1;
     }
 
-    inline int NamespaceDetails::findIndexByKeyPattern(const BSONObj& keyPattern) {
-        IndexIterator i = ii();
+    inline int NamespaceDetails::findIndexByKeyPattern(const BSONObj& keyPattern,
+                                                       bool includeBackgroundInProgress) {
+        IndexIterator i = ii(includeBackgroundInProgress);
         while( i.more() ) {
             if( i.next().keyPattern() == keyPattern )
                 return i.pos()-1;
@@ -83,10 +96,11 @@ namespace mongo {
     }
 
     // @return offset in indexes[]
-    inline int NamespaceDetails::findIndexByName(const char *name) {
-        IndexIterator i = ii();
+    inline int NamespaceDetails::findIndexByName(const StringData& name,
+                                                 bool includeBackgroundInProgress) {
+        IndexIterator i = ii(includeBackgroundInProgress);
         while( i.more() ) {
-            if ( strcmp(i.next().info.obj().getStringField("name"),name) == 0 )
+            if ( name == i.next().info.obj().getStringField("name") )
                 return i.pos()-1;
         }
         return -1;
@@ -96,7 +110,7 @@ namespace mongo {
                                                           bool includeBackgroundInProgress) {
         d = _d;
         i = 0;
-        n = includeBackgroundInProgress ? d->getTotalIndexCount() : d->nIndexes;
+        n = includeBackgroundInProgress ? d->getTotalIndexCount() : d->_nIndexes;
     }
 
 }

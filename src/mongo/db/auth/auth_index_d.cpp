@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/auth/auth_index_d.h"
@@ -30,19 +42,29 @@ namespace mongo {
 namespace authindex {
 
 namespace {
-    BSONObj oldSystemUsersKeyPattern;
-    BSONObj extendedSystemUsersKeyPattern;
-    std::string extendedSystemUsersIndexName;
+    BSONObj v0SystemUsersKeyPattern;
+    BSONObj v1SystemUsersKeyPattern;
+    BSONObj v2SystemUsersKeyPattern;
+    BSONObj v2SystemRolesKeyPattern;
+    std::string v2SystemUsersIndexName;
+    std::string v2SystemRolesIndexName;
 
     MONGO_INITIALIZER(AuthIndexKeyPatterns)(InitializerContext*) {
-        oldSystemUsersKeyPattern = BSON(AuthorizationManager::USER_NAME_FIELD_NAME << 1);
-        extendedSystemUsersKeyPattern = BSON(AuthorizationManager::USER_NAME_FIELD_NAME << 1 <<
-                                             AuthorizationManager::USER_SOURCE_FIELD_NAME << 1);
-        extendedSystemUsersIndexName = std::string(str::stream() <<
-                                                   AuthorizationManager::USER_NAME_FIELD_NAME <<
-                                                   "_1_" <<
-                                                   AuthorizationManager::USER_SOURCE_FIELD_NAME <<
-                                                   "_1");
+        v0SystemUsersKeyPattern = BSON(AuthorizationManager::V1_USER_NAME_FIELD_NAME << 1);
+        v1SystemUsersKeyPattern = BSON(AuthorizationManager::V1_USER_NAME_FIELD_NAME << 1 <<
+                                       AuthorizationManager::V1_USER_SOURCE_FIELD_NAME << 1);
+        v2SystemUsersKeyPattern = BSON(AuthorizationManager::USER_NAME_FIELD_NAME << 1 <<
+                                       AuthorizationManager::USER_SOURCE_FIELD_NAME << 1);
+        v2SystemRolesKeyPattern = BSON(AuthorizationManager::ROLE_NAME_FIELD_NAME << 1 <<
+                                       AuthorizationManager::ROLE_SOURCE_FIELD_NAME << 1);
+        v2SystemUsersIndexName = std::string(
+                str::stream() <<
+                        AuthorizationManager::USER_NAME_FIELD_NAME << "_1_" <<
+                        AuthorizationManager::USER_SOURCE_FIELD_NAME << "_1");
+        v2SystemRolesIndexName = std::string(
+                str::stream() <<
+                        AuthorizationManager::ROLE_NAME_FIELD_NAME << "_1_" <<
+                        AuthorizationManager::ROLE_SOURCE_FIELD_NAME << "_1");
         return Status::OK();
     }
 
@@ -50,9 +72,10 @@ namespace {
         std::string systemUsers = dbname.toString() + ".system.users";
         Client::WriteContext wctx(systemUsers);
 
-        createSystemIndexes(systemUsers);
+        NamespaceString systemUsersNS( systemUsers );
+        createSystemIndexes(systemUsersNS);
 
-        NamespaceDetails* nsd = nsdetails(systemUsers.c_str());
+        NamespaceDetails* nsd = nsdetails(systemUsers);
         if (nsd == NULL)
             return;
 
@@ -61,7 +84,8 @@ namespace {
 
         while (indexIter.more()) {
             IndexDetails& idetails = indexIter.next();
-            if (idetails.keyPattern() == oldSystemUsersKeyPattern)
+            if (idetails.keyPattern() == v0SystemUsersKeyPattern ||
+                    idetails.keyPattern() == v1SystemUsersKeyPattern)
                 namedIndexesToDrop.push_back(idetails.indexName());
         }
         for (size_t i = 0; i < namedIndexesToDrop.size(); ++i) {
@@ -74,35 +98,54 @@ namespace {
                             errmsg,
                             infoBuilder,
                             false)) {
-                log() << "Dropped index " << namedIndexesToDrop[i] << " with key pattern " <<
-                    oldSystemUsersKeyPattern << " from " << systemUsers <<
-                    " because it is incompatible with extended form privilege documents." << endl;
+                log() << "Dropped index " << namedIndexesToDrop[i] << " from " << systemUsers <<
+                    " because it is incompatible with v2 form privilege documents." << endl;
             }
             else {
                 // Only reason should be orphaned index, which dropIndexes logged.
             }
         }
     }
+
+    void configureSystemRolesIndexes(const StringData& dbname) {
+        std::string systemRoles = dbname.toString() + ".system.roles";
+        Client::WriteContext wctx(systemRoles);
+
+        NamespaceString systemRolesNS( systemRoles );
+        createSystemIndexes(systemRolesNS);
+    }
 }  // namespace
 
     void configureSystemIndexes(const StringData& dbname) {
         configureSystemUsersIndexes(dbname);
+        configureSystemRolesIndexes(dbname);
     }
 
     void createSystemIndexes(const NamespaceString& ns) {
-        if (ns.coll == "system.users") {
+        if (ns.coll() == "system.users") {
             try {
                 Helpers::ensureIndex(ns.ns().c_str(),
-                                     extendedSystemUsersKeyPattern,
+                                     v2SystemUsersKeyPattern,
                                      true,  // unique
-                                     extendedSystemUsersIndexName.c_str());
+                                     v2SystemUsersIndexName.c_str());
             } catch (const DBException& e) {
                 if (e.getCode() == ASSERT_ID_DUPKEY) {
                     log() << "Duplicate key exception while trying to build unique index on " <<
-                            ns << ".  You most likely have user documents with duplicate \"user\" "
-                            "fields.  To resolve this, start up with a version of MongoDB prior to "
-                            "2.4, drop the duplicate user documents, then start up again with the "
-                            "current version." << endl;
+                            ns << ".  This is likely due to problems during the upgrade process " <<
+                            endl;
+                }
+                throw;
+            }
+        } else if (ns.coll() == "system.roles") {
+            try {
+                Helpers::ensureIndex(ns.ns().c_str(),
+                                     v2SystemRolesKeyPattern,
+                                     true,  // unique
+                                     v2SystemRolesIndexName.c_str());
+            } catch (const DBException& e) {
+                if (e.getCode() == ASSERT_ID_DUPKEY) {
+                    log() << "Duplicate key exception while trying to build unique index on " <<
+                            ns << "." << endl;
                 }
                 throw;
             }

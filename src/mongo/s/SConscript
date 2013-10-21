@@ -6,9 +6,8 @@ Import("env")
 # Schema and backward compatibility code for "config" collections.
 #
 
-env.StaticLibrary('base', [#'chunk_version.cpp',
-                           'field_parser.cpp',
-                           'mongo_version_range.cpp',
+env.StaticLibrary('base', ['mongo_version_range.cpp',
+                           'range_arithmetic.cpp',
                            'type_changelog.cpp',
                            'type_chunk.cpp',
                            'type_collection.cpp',
@@ -23,34 +22,63 @@ env.StaticLibrary('base', [#'chunk_version.cpp',
                   LIBDEPS=['$BUILD_DIR/mongo/base/base',
                            '$BUILD_DIR/mongo/bson'])
 
-env.CppUnitTest('chunk_version_test', 'chunk_version_test.cpp', LIBDEPS=['base'])
-
-env.CppUnitTest('field_parser_test', 'field_parser_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('chunk_version_test', 'chunk_version_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
 env.CppUnitTest('mongo_version_range_test', 'mongo_version_range_test.cpp', 
-                LIBDEPS=['base', '$BUILD_DIR/mongo/bson'])
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/bson',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_changelog_test', 'type_changelog_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('range_arithmetic_test', 'range_arithmetic_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/bson',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_chunk_test', 'type_chunk_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_changelog_test', 'type_changelog_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_collection_test', 'type_collection_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_chunk_test', 'type_chunk_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_config_version_test', 'type_config_version_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_collection_test', 'type_collection_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_database_test', 'type_database_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_config_version_test', 'type_config_version_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_locks_test', 'type_locks_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_database_test', 'type_database_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_lockpings_test', 'type_lockpings_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_locks_test', 'type_locks_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_settings_test', 'type_settings_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_lockpings_test', 'type_lockpings_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_shard_test', 'type_shard_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_settings_test', 'type_settings_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_mongos_test', 'type_mongos_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_shard_test', 'type_shard_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
-env.CppUnitTest('type_tags_test', 'type_tags_test.cpp', LIBDEPS=['base'])
+env.CppUnitTest('type_mongos_test', 'type_mongos_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
+
+env.CppUnitTest('type_tags_test', 'type_tags_test.cpp',
+                LIBDEPS=['base',
+                         '$BUILD_DIR/mongo/db/common'])
 
 #
 # Upgrade library for config database
@@ -60,8 +88,8 @@ env.CppUnitTest('type_tags_test', 'type_tags_test.cpp', LIBDEPS=['base'])
 env.Library('upgrade', ['cluster_client_internal.cpp',
                         'config_upgrade.cpp',
                         'config_upgrade_helpers.cpp',
-                        'config_upgrade_v0_to_v4.cpp',
-                        'config_upgrade_v3_to_v4.cpp'],
+                        'config_upgrade_v0_to_v5.cpp',
+                        'config_upgrade_v4_to_v5.cpp'],
             LIBDEPS=['base',
                      '$BUILD_DIR/mongo/mongocommon'])
 
@@ -71,26 +99,162 @@ env.Library('upgrade', ['cluster_client_internal.cpp',
 # Support for maintaining persistent sharding state and data.
 #
 
-env.StaticLibrary('metadata', ['collection_manager.cpp',
+env.StaticLibrary('metadata', ['collection_metadata.cpp',
                                'metadata_loader.cpp'],
                   LIBDEPS=['base',
-                           '$BUILD_DIR/mongo/clientandshell',
+                           '$BUILD_DIR/mongo/bson',
                            '$BUILD_DIR/mongo/base/base',
-                           '$BUILD_DIR/mongo/bson'])
+                           '$BUILD_DIR/mongo/mongocommon', # DBClient library
+                          ])
 
 env.CppUnitTest('chunk_diff_test',
                 'chunk_diff_test.cpp',
-                LIBDEPS=['metadata'],
+                LIBDEPS=['metadata',
+                         '$BUILD_DIR/mongo/clientandshell', # CmdLine crutch
+                         '$BUILD_DIR/mongo/db/common'],
                 NO_CRUTCH=True)
 
-env.CppUnitTest('collection_manager_test',
-                'collection_manager_test.cpp',
+env.CppUnitTest('collection_metadata_test',
+                'collection_metadata_test.cpp',
                 LIBDEPS=['metadata',
-                         '$BUILD_DIR/mongo/mocklib'],
+                         '$BUILD_DIR/mongo/mocklib',
+                         '$BUILD_DIR/mongo/clientandshell', # CmdLine crutch
+                         '$BUILD_DIR/mongo/db/common'],
                 NO_CRUTCH=True)
 
 env.CppUnitTest('metadata_loader_test',
                 'metadata_loader_test.cpp',
                 LIBDEPS=['metadata',
-                         '$BUILD_DIR/mongo/mocklib'],
+                         '$BUILD_DIR/mongo/mocklib',
+                         '$BUILD_DIR/mongo/clientandshell', # CmdLine crutch
+                         '$BUILD_DIR/mongo/db/common'],
                 NO_CRUTCH=True);
+
+#
+# Write Operations
+#
+
+env.StaticLibrary(
+    target='batched_write_ops',
+    source=[
+        'batched_command_request.cpp',
+        'batched_command_response.cpp',
+        'batched_delete_request.cpp',
+        'batched_delete_document.cpp',
+        'batched_error_detail.cpp',
+        'batched_insert_request.cpp',
+        'batched_update_request.cpp',
+        'batched_update_document.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base/base',
+        '$BUILD_DIR/mongo/bson',
+    ],
+)
+
+env.CppUnitTest(
+    target='batched_command_response_test',
+    source=[
+        'batched_command_response_test.cpp',
+    ],
+    LIBDEPS=[
+        'batched_write_ops',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
+
+env.CppUnitTest(
+    target='batched_delete_request_test',
+    source=[
+        'batched_delete_request_test.cpp',
+    ],
+    LIBDEPS=[
+        'batched_write_ops',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
+
+env.CppUnitTest(
+    target='batched_insert_request_test',
+    source=[
+        'batched_insert_request_test.cpp',
+    ],
+    LIBDEPS=[
+        'batched_write_ops',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
+
+env.CppUnitTest(
+    target='batched_update_request_test',
+    source=[
+        'batched_update_request_test.cpp',
+    ],
+    LIBDEPS=[
+        'batched_write_ops',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
+
+env.StaticLibrary(
+    target='write_ops',
+    source=[
+        'write_op.cpp',
+        'batch_write_op.cpp',
+        'batch_write_exec.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/bson',
+        'batched_write_ops',
+    ],
+)
+
+env.CppUnitTest(
+    target='write_op_test',
+    source=[
+        'write_op_test.cpp',
+    ],
+    LIBDEPS=[
+        'base',
+        'write_ops',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
+
+env.CppUnitTest(
+    target='batch_write_op_test',
+    source=[
+        'batch_write_op_test.cpp',
+    ],
+    LIBDEPS=[
+        'base',
+        'write_ops',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
+
+env.CppUnitTest(
+    target='batch_write_exec_test',
+    source=[
+        'batch_write_exec_test.cpp',
+    ],
+    LIBDEPS=[
+        'base',
+        'write_ops',
+        '$BUILD_DIR/mongo/db/common',
+    ]
+)
+
+env.StaticLibrary(
+    target='write_op_impl',
+    source=[
+        'chunk_manager_targeter.cpp',
+        'dbclient_multi_command.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/bson',
+        'batched_write_ops',
+    ],
+)
+
+

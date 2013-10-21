@@ -14,6 +14,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 
@@ -23,7 +35,7 @@
 
 #include "mongo/bson/util/atomic_int.h"
 #include "mongo/db/client.h"
-#include "mongo/db/namespace-inl.h"
+#include "mongo/db/storage/namespace.h"
 #include "mongo/util/concurrency/spin_lock.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/progress_meter.h"
@@ -80,7 +92,8 @@ namespace mongo {
         long long nscanned;
         bool idhack;         // indicates short circuited code path on an update to make the update faster
         bool scanAndOrder;   // scanandorder query plan aspect was used
-        long long  nupdated; // number of records updated
+        long long  nupdated; // number of records updated (including no-ops)
+        long long  nupdateNoops; // number of records updated which were noops
         long long  nmoved;   // updates resulted in a move (moves are expensive)
         long long  ninserted;
         long long  ndeleted;
@@ -121,8 +134,8 @@ namespace mongo {
 
         void set( const BSONObj& o ) {
             scoped_spinlock lk(_lock);
-            int sz = o.objsize();
-            if ( sz > (int) sizeof(_buf) ) {
+            size_t sz = o.objsize();
+            if ( sz > sizeof(_buf) ) {
                 _reset(TOO_BIG_SENTINEL);
             }
             else {
@@ -175,8 +188,6 @@ namespace mongo {
         BSONObj query() const { return _query.get();  }
         void appendQuery( BSONObjBuilder& b , const StringData& name ) const { _query.append( b , name ); }
         
-        void ensureStarted();
-        bool isStarted() const { return _start > 0; }
         void enter( Client::Context * context );
         void leave( Client::Context * context );
         void reset();
@@ -190,7 +201,7 @@ namespace mongo {
             if ( _dbprofile <= 0 )
                 return false;
 
-            return _dbprofile >= 2 || ms >= cmdLine.slowMS;
+            return _dbprofile >= 2 || ms >= serverGlobalParams.slowMS;
         }
 
         AtomicUInt opNum() const { return _opNum; }
@@ -200,6 +211,41 @@ namespace mongo {
 
         bool displayInCurop() const { return _active && ! _suppressFromCurop; }
         int getOp() const { return _op; }
+
+        //
+        // Methods for controlling CurOp "max time".
+        //
+
+        /**
+         * Sets the amount of time operation this should be allowed to run, units of microseconds.
+         * The special value 0 is "allow to run indefinitely".
+         */
+        void setMaxTimeMicros(uint64_t maxTimeMicros);
+
+        /**
+         * Checks whether this operation has been running longer than its time limit.  Returns
+         * false if not, or if the operation has no time limit.
+         *
+         * Note that KillCurrentOp objects are responsible for interrupting CurOp objects that
+         * have exceeded their allotted time; CurOp objects do not interrupt themselves.
+         */
+        bool maxTimeHasExpired();
+
+        /**
+         * Returns the number of microseconds remaining for this operation's time limit, or the
+         * special value 0 if the operation has no time limit.
+         *
+         * Calling this method is more expensive than calling its sibling "maxTimeHasExpired()",
+         * since an accurate measure of remaining time needs to be calculated.
+         */
+        uint64_t getRemainingMaxTimeMicros() const;
+
+        //
+        // Methods for getting/setting elapsed time.
+        //
+
+        void ensureStarted();
+        bool isStarted() const { return _start > 0; }
         unsigned long long startTime() { // micros
             ensureStarted();
             return _start;
@@ -208,19 +254,28 @@ namespace mongo {
             _active = false;
             _end = curTimeMicros64();
         }
+
         unsigned long long totalTimeMicros() {
             massert( 12601 , "CurOp not marked done yet" , ! _active );
             return _end - startTime();
         }
         int totalTimeMillis() { return (int) (totalTimeMicros() / 1000); }
+        unsigned long long elapsedMicros() {
+            return curTimeMicros64() - startTime();
+        }
         int elapsedMillis() {
-            unsigned long long total = curTimeMicros64() - startTime();
-            return (int) (total / 1000);
+            return (int) (elapsedMicros() / 1000);
         }
         int elapsedSeconds() { return elapsedMillis() / 1000; }
+
         void setQuery(const BSONObj& query) { _query.set( query ); }
         Client * getClient() const { return _client; }
+
         BSONObj info();
+
+        // Fetches less information than "info()"; used to search for ops with certain criteria
+        BSONObj description();
+
         string getRemoteString( bool includePort = true ) { return _remote.toString(includePort); }
         ProgressMeter& setMessage(const char * msg,
                                   std::string name = "Progress",
@@ -245,6 +300,15 @@ namespace mongo {
         LockStat& lockStat() { return _lockStat; }
 
         void setKillWaiterFlags();
+
+        /**
+         * Find a currently running operation matching the given criteria. This assumes that you're
+         * going to kill the operation, so it must be called multiple times to get multiple matching
+         * operations.
+         * @param criteria the search to do against the infoNoauth() BSONObj
+         * @return a pointer to a matching op or NULL if no ops match
+         */
+        static CurOp* getOp(const BSONObj& criteria);
     private:
         friend class Client;
         void _reset();
@@ -276,5 +340,54 @@ namespace mongo {
         // a writebacklisten for example will block for 30s 
         // so this should be 30000 in that case
         long long _expectedLatencyMs; 
+
+        /** Nested class that implements a time limit ($maxTimeMS) for a CurOp object. */
+        class MaxTimeTracker {
+            MONGO_DISALLOW_COPYING(MaxTimeTracker);
+        public:
+            /** Newly-constructed MaxTimeTracker objects have the time limit disabled. */
+            MaxTimeTracker();
+
+            /** Disables the time limit. */
+            void reset();
+
+            /** Returns whether or not the time limit is enabled. */
+            bool isEnabled() { return _enabled; }
+
+            /**
+             * Enables the time limit to be "durationMicros" microseconds from "startEpochMicros"
+             * (units of microseconds since the epoch).
+             *
+             * "durationMicros" must be nonzero.
+             */
+            void setTimeLimit(uint64_t startEpochMicros, uint64_t durationMicros);
+
+            /**
+             * Checks whether the time limit has been hit.  Returns false if not, or if the time
+             * limit is disabled.
+             */
+            bool checkTimeLimit();
+
+            /**
+             * Returns the number of microseconds remaining for the time limit, or the special
+             * value 0 if the time limit is disabled.
+             *
+             * Calling this method is more expensive than calling its sibling "checkInterval()",
+             * since an accurate measure of remaining time needs to be calculated.
+             */
+            uint64_t getRemainingMicros() const;
+        private:
+            // Whether or not this operation is subject to a time limit.
+            bool _enabled;
+
+            // Point in time at which the time limit is hit.  Units of microseconds since the
+            // epoch.
+            uint64_t _targetEpochMicros;
+
+            // Approximate point in time at which the time limit is hit.   Units of milliseconds
+            // since the server process was started.
+            int64_t _approxTargetServerMillis;
+        } _maxTimeTracker;
+
     };
 }

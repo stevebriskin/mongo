@@ -14,7 +14,7 @@
  */
 
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/util/touch_pages.h"
 
@@ -45,17 +45,17 @@ namespace mongo {
             Client::ReadContext ctx(ns);
             NamespaceDetails *nsd = nsdetails(ns);
             uassert( 16154, "namespace does not exist", nsd );
-            
-            for( DiskLoc L = nsd->firstExtent; !L.isNull(); L = L.ext()->xnext )  {
-                MongoDataFile* mdf = cc().database()->getFile( L.a() );
+
+            for( DiskLoc L = nsd->firstExtent(); !L.isNull(); L = L.ext()->xnext )  {
+                DataFile* mdf = cc().database()->getFile( L.a() );
                 massert( 16238, "can't fetch extent file structure", mdf );
                 touch_location tl;
                 tl.fd = mdf->getFd();
                 tl.offset = L.getOfs();
                 tl.ext = L.ext();
                 tl.length = tl.ext->length;
-                
-                ranges.push_back(tl);                
+
+                ranges.push_back(tl);
             }
             mongoFilesLock.reset(new LockMongoFilesShared());
         }
@@ -73,23 +73,13 @@ namespace mongo {
         pm.finished();
     }
 
-#if defined(__linux__)    
-    void touch_pages( HANDLE fd, int offset, size_t length, const Extent* ext ) {
-        if ( -1 == readahead(fd, offset, length) ) {
-            massert( 16237, str::stream() << "readahead failed on fd " << fd 
-                     << " offset " << offset << " len " << length 
-                     << " : " << errnoWithDescription(errno), 0 );
-        }
-    }
-#else // if defined __linux__
     char _touch_pages_char_reader; // goes in .bss
+  
     void touch_pages( HANDLE fd, int offset, size_t length, const Extent* ext ) {
         // read first byte of every page, in order
         const char *p = static_cast<const char *>(static_cast<const void *> (ext));
         for( size_t i = 0; i < length; i += g_minOSPageSizeBytes ) { 
             _touch_pages_char_reader += p[i];
         }
-  
     }
-#endif // if defined __linux__
 }

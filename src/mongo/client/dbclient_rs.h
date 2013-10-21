@@ -201,12 +201,12 @@ namespace mongo {
          * checks all sets for current master and new secondaries
          * usually only called from a BackgroundJob
          */
-        static void checkAll( bool checkAllSecondaries );
+        static void checkAll();
 
         /**
          * Removes the ReplicaSetMonitor for the given set name from _sets, which will delete it.
          * If clearSeedCache is true, then the cached seed string for this Replica Set will be removed
-         * from _setServers.
+         * from _seedServers.
          */
         static void remove( const string& name, bool clearSeedCache = false );
 
@@ -220,6 +220,19 @@ namespace mongo {
          * ownership passes to ReplicaSetMonitor and the hook will actually never be deleted
          */
         static void setConfigChangeHook( ConfigChangeHook hook );
+
+        /**
+         * Stops all monitoring on replica sets and clears all cached information as well.
+         * Note that this does not prevent new monitors from being created afterwards or even
+         * while this is being executed. As a consequence, NEVER call this if you have other
+         * threads that has a DBClientReplicaSet instance or will create one before this
+         * fully terminates as it will cause a deadlock. This is intended for performing cleanups
+         * in unit tests.
+         *
+         * Warning: Make sure that the monitor thread is running, otherwise this can hang
+         * indefinitely.
+         */
+        static void cleanup();
 
         ~ReplicaSetMonitor();
 
@@ -252,7 +265,7 @@ namespace mongo {
         /**
          * checks for current master and new secondaries
          */
-        void check( bool checkAllSecondaries );
+        void check();
 
         string getName() const { return _name; }
 
@@ -296,17 +309,8 @@ namespace mongo {
         /**
          * Checks all connections from the host list and sets the current
          * master.
-         * 
-         * @param checkAllSecondaries if set to false, stop immediately when
-         *    the master is found or when _master is not -1.
          */
-        void _check( bool checkAllSecondaries );
-
-        /**
-         * Use replSetGetStatus command to make sure hosts in host list are up
-         * and readable.  Sets Node::ok appropriately.
-         */
-        void _checkStatus( const string& hostAddr );
+        void _check();
 
         /**
          * Add array of hosts to host list. Doesn't do anything if hosts are
@@ -333,7 +337,7 @@ namespace mongo {
                 bool verbose, int nodesOffset );
 
         /**
-         * Save the seed list for the current set into the _setServers map
+         * Save the seed list for the current set into the _seedServers map
          * Should only be called if you're already holding _setsLock and this
          * monitor's _lock.
          */
@@ -397,9 +401,12 @@ namespace mongo {
         // The number of consecutive times the set has been checked and every member in the set was down.
         int _failedChecks;
 
-        static mongo::mutex _setsLock; // protects _sets and _setServers
-        static map<string,ReplicaSetMonitorPtr> _sets; // set name to Monitor
-        static map<string,vector<HostAndPort> > _seedServers; // set name to seed list. Used to rebuild the monitor if it is cleaned up but then the set is accessed again.
+        static mongo::mutex _setsLock; // protects _seedServers and _sets
+
+        // set name to seed list.
+        // Used to rebuild the monitor if it is cleaned up but then the set is accessed again.
+        static map<string, vector<HostAndPort> > _seedServers;
+        static map<string, ReplicaSetMonitorPtr> _sets; // set name to Monitor
 
         static ConfigChangeHook _hook;
         int _localThresholdMillis; // local ping latency threshold (protected by _lock)
@@ -498,6 +505,7 @@ namespace mongo {
         // ----- status ------
 
         virtual bool isFailed() const { return ! _master || _master->isFailed(); }
+        bool isStillConnected();
 
         // ----- informational ----
 
@@ -646,6 +654,11 @@ namespace mongo {
          */
         void next();
 
+        /**
+         * Rests the iterator to point to the first element (if there is a tag).
+         */
+        void reset();
+
         //
         // Getters
         //
@@ -672,6 +685,8 @@ namespace mongo {
          */
         bool equals(const TagSet& other) const;
 
+        const BSONArray& getTagBSON() const;
+
     private:
         /**
          * This is purposely undefined as the semantics for assignment can be
@@ -684,7 +699,7 @@ namespace mongo {
 
         // Important: do not re-order _tags & _tagIterator
         BSONArray _tags;
-        BSONArrayIteratorSorted _tagIterator;
+        scoped_ptr<BSONArrayIteratorSorted> _tagIterator;
     };
 
     struct ReadPreferenceSetting {
@@ -702,6 +717,8 @@ namespace mongo {
         inline bool equals(const ReadPreferenceSetting& other) const {
             return pref == other.pref && tags.equals(other.tags);
         }
+
+        BSONObj toBSON() const;
 
         const ReadPreference pref;
         TagSet tags;

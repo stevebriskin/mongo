@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -19,17 +31,32 @@
 #include "mongo/db/initialize_server_global_state.h"
 
 #include <boost/filesystem/operations.hpp>
+#include <memory>
 
 #ifndef _WIN32
+#include <syslog.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #endif
 
+#include "mongo/base/init.h"
+#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_manager_global.h"
 #include "mongo/db/auth/security_key.h"
-#include "mongo/db/cmdline.h"
+#include "mongo/logger/logger.h"
+#include "mongo/logger/console_appender.h"
+#include "mongo/logger/message_event.h"
+#include "mongo/logger/message_event_utf8_encoder.h"
+#include "mongo/logger/ramlog.h"
+#include "mongo/logger/rotatable_file_appender.h"
+#include "mongo/logger/rotatable_file_manager.h"
+#include "mongo/logger/rotatable_file_writer.h"
+#include "mongo/logger/syslog_appender.h"
+#include "mongo/platform/process_id.h"
 #include "mongo/util/log.h"
 #include "mongo/util/net/listen.h"
+#include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/processinfo.h"
 
 namespace fs = boost::filesystem;
@@ -40,9 +67,9 @@ namespace mongo {
     // support for exit value propagation with fork
     void launchSignal( int sig ) {
         if ( sig == SIGUSR2 ) {
-            pid_t cur = getpid();
+            ProcessId cur = ProcessId::getCurrent();
             
-            if ( cur == cmdLine.parentProc || cur == cmdLine.leaderProc ) {
+            if (cur == serverGlobalParams.parentProc || cur == serverGlobalParams.leaderProc) {
                 // signal indicates successful start allowing us to exit
                 _exit(0);
             } 
@@ -53,31 +80,25 @@ namespace mongo {
         verify( signal(SIGUSR2 , launchSignal ) != SIG_ERR );
     }
 
-    void CmdLine::launchOk() {
-        if ( cmdLine.doFork ) {
+    void signalForkSuccess() {
+        if (serverGlobalParams.doFork) {
             // killing leader will propagate to parent
-            verify( kill( cmdLine.leaderProc, SIGUSR2 ) == 0 );
+            verify(kill(serverGlobalParams.leaderProc.toNative(), SIGUSR2) == 0);
         }
     }
 #endif
 
-    bool initializeServerGlobalState(bool isMongodShutdownSpecialCase) {
 
-        Listener::globalTicketHolder.resize( cmdLine.maxConns );
-
+    static bool forkServer() {
 #ifndef _WIN32
-        if (!fs::is_directory(cmdLine.socket)) {
-            cout << cmdLine.socket << " must be a directory" << endl;
-            return false;
-        }
-
-        if (cmdLine.doFork) {
-            fassert(16447, !cmdLine.logpath.empty() || cmdLine.logWithSyslog);
+        if (serverGlobalParams.doFork) {
+            fassert(16447, !serverGlobalParams.logpath.empty() ||
+                           serverGlobalParams.logWithSyslog);
 
             cout.flush();
             cerr.flush();
 
-            cmdLine.parentProc = getpid();
+            serverGlobalParams.parentProc = ProcessId::getCurrent();
 
             // facilitate clean exit when child starts successfully
             setupLaunchSignals();
@@ -116,7 +137,7 @@ namespace mongo {
             }
             setsid();
 
-            cmdLine.leaderProc = getpid();
+            serverGlobalParams.leaderProc = ProcessId::getCurrent();
 
             pid_t child2 = fork();
             if (child2 == -1) {
@@ -138,14 +159,13 @@ namespace mongo {
 
             // this is run in the final child process (the server)
 
-            // stdout handled in initLogging
-            //fclose(stdout);
-            //freopen("/dev/null", "w", stdout);
+            FILE* f = freopen("/dev/null", "w", stdout);
+            if ( f == NULL ) {
+                cout << "Cant reassign stdout while forking server process: " << strerror(errno) << endl;
+                return false;
+            }
 
-            fclose(stderr);
-            fclose(stdin);
-
-            FILE* f = freopen("/dev/null", "w", stderr);
+            f = freopen("/dev/null", "w", stderr);
             if ( f == NULL ) {
                 cout << "Cant reassign stderr while forking server process: " << strerror(errno) << endl;
                 return false;
@@ -157,50 +177,180 @@ namespace mongo {
                 return false;
             }
         }
+#endif  // !defined(_WIN32)
+        return true;
+    }
 
-        if (cmdLine.logWithSyslog) {
+    void forkServerOrDie() {
+        if (!forkServer())
+            _exit(EXIT_FAILURE);
+    }
+
+    MONGO_INITIALIZER_GENERAL(ServerLogRedirection,
+                              ("GlobalLogManager", "EndStartupOptionHandling", "ForkServer"),
+                              ("default"))(
+            InitializerContext*) {
+
+        using logger::LogManager;
+        using logger::MessageEventEphemeral;
+        using logger::MessageEventDetailsEncoder;
+        using logger::MessageEventWithContextEncoder;
+        using logger::MessageLogDomain;
+        using logger::RotatableFileAppender;
+        using logger::StatusWithRotatableFileWriter;
+
+        if (serverGlobalParams.logWithSyslog) {
+#ifdef _WIN32
+            return Status(ErrorCodes::InternalError,
+                          "Syslog requested in Windows build; command line processor logic error");
+#else
+            using logger::SyslogAppender;
+
             StringBuilder sb;
-            sb << cmdLine.binaryName << "." << cmdLine.port;
-            Logstream::useSyslog( sb.str().c_str() );
+            sb << serverGlobalParams.binaryName << "." << serverGlobalParams.port;
+            openlog(strdup(sb.str().c_str()),
+                    LOG_PID | LOG_CONS,
+                    serverGlobalParams.syslogFacility);
+            LogManager* manager = logger::globalLogManager();
+            manager->getGlobalDomain()->clearAppenders();
+            manager->getGlobalDomain()->attachAppender(
+                    MessageLogDomain::AppenderAutoPtr(
+                            new SyslogAppender<MessageEventEphemeral>(
+                                    new logger::MessageEventWithContextEncoder)));
+            manager->getNamedDomain("javascriptOutput")->attachAppender(
+                    MessageLogDomain::AppenderAutoPtr(
+                            new SyslogAppender<MessageEventEphemeral>(
+                                    new logger::MessageEventWithContextEncoder)));
+#endif // defined(_WIN32)
+        }
+        else if (!serverGlobalParams.logpath.empty()) {
+            fassert(16448, !serverGlobalParams.logWithSyslog);
+            std::string absoluteLogpath = boost::filesystem::absolute(
+                    serverGlobalParams.logpath, serverGlobalParams.cwd).string();
+
+            bool exists;
+
+            try{
+                exists = boost::filesystem::exists(absoluteLogpath);
+            } catch(boost::filesystem::filesystem_error& e) {
+                return Status(ErrorCodes::FileNotOpen, mongoutils::str::stream() <<
+                        "Failed probe for \"" << absoluteLogpath << "\": " <<
+                        e.code().message());
+            }
+
+            if (exists) {
+                if (boost::filesystem::is_directory(absoluteLogpath)) {
+                    return Status(ErrorCodes::FileNotOpen, mongoutils::str::stream() <<
+                                  "logpath \"" << absoluteLogpath <<
+                                  "\" should name a file, not a directory.");
+                }
+
+                if (!serverGlobalParams.logAppend &&
+                    boost::filesystem::is_regular(absoluteLogpath)) {
+                    std::string renameTarget = absoluteLogpath + "." + terseCurrentTime(false);
+                    if (0 == rename(absoluteLogpath.c_str(), renameTarget.c_str())) {
+                        log() << "log file \"" << absoluteLogpath
+                              << "\" exists; moved to \"" << renameTarget << "\".";
+                    }
+                    else {
+                        return Status(ErrorCodes::FileRenameFailed, mongoutils::str::stream() <<
+                                      "Could not rename preexisting log file \"" <<
+                                      absoluteLogpath << "\" to \"" << renameTarget <<
+                                      "\"; run with --logappend or manually remove file: " <<
+                                      errnoWithDescription());
+                    }
+                }
+            }
+
+            StatusWithRotatableFileWriter writer =
+                logger::globalRotatableFileManager()->openFile(absoluteLogpath,
+                                                               serverGlobalParams.logAppend);
+            if (!writer.isOK()) {
+                return writer.getStatus();
+            }
+
+            LogManager* manager = logger::globalLogManager();
+            manager->getGlobalDomain()->clearAppenders();
+            manager->getGlobalDomain()->attachAppender(
+                    MessageLogDomain::AppenderAutoPtr(
+                            new RotatableFileAppender<MessageEventEphemeral>(
+                                    new MessageEventDetailsEncoder, writer.getValue())));
+            manager->getNamedDomain("javascriptOutput")->attachAppender(
+                    MessageLogDomain::AppenderAutoPtr(
+                            new RotatableFileAppender<MessageEventEphemeral>(
+                                    new MessageEventDetailsEncoder, writer.getValue())));
+
+            if (serverGlobalParams.logAppend && exists) {
+                log() << "***** SERVER RESTARTED *****" << endl;
+                Status status =
+                    logger::RotatableFileWriter::Use(writer.getValue()).status();
+                if (!status.isOK())
+                    return status;
+            }
+        }
+        else {
+            logger::globalLogManager()->getNamedDomain("javascriptOutput")->attachAppender(
+                    MessageLogDomain::AppenderAutoPtr(
+                            new logger::ConsoleAppender<MessageEventEphemeral>(
+                                    new MessageEventDetailsEncoder)));
+        }
+
+        logger::globalLogDomain()->attachAppender(
+                logger::MessageLogDomain::AppenderAutoPtr(
+                        new RamLogAppender(RamLog::get("global"))));
+
+        return Status::OK();
+    }
+
+    bool initializeServerGlobalState() {
+
+        Listener::globalTicketHolder.resize(serverGlobalParams.maxConns);
+
+#ifndef _WIN32
+        if (!fs::is_directory(serverGlobalParams.socket)) {
+            cout << serverGlobalParams.socket << " must be a directory" << endl;
+            return false;
         }
 #endif
-        if (!cmdLine.logpath.empty() && !isMongodShutdownSpecialCase) {
-            fassert(16448, !cmdLine.logWithSyslog);
-            string absoluteLogpath = boost::filesystem::absolute(
-                    cmdLine.logpath, cmdLine.cwd).string();
-            if (!initLogging(absoluteLogpath, cmdLine.logAppend)) {
-                cout << "Bad logpath value: \"" << absoluteLogpath << "\"; terminating." << endl;
+
+        if (!serverGlobalParams.pidFile.empty()) {
+            if (!writePidFile(serverGlobalParams.pidFile)) {
+                // error message logged in writePidFile
                 return false;
             }
         }
 
-        if (!cmdLine.pidFile.empty()) {
-            writePidFile(cmdLine.pidFile);
-        }
-
-        if (!cmdLine.keyFile.empty()) {
-
-            if (!setUpSecurityKey(cmdLine.keyFile)) {
+        if (!serverGlobalParams.keyFile.empty() && serverGlobalParams.clusterAuthMode != "x509") {
+            if (!setUpSecurityKey(serverGlobalParams.keyFile)) {
                 // error message printed in setUpPrivateKey
                 return false;
             }
-
-            AuthorizationManager::setAuthEnabled(true);
         }
 
+        // Auto-enable auth except if clusterAuthMode is not set.
+        // clusterAuthMode is automatically set if a --keyfile parameter is provided.
+        if (!serverGlobalParams.clusterAuthMode.empty()) {
+            getGlobalAuthorizationManager()->setAuthEnabled(true);
+        }
+
+#ifdef MONGO_SSL
+        if (serverGlobalParams.clusterAuthMode == "x509" ||
+            serverGlobalParams.clusterAuthMode == "sendX509") {
+            setInternalUserAuthParams(BSON(saslCommandMechanismFieldName << "MONGODB-X509" <<
+                                           saslCommandUserSourceFieldName << "$external" <<
+                                           saslCommandUserFieldName << 
+                                           getSSLManager()->getClientSubjectName()));
+        }
+#endif
         return true;
     }
 
     static void ignoreSignal( int sig ) {}
 
-    static void rotateLogsOrDie(int sig) {
-        fassert(16176, rotateLogs());
-    }
-
     void setupCoreSignals() {
 #if !defined(_WIN32)
-        verify( signal(SIGUSR1 , rotateLogsOrDie ) != SIG_ERR );
         verify( signal(SIGHUP , ignoreSignal ) != SIG_ERR );
+        verify( signal(SIGUSR2, ignoreSignal ) != SIG_ERR );
 #endif
     }
 

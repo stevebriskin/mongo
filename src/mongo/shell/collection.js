@@ -55,8 +55,7 @@ DBCollection.prototype.help = function () {
     // print("\tdb." + shortName + ".indexStats({expandNodes: [<expanded child numbers>}, <detailed: t/f>) - output aggregate/per-depth btree bucket stats");
     print("\tdb." + shortName + ".insert(obj)");
     print("\tdb." + shortName + ".mapReduce( mapFunction , reduceFunction , <optional params> )");
-    print("\tdb." + shortName + ".aggregate( pipeline ) - performs an aggregation on collection;"
-        + " pipeline can be specified as array or args");
+    print("\tdb." + shortName + ".aggregate( [pipeline], <optional params> ) - performs an aggregation on a collection; returns a cursor");
     print("\tdb." + shortName + ".remove(query)");
     print("\tdb." + shortName + ".renameCollection( newName , <dropTarget> ) renames the collection.");
     print("\tdb." + shortName + ".runCommand( name , <options> ) runs a db command with the given name where the first param is the collection name");
@@ -248,7 +247,7 @@ DBCollection.prototype.update = function( query , obj , upsert , multi ){
 }
 
 DBCollection.prototype.save = function( obj ){
-    if ( obj == null || typeof( obj ) == "undefined" ) 
+    if ( obj == null )
         throw "can't save a null";
 
     if ( typeof( obj ) == "number" || typeof( obj) == "string" )
@@ -886,22 +885,30 @@ DBCollection.prototype.distinct = function( keyString , query ){
 }
 
 
-DBCollection.prototype.aggregate = function( ops ) {
-    
-    var arr = ops;
-    
-    if (!ops.length) {
-        arr = [];
+DBCollection.prototype.aggregate = function(pipeline, extraOpts) {
+    var cmd = {pipeline: pipeline};
+
+    if (!(pipeline instanceof Array)) {
+        // support varargs form
+        cmd.pipeline = [];
         for (var i=0; i<arguments.length; i++) {
-            arr.push(arguments[i]);
+            cmd.pipeline.push(arguments[i]);
         }
     }
-
-    var res = this.runCommand("aggregate", {pipeline: arr});
-    if (!res.ok) {
-        printStackTrace();
-        throw "aggregate failed: " + tojson(res);
+    else {
+        Object.extend(cmd, extraOpts);
     }
+
+    if (cmd.cursor === undefined) {
+        cmd.cursor = {};
+    }
+
+    var res = this.runCommand("aggregate", cmd);
+    assert.commandWorked(res, "aggregate with cursor failed");
+
+    if ("cursor" in res)
+        return new DBCommandCursor(this._mongo, res);
+
     return res;
 }
 

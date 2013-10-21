@@ -35,7 +35,7 @@ removeShard = function(st, replTest) {
            var res = directdb.currentOp( { desc: /^clean/ } );
            print( "eliot: " + replTest.getPrimary() + "\t" + tojson(res) );
            return res.inprog.length == 0;
-       }, "never clean", 60000, 1000 );
+       }, "never clean", 5 * 60 * 1000, 1000 );
     
     replTest.getPrimary().getDB( coll.getDB().getName() ).dropDatabase();
     print( "Shard removed successfully" );
@@ -59,7 +59,7 @@ addShard = function(st, replTest) {
         var x = st.chunkDiff( coll.getName() , coll.getDB().getName() );
         print( "chunk diff: " + x );
         return x < 2;
-    } , "no balance happened", 60000 );
+    } , "no balance happened", 5 * 60 * 1000 );
 
     try {
         assert.eq( 300, coll.find().itcount() );
@@ -80,6 +80,12 @@ var st = new ShardingTest( testName = "remove2",
                              rs0 : { nodes : 2 },
                              rs1 : { nodes : 2 }
                            });
+
+// Pending resolution of SERVER-8598, we need to wait for deletion after chunk migrations to avoid
+// a pending delete re-creating a database after it was dropped.
+st.s.getDB("config").settings.update( { _id: "balancer" },
+                                      { $set : { _waitForDelete : true } },
+                                      true );
 
 var rst0 = st._rs[0].test;
 var rst1 = st._rs[1].test;
@@ -114,7 +120,7 @@ assert.eq( 300, coll.find().itcount() );
 
 assert.soon( function() {
     var x = st.chunkDiff( 'remove2' , "test" ); print( "chunk diff: " + x ); return x < 2;
-} , "no balance happened" );
+} , "no balance happened", 5 * 60 * 1000 );
 
 assert.eq( 300, coll.find().itcount() );
 

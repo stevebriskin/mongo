@@ -12,11 +12,22 @@
  *
  * You should have received a copy of the GNU Affero General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ * As a special exception, the copyright holders give permission to link the
+ * code of portions of this program with the OpenSSL library under certain
+ * conditions as described in each individual source file and distribute
+ * linked combinations including the program with the OpenSSL library. You
+ * must comply with the GNU Affero General Public License in all respects for
+ * all of the code used other than as permitted herein. If you modify file(s)
+ * with this exception, you may extend this exception to your version of the
+ * file(s), but you are not obligated to do so. If you do not wish to do so,
+ * delete this exception statement from your version. If you delete this
+ * exception statement from all source files in the program, then also delete
+ * it in the license file.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
-#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/pipeline_d.h"
 
 #include "mongo/client/dbclientinterface.h"
@@ -24,28 +35,59 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/parsed_query.h"
 #include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/query_optimizer.h"
+#include "mongo/s/d_logic.h"
 
 
 namespace mongo {
 
+namespace {
+    class MongodImplementation : public DocumentSourceNeedsMongod::MongodInterface {
+    public:
+        DBClientBase* directClient() { return &_client; }
+
+        bool isSharded(const NamespaceString& ns) {
+            const ChunkVersion unsharded(0, 0, OID());
+            return !(shardingState.getVersion(ns.ns()).isWriteCompatibleWith(unsharded));
+        }
+
+        bool isCapped(const NamespaceString& ns) {
+            Client::ReadContext ctx(ns.ns());
+            NamespaceDetails* nsd = nsdetails(ns.ns());
+            return nsd && nsd->isCapped();
+        }
+
+    private:
+        DBDirectClient _client;
+    };
+}
+
     void PipelineD::prepareCursorSource(
         const intrusive_ptr<Pipeline> &pPipeline,
-        const string &dbName,
         const intrusive_ptr<ExpressionContext> &pExpCtx) {
 
         // We will be modifying the source vector as we go
         Pipeline::SourceContainer& sources = pPipeline->sources;
 
-        if (!sources.empty()) {
-            DocumentSource* first = sources.front().get();
-            DocumentSourceGeoNear* geoNear = dynamic_cast<DocumentSourceGeoNear*>(first);
-            if (geoNear) {
-                geoNear->client.reset(new DBDirectClient);
-                geoNear->db = dbName;
-                geoNear->collection = pPipeline->collectionName;
-                return; // we don't need a DocumentSourceCursor in this case
+        // Inject a MongodImplementation to sources that need them.
+        for (size_t i = 0; i < sources.size(); i++) {
+            DocumentSourceNeedsMongod* needsMongod =
+                dynamic_cast<DocumentSourceNeedsMongod*>(sources[i].get());
+            if (needsMongod) {
+                needsMongod->injectMongodInterface(boost::make_shared<MongodImplementation>());
             }
+        }
+
+        if (!sources.empty() && sources.front()->isValidInitialSource()) {
+            if (dynamic_cast<DocumentSourceMergeCursors*>(sources.front().get())) {
+                // Enable the hooks for setting up authentication on the subsequent internal
+                // connections we are going to create. This would normally have been done
+                // when SetShardVersion was called, but since SetShardVersion is never called
+                // on secondaries, this is needed.
+                ShardedConnectionInfo::addHook();
+            }
+            return; // don't need a cursor
         }
 
         /* look for an initial match */
@@ -69,7 +111,7 @@ namespace mongo {
           object so that we can preserve it for the Cursor we're going to
           create below.
          */
-        shared_ptr<BSONObj> pQueryObj(new BSONObj(queryBuilder.obj()));
+        BSONObj queryObj = queryBuilder.obj();
 
         /* Look for an initial simple project; we'll avoid constructing Values
          * for fields that won't make it through the projection.
@@ -83,6 +125,8 @@ namespace mongo {
             DocumentSource::GetDepsReturn status = DocumentSource::SEE_NEXT;
             for (size_t i=0; i < sources.size() && status == DocumentSource::SEE_NEXT; i++) {
                 status = sources[i]->getDependencies(deps);
+                if (deps.count(string())) // empty string means we need the full doc
+                    status = DocumentSource::NOT_SUPPORTED;
             }
 
             if (status == DocumentSource::EXHAUSTIVE) {
@@ -100,38 +144,34 @@ namespace mongo {
           index scan.
         */
         intrusive_ptr<DocumentSourceSort> pSort;
-        BSONObjBuilder sortBuilder;
+        BSONObj sortObj;
         if (!sources.empty()) {
             const intrusive_ptr<DocumentSource> &pSC = sources.front();
             pSort = dynamic_cast<DocumentSourceSort *>(pSC.get());
 
             if (pSort) {
-                /* build the sort key */
-                pSort->sortKeyToBson(&sortBuilder, false);
+                // build the sort key
+                sortObj = pSort->serializeSortKey().toBson();
             }
         }
 
-        /* Create the sort object; see comments on the query object above */
-        shared_ptr<BSONObj> pSortObj(new BSONObj(sortBuilder.obj()));
+        // get the full "namespace" name
+        const string& fullName = pExpCtx->ns.ns();
 
-        /* get the full "namespace" name */
-        string fullName(dbName + "." + pPipeline->getCollectionName());
-
-        /* for debugging purposes, show what the query and sort are */
+        // for debugging purposes, show what the query and sort are
         DEV {
             (log() << "\n---- query BSON\n" <<
-             pQueryObj->jsonString(Strict, 1) << "\n----\n").flush();
+             queryObj.jsonString(Strict, 1) << "\n----\n");
             (log() << "\n---- sort BSON\n" <<
-             pSortObj->jsonString(Strict, 1) << "\n----\n").flush();
+             sortObj.jsonString(Strict, 1) << "\n----\n");
             (log() << "\n---- fullName\n" <<
-             fullName << "\n----\n").flush();
+             fullName << "\n----\n");
         }
 
         // Create the necessary context to use a Cursor, including taking a namespace read lock,
         // see SERVER-6123.
         // Note: this may throw if the sharding version for this connection is out of date.
-        shared_ptr<DocumentSourceCursor::CursorWithContext> cursorWithContext
-                ( new DocumentSourceCursor::CursorWithContext( fullName ) );
+        Client::ReadContext context(fullName);
 
         /*
           Create the cursor.
@@ -157,14 +197,14 @@ namespace mongo {
         shared_ptr<Cursor> pCursor;
         bool initSort = false;
         if (pSort) {
-            const BSONObj queryAndSort = BSON("$query" << *pQueryObj << "$orderby" << *pSortObj);
+            const BSONObj queryAndSort = BSON("$query" << queryObj << "$orderby" << sortObj);
             shared_ptr<ParsedQuery> pq (new ParsedQuery(
-                        fullName.c_str(), 0, 0, QueryOption_NoCursorTimeout, queryAndSort, projection));
+                fullName.c_str(), 0, 0, QueryOption_NoCursorTimeout, queryAndSort, projection));
 
             /* try to create the cursor with the query and the sort */
             shared_ptr<Cursor> pSortedCursor(
-                pCursor = getOptimizedCursor(
-                    fullName.c_str(), *pQueryObj, *pSortObj,
+                getOptimizedCursor(
+                    fullName.c_str(), queryObj, sortObj,
                     QueryPlanSelectionPolicy::any(), pq));
 
             if (pSortedCursor.get()) {
@@ -183,26 +223,45 @@ namespace mongo {
 
         if (!pCursor.get()) {
             shared_ptr<ParsedQuery> pq (new ParsedQuery(
-                        fullName.c_str(), 0, 0, QueryOption_NoCursorTimeout, *pQueryObj, projection));
+                fullName.c_str(), 0, 0, QueryOption_NoCursorTimeout, queryObj, projection));
 
             /* try to create the cursor without the sort */
             shared_ptr<Cursor> pUnsortedCursor(
-                pCursor = getOptimizedCursor(
-                    fullName.c_str(), *pQueryObj, BSONObj(),
+                getOptimizedCursor(
+                    fullName.c_str(), queryObj, BSONObj(),
                     QueryPlanSelectionPolicy::any(), pq));
 
             pCursor = pUnsortedCursor;
         }
 
-        // Now add the Cursor to cursorWithContext.
-        cursorWithContext->_cursor.reset
-                ( new ClientCursor( QueryOption_NoCursorTimeout, pCursor, fullName ) );
+        // Now wrap the Cursor in ClientCursor
+        ClientCursorHolder cursor(
+                new ClientCursor(QueryOption_NoCursorTimeout, pCursor, fullName));
+        CursorId cursorId = cursor->cursorid();
+        massert(16917, str::stream()
+                            << "cursor " << cursor->c()->toString()
+                            << "does its own locking so it can't be used with aggregation",
+                cursor->c()->requiresLock());
+
+        // Prepare the cursor for data to change under it when we unlock
+        if (cursor->c()->supportYields()) {
+            ClientCursor::YieldData data;
+            cursor->prepareToYield(data);
+        }
+        else {
+            massert(16915, str::stream()
+                                << "cursor " << cursor->c()->toString()
+                                << " supports neither yields nor getMore, one of which"
+                                << " must be supported in an aggregation source",
+                    cursor->c()->supportGetMore());
+
+            cursor->c()->noteLocation();
+        }
+        cursor.release(); // it is now owned by the client cursor manager
 
         /* wrap the cursor with a DocumentSource and return that */
         intrusive_ptr<DocumentSourceCursor> pSource(
-            DocumentSourceCursor::create( cursorWithContext, pExpCtx ) );
-
-        pSource->setNamespace(fullName);
+            DocumentSourceCursor::create( fullName, cursorId, pExpCtx ) );
 
         /*
           Note the query and sort
@@ -211,18 +270,17 @@ namespace mongo {
           referenced (by reference) by the cursor, which doesn't make its
           own copies of them.
         */
-        pSource->setQuery(pQueryObj);
+        pSource->setQuery(queryObj);
         if (initSort)
-            pSource->setSort(pSortObj);
+            pSource->setSort(sortObj);
 
         if (haveProjection) {
             pSource->setProjection(projection, dependencies);
         }
 
-        // If we are in an explain, we won't actually use the created cursor so release it.
-        // This is important to avoid double locking when we use DBDirectClient to run explain.
-        if (pPipeline->isExplain())
-            pSource->dispose();
+        while (!sources.empty() && pSource->coalesce(sources.front())) {
+            sources.pop_front();
+        }
 
         pPipeline->addInitialSource(pSource);
     }

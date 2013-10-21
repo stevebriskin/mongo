@@ -14,19 +14,34 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #pragma once
 
 #include "mongo/db/cc_by_loc.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/namespace_details.h"
-#include "mongo/db/record.h"
+#include "mongo/db/storage/extent_manager.h"
+#include "mongo/db/storage/record.h"
+#include "mongo/db/storage_options.h"
 
 namespace mongo {
 
+    class Collection;
     class Extent;
-    class MongoDataFile;
+    class DataFile;
+    class IndexDetails;
 
     /**
      * Database represents a database database
@@ -36,88 +51,95 @@ namespace mongo {
     class Database {
     public:
         // you probably need to be in dbHolderMutex when constructing this
-        Database(const char *nm, /*out*/ bool& newDb, const string& _path = dbpath);
-    private:
-        ~Database(); // closes files and other cleanup see below.
-    public:
+        Database(const char *nm, /*out*/ bool& newDb,
+                 const string& path = storageGlobalParams.dbpath);
+
         /* you must use this to close - there is essential code in this method that is not in the ~Database destructor.
            thus the destructor is private.  this could be cleaned up one day...
         */
-        static void closeDatabase( const char *db, const string& path );
+        static void closeDatabase( const string& db, const string& path );
 
-        void openAllFiles();
+        const string& name() const { return _name; }
+        const string& path() const { return _path; }
+
         void clearTmpCollections();
 
         /**
          * tries to make sure that this hasn't been deleted
          */
-        bool isOk() const { return magic == 781231; }
+        bool isOk() const { return _magic == 781231; }
 
-        bool isEmpty() { return ! namespaceIndex.allocated(); }
+        bool isEmpty() { return ! _namespaceIndex.allocated(); }
 
         /**
          * total file size of Database in bytes
          */
-        long long fileSize() const;
+        long long fileSize() const { return _extentManager.fileSize(); }
 
-        int numFiles() const;
+        int numFiles() const { return _extentManager.numFiles(); }
 
-        /**
-         * returns file valid for file number n
-         */
-        boost::filesystem::path fileName( int n ) const;
-
-    private:
-        bool exists(int n) const;
-        bool openExistingFile( int n );
-
-    public:
         /**
          * return file n.  if it doesn't exist, create it
          */
-        MongoDataFile* getFile( int n, int sizeNeeded = 0, bool preallocateOnly = false );
+        DataFile* getFile( int n, int sizeNeeded = 0, bool preallocateOnly = false ) {
+            _initForWrites();
+            return _extentManager.getFile( n, sizeNeeded, preallocateOnly );
+        }
 
-        MongoDataFile* addAFile( int sizeNeeded, bool preallocateNextFile );
+        DataFile* addAFile( int sizeNeeded, bool preallocateNextFile ) {
+            _initForWrites();
+            return _extentManager.addAFile( sizeNeeded, preallocateNextFile );
+        }
 
         /**
          * makes sure we have an extra file at the end that is empty
          * safe to call this multiple times - the implementation will only preallocate one file
          */
-        void preallocateAFile() { getFile( numFiles() , 0, true ); }
-
-        MongoDataFile* suitableFile( const char *ns, int sizeNeeded, bool preallocate, bool enforceQuota );
-
-        Extent* allocExtent( const char *ns, int size, bool capped, bool enforceQuota );
-
-        MongoDataFile* newestFile();
+        void preallocateAFile() { _extentManager.preallocateAFile(); }
 
         /**
          * @return true if success.  false if bad level or error creating profile ns
          */
         bool setProfilingLevel( int newLevel , string& errmsg );
 
-        void flushFiles( bool sync );
+        void flushFiles( bool sync ) { return _extentManager.flushFiles( sync ); }
 
         /**
          * @return true if ns is part of the database
          *         ns=foo.bar, db=foo returns true
          */
         bool ownsNS( const string& ns ) const {
-            if ( ! startsWith( ns , name ) )
+            if ( ! startsWith( ns , _name ) )
                 return false;
-            return ns[name.size()] == '.';
+            return ns[_name.size()] == '.';
         }
 
         const RecordStats& recordStats() const { return _recordStats; }
         RecordStats& recordStats() { return _recordStats; }
 
-    private:
+        int getProfilingLevel() const { return _profile; }
+        const char* getProfilingNS() const { return _profileName.c_str(); }
+
+        CCByLoc& ccByLoc() { return _ccByLoc; }
+
+        const NamespaceIndex& namespaceIndex() const { return _namespaceIndex; }
+        NamespaceIndex& namespaceIndex() { return _namespaceIndex; }
+
+        // TODO: do not think this method should exist, so should try and encapsulate better
+        ExtentManager& getExtentManager() { return _extentManager; }
+        const ExtentManager& getExtentManager() const { return _extentManager; }
+
+        Status dropCollection( const StringData& fullns );
+
+        Collection* createCollection( const StringData& ns, bool capped, const BSONObj* options );
+
         /**
-         * @throws DatabaseDifferCaseCode if the name is a duplicate based on
-         * case insensitive matching.
+         * @param ns - this is fully qualified, which is maybe not ideal ???
          */
-        void checkDuplicateUncasedNames(bool inholderlockalready) const;
-    public:
+        Collection* getCollection( const StringData& ns );
+
+        Status renameCollection( const StringData& fromNS, const StringData& toNS, bool stayTemp );
+
         /**
          * @return name of an existing database with same text name but different
          * casing, if one exists.  Otherwise the empty string is returned.  If
@@ -125,28 +147,78 @@ namespace mongo {
          */
         static string duplicateUncasedName( bool inholderlockalready, const string &name, const string &path, set< string > *duplicates = 0 );
 
-        const string name; // "alleyinsider"
-        const string path;
+        static Status validateDBName( const StringData& dbname );
 
     private:
 
-        // must be in the dbLock when touching this (and write locked when writing to of course)
-        // however during Database object construction we aren't, which is ok as it isn't yet visible
-        //   to others and we are in the dbholder lock then.
-        vector<MongoDataFile*> _files;
+        void _clearCollectionCache( const StringData& fullns );
 
-    public: // this should be private later
+        void _clearCollectionCache_inlock( const StringData& fullns );
 
-        NamespaceIndex namespaceIndex;
-        const string profileName; // "alleyinsider.system.profile"
-        CCByLoc ccByLoc;
-        int magic; // used for making sure the object is still loaded in memory
+        ~Database(); // closes files and other cleanup see below.
 
-        int getProfilingLevel() const { return _profile; }
+        void _addNamespaceToCatalog( const StringData& ns, const BSONObj* options );
 
-    private:
+
+        /**
+         * removes from *.system.namespaces
+         * frees extents
+         * removes from NamespaceIndex
+         * NOT RIGHT NOW, removes cache entry in Database TODO?
+         */
+        Status _dropNS( const StringData& ns );
+
+        /**
+         * make sure namespace is initialized and $freelist is allocated before
+         * doing anything that will write
+         */
+        void _initForWrites() {
+            _namespaceIndex.init();
+            if ( !_extentManager.hasFreeList() ) {
+                _initExtentFreeList();
+            }
+        }
+
+        void _initExtentFreeList();
+
+        /**
+         * @throws DatabaseDifferCaseCode if the name is a duplicate based on
+         * case insensitive matching.
+         */
+        void checkDuplicateUncasedNames(bool inholderlockalready) const;
+
+        void openAllFiles();
+
+        Status _renameSingleNamespace( const StringData& fromNS, const StringData& toNS,
+                                       bool stayTemp );
+
+        const string _name; // "alleyinsider"
+        const string _path; // "/data/db"
+
+        NamespaceIndex _namespaceIndex;
+        ExtentManager _extentManager;
+
+        const string _profileName; // "alleyinsider.system.profile"
+        const string _namespacesName; // "alleyinsider.system.namespaces"
+        const string _extentFreelistName;
+
+        CCByLoc _ccByLoc; // use by ClientCursor
+
         RecordStats _recordStats;
         int _profile; // 0=off.
+
+        int _magic; // used for making sure the object is still loaded in memory
+
+        // TODO: probably shouldn't be a std::map
+        // TODO: make sure deletes go through
+        // this in some ways is a dupe of _namespaceIndex
+        // but it points to a much more useful data structure
+        typedef std::map< std::string, Collection* > CollectionMap;
+        CollectionMap _collections;
+        mutex _collectionLock;
+
+        friend class NamespaceDetails;
+        friend class IndexDetails;
     };
 
 } // namespace mongo

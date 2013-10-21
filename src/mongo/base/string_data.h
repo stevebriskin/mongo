@@ -126,6 +126,24 @@ namespace mongo {
         string toString() const { return string(_data, size()); }
         char operator[] ( unsigned pos ) const { return _data[pos]; }
 
+        /**
+         * Functor compatible with std::hash for std::unordered_{map,set}
+         * Warning: The hash function is subject to change. Do not use in cases where hashes need
+         *          to be consistent across versions.
+         */
+        struct Hasher {
+            size_t operator() (const StringData& str) const;
+        };
+
+        //
+        // iterators
+        //
+
+        typedef const char* const_iterator;
+
+        const_iterator begin() const { return rawData(); }
+        const_iterator end() const { return rawData() + size(); }
+
     private:
         const char* _data;        // is not guaranted to be null terminated (see "notes" above)
         mutable size_t _size;     // 'size' does not include the null terminator
@@ -165,4 +183,4 @@ namespace mongo {
 
 } // namespace mongo
 
-#include "string_data-inl.h"
+#include "mongo/base/string_data-inl.h"

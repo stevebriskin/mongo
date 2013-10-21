@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -36,20 +48,19 @@ namespace mongo {
          * @param language, language of the query
          * @param filter, filter object
          */
-        FTSSearch::FTSSearch( NamespaceDetails* ns,
-                              const IndexDetails& id,
+        FTSSearch::FTSSearch( IndexDescriptor* descriptor,
+                              const FTSSpec& ftsSpec,
                               const BSONObj& indexPrefix,
                               const FTSQuery& query,
                               const BSONObj& filter )
-            : _ns( ns ),
-              _id( id ),
-              _fts( static_cast<FTSIndex*>(_id.getSpec().getType()) ),
+            : _descriptor(descriptor),
+              _ftsSpec(ftsSpec),
               _indexPrefix( indexPrefix ),
               _query( query ),
-              _ftsMatcher( query, static_cast<FTSIndex*>(_id.getSpec().getType())->getFtsSpec() ) {
+              _ftsMatcher(query, ftsSpec) {
 
             if ( !filter.isEmpty() )
-                _matcher.reset( new CoveredIndexMatcher( filter, _fts->keyPattern() ) );
+                _matcher.reset( new CoveredIndexMatcher( filter, _descriptor->keyPattern() ) );
 
             _keysLookedAt = 0;
             _objectsLookedAt = 0;
@@ -75,7 +86,12 @@ namespace mongo {
                 const string& term = _query.getTerms()[i];
                 BSONObj min = FTSIndexFormat::getIndexKey( MAX_WEIGHT, term, _indexPrefix );
                 BSONObj max = FTSIndexFormat::getIndexKey( 0, term, _indexPrefix );
-                shared_ptr<BtreeCursor> c( BtreeCursor::make( _ns, _id, min, max, true, -1 ) );
+
+                shared_ptr<BtreeCursor> c( BtreeCursor::make(
+                    nsdetails(_descriptor->parentNS().c_str()),
+                    _descriptor->getOnDisk(),
+                    min, max, true, -1 ) );
+
                 cursors.push_back( c );
             }
 
@@ -137,9 +153,9 @@ namespace mongo {
             BSONObj key = cursor->currKey();
 
             BSONObjIterator i( key );
-            for ( unsigned j = 0; j < _fts->getFtsSpec().numExtraBefore(); j++ )
+            for ( unsigned j = 0; j < _ftsSpec.numExtraBefore(); j++)
                 i.next();
-            i.next(); // move pase indexToken
+            i.next(); // move past indexToken
             BSONElement scoreElement = i.next();
 
             double score = scoreElement.number();

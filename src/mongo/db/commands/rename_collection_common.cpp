@@ -12,6 +12,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/db/commands/rename_collection.h"
@@ -23,7 +35,7 @@
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespacestring.h"
+#include "mongo/db/namespace_string.h"
 
 namespace mongo {
 namespace rename_collection {
@@ -32,10 +44,12 @@ namespace rename_collection {
                                                   std::vector<Privilege>* out) {
         NamespaceString sourceNS = NamespaceString(cmdObj.getStringField("renameCollection"));
         NamespaceString targetNS = NamespaceString(cmdObj.getStringField("to"));
+        uassert(17140, "Invalid source namespace " + sourceNS.ns(), sourceNS.isValid());
+        uassert(17141, "Invalid target namespace " + targetNS.ns(), targetNS.isValid());
         ActionSet sourceActions;
         ActionSet targetActions;
 
-        if (sourceNS.db == targetNS.db) {
+        if (sourceNS.db() == targetNS.db()) {
             sourceActions.addAction(ActionType::renameCollectionSameDB);
             targetActions.addAction(ActionType::renameCollectionSameDB);
         } else {
@@ -43,11 +57,11 @@ namespace rename_collection {
             sourceActions.addAction(ActionType::dropCollection);
             targetActions.addAction(ActionType::createCollection);
             targetActions.addAction(ActionType::cloneCollectionTarget);
-            targetActions.addAction(ActionType::ensureIndex);
+            targetActions.addAction(ActionType::createIndex);
         }
 
-        out->push_back(Privilege(sourceNS.ns(), sourceActions));
-        out->push_back(Privilege(targetNS.ns(), targetActions));
+        out->push_back(Privilege(ResourcePattern::forExactNamespace(sourceNS), sourceActions));
+        out->push_back(Privilege(ResourcePattern::forExactNamespace(targetNS), targetActions));
     }
 
 } // namespace rename_collection

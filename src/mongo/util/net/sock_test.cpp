@@ -12,6 +12,18 @@
  *
  *    You should have received a copy of the GNU Affero General Public License
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the GNU Affero General Public License in all respects
+ *    for all of the code used other than as permitted herein. If you modify
+ *    file(s) with this exception, you may extend this exception to your
+ *    version of the file(s), but you are not obligated to do so. If you do not
+ *    wish to do so, delete this exception statement from your version. If you
+ *    delete this exception statement from all source files in the program,
+ *    then also delete it in the license file.
  */
 
 #include "mongo/platform/basic.h"
@@ -26,14 +38,14 @@
 #include <sys/types.h>
 #endif
 
-#include "mongo/db/cmdline.h"
+#include "mongo/db/server_options.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/concurrency/synchronization.h"
 #include "mongo/util/fail_point_service.h"
 
 namespace mongo {
 
-    CmdLine cmdLine;
+    ServerGlobalParams serverGlobalParams;
 
     bool inShutdown() {
         return false;
@@ -48,9 +60,9 @@ namespace {
     typedef boost::shared_ptr<Socket> SocketPtr;
     typedef std::pair<SocketPtr, SocketPtr> SocketPair;
 
-    // On UNIX, make a connected pair of PF_LOCAL sockets via the native 'socketpair' call. The
-    // 'type' parameter should be one of SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET, etc. For
-    // Win32, we don't have a native socketpair function, so we hack up a connected PF_INET
+    // On UNIX, make a connected pair of PF_LOCAL (aka PF_UNIX) sockets via the native 'socketpair'
+    // call. The 'type' parameter should be one of SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET, etc.
+    // For Win32, we don't have a native socketpair function, so we hack up a connected PF_INET
     // pair on a random port.
     SocketPair socketPair(const int type, const int protocol = 0);
 
@@ -184,7 +196,10 @@ namespace {
 #else
     // We can just use ::socketpair and wrap up the result in a Socket.
     SocketPair socketPair(const int type, const int protocol) {
-        const int domain = PF_LOCAL;
+        // PF_LOCAL is the POSIX name for Unix domain sockets, while PF_UNIX
+        // is the name that BSD used.  We use the BSD name because it is more
+        // widely supported (e.g. Solaris 10).
+        const int domain = PF_UNIX;
 
         int socks[2];
         const int result = ::socketpair(domain, type, protocol, socks);

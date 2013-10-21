@@ -12,18 +12,30 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects
+*    for all of the code used other than as permitted herein. If you modify
+*    file(s) with this exception, you may extend this exception to your
+*    version of the file(s), but you are not obligated to do so. If you do not
+*    wish to do so, delete this exception statement from your version. If you
+*    delete this exception statement from all source files in the program,
+*    then also delete it in the license file.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
 #include "mongo/s/balance.h"
 
 #include "mongo/client/dbclientcursor.h"
 #include "mongo/client/distlock.h"
-#include "mongo/db/cmdline.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/s/chunk.h"
 #include "mongo/s/config.h"
+#include "mongo/s/config_server_checker_service.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/server.h"
 #include "mongo/s/shard.h"
@@ -52,58 +64,70 @@ namespace mongo {
         for ( vector<CandidateChunkPtr>::const_iterator it = candidateChunks->begin(); it != candidateChunks->end(); ++it ) {
             const CandidateChunk& chunkInfo = *it->get();
 
-            DBConfigPtr cfg = grid.getDBConfig( chunkInfo.ns );
-            verify( cfg );
+            // Changes to metadata, borked metadata, and connectivity problems should cause us to
+            // abort this chunk move, but shouldn't cause us to abort the entire round of chunks.
+            // TODO: Handle all these things more cleanly, since they're expected problems
+            try {
 
-            ChunkManagerPtr cm = cfg->getChunkManager( chunkInfo.ns );
-            verify( cm );
+                DBConfigPtr cfg = grid.getDBConfig( chunkInfo.ns );
+                verify( cfg );
 
-            ChunkPtr c = cm->findIntersectingChunk( chunkInfo.chunk.min );
-            if ( c->getMin().woCompare( chunkInfo.chunk.min ) || c->getMax().woCompare( chunkInfo.chunk.max ) ) {
-                // likely a split happened somewhere
-                cm = cfg->getChunkManager( chunkInfo.ns , true /* reload */);
+                // NOTE: We purposely do not reload metadata here, since _doBalanceRound already
+                // tried to do so once.
+                ChunkManagerPtr cm = cfg->getChunkManager( chunkInfo.ns );
                 verify( cm );
 
-                c = cm->findIntersectingChunk( chunkInfo.chunk.min );
+                ChunkPtr c = cm->findIntersectingChunk( chunkInfo.chunk.min );
                 if ( c->getMin().woCompare( chunkInfo.chunk.min ) || c->getMax().woCompare( chunkInfo.chunk.max ) ) {
-                    log() << "chunk mismatch after reload, ignoring will retry issue " << chunkInfo.chunk.toString() << endl;
+                    // likely a split happened somewhere
+                    cm = cfg->getChunkManager( chunkInfo.ns , true /* reload */);
+                    verify( cm );
+
+                    c = cm->findIntersectingChunk( chunkInfo.chunk.min );
+                    if ( c->getMin().woCompare( chunkInfo.chunk.min ) || c->getMax().woCompare( chunkInfo.chunk.max ) ) {
+                        log() << "chunk mismatch after reload, ignoring will retry issue " << chunkInfo.chunk.toString() << endl;
+                        continue;
+                    }
+                }
+
+                BSONObj res;
+                if (c->moveAndCommit(Shard::make(chunkInfo.to),
+                                     Chunk::MaxChunkSize,
+                                     secondaryThrottle,
+                                     waitForDelete,
+                                     res)) {
+                    movedCount++;
                     continue;
                 }
-            }
 
-            BSONObj res;
-            if (c->moveAndCommit(Shard::make(chunkInfo.to),
-                                 Chunk::MaxChunkSize,
-                                 secondaryThrottle,
-                                 waitForDelete,
-                                 res)) {
-                movedCount++;
-                continue;
-            }
+                // the move requires acquiring the collection metadata's lock, which can fail
+                log() << "balancer move failed: " << res << " from: " << chunkInfo.from << " to: " << chunkInfo.to
+                      << " chunk: " << chunkInfo.chunk << endl;
 
-            // the move requires acquiring the collection metadata's lock, which can fail
-            log() << "balancer move failed: " << res << " from: " << chunkInfo.from << " to: " << chunkInfo.to
-                  << " chunk: " << chunkInfo.chunk << endl;
+                if ( res["chunkTooBig"].trueValue() ) {
+                    // reload just to be safe
+                    cm = cfg->getChunkManager( chunkInfo.ns );
+                    verify( cm );
+                    c = cm->findIntersectingChunk( chunkInfo.chunk.min );
 
-            if ( res["chunkTooBig"].trueValue() ) {
-                // reload just to be safe
-                cm = cfg->getChunkManager( chunkInfo.ns );
-                verify( cm );
-                c = cm->findIntersectingChunk( chunkInfo.chunk.min );
-                
-                log() << "forcing a split because migrate failed for size reasons" << endl;
-                
-                res = BSONObj();
-                c->singleSplit( true , res );
-                log() << "forced split results: " << res << endl;
-                
-                if ( ! res["ok"].trueValue() ) {
-                    log() << "marking chunk as jumbo: " << c->toString() << endl;
-                    c->markAsJumbo();
-                    // we increment moveCount so we do another round right away
-                    movedCount++;
+                    log() << "forcing a split because migrate failed for size reasons" << endl;
+
+                    res = BSONObj();
+                    c->singleSplit( true , res );
+                    log() << "forced split results: " << res << endl;
+
+                    if ( ! res["ok"].trueValue() ) {
+                        log() << "marking chunk as jumbo: " << c->toString() << endl;
+                        c->markAsJumbo();
+                        // we increment moveCount so we do another round right away
+                        movedCount++;
+                    }
+
                 }
-
+            }
+            catch( const DBException& ex ) {
+                warning() << "could not move chunk " << chunkInfo.chunk.toString()
+                          << ", continuing balancing round" << causedBy( ex ) << endl;
             }
         }
 
@@ -295,9 +319,18 @@ namespace mongo {
             cursor.reset();
 
             DBConfigPtr cfg = grid.getDBConfig( ns );
-            verify( cfg );
-            ChunkManagerPtr cm = cfg->getChunkManager( ns );
-            verify( cm );
+            if ( !cfg ) {
+                warning() << "could not load db config to balance " << ns << " collection" << endl;
+                continue;
+            }
+
+            // This line reloads the chunk manager once if this process doesn't know the collection
+            // is sharded yet.
+            ChunkManagerPtr cm = cfg->getChunkManagerIfExists( ns, true );
+            if ( !cm ) {
+                warning() << "could not load chunks to balance " << ns << " collection" << endl;
+                continue;
+            }
 
             // loop through tags to make sure no chunk spans tags; splits on tag min. for all chunks
             bool didAnySplits = false;
@@ -354,7 +387,7 @@ namespace mongo {
             log() << "config servers and shards contacted successfully" << endl;
 
             StringBuilder buf;
-            buf << getHostNameCached() << ":" << cmdLine.port;
+            buf << getHostNameCached() << ":" << serverGlobalParams.port;
             _myid = buf.str();
             _started = time(0);
 
@@ -438,7 +471,14 @@ namespace mongo {
                         sleepsecs( sleepTime ); // no need to wake up soon
                         continue;
                     }
-                    
+
+                    if ( !isConfigServerConsistent() ) {
+                        conn.done();
+                        warning() << "Skipping balancing round because data inconsistency"
+                                  << " was detected amongst the config servers." << endl;
+                        continue;
+                    }
+
                     LOG(1) << "*** start balancing round" << endl;
 
                     bool waitForDelete = false;

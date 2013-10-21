@@ -14,6 +14,18 @@
 *
 *    You should have received a copy of the GNU Affero General Public License
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*
+*    As a special exception, the copyright holders give permission to link the
+*    code of portions of this program with the OpenSSL library under certain
+*    conditions as described in each individual source file and distribute
+*    linked combinations including the program with the OpenSSL library. You
+*    must comply with the GNU Affero General Public License in all respects for
+*    all of the code used other than as permitted herein. If you modify file(s)
+*    with this exception, you may extend this exception to your version of the
+*    file(s), but you are not obligated to do so. If you do not wish to do so,
+*    delete this exception statement from your version. If you delete this
+*    exception statement from all source files in the program, then also delete
+*    it in the license file.
 */
 
 #include "mongo/pch.h"
@@ -23,156 +35,52 @@
 #include <boost/checked_delete.hpp>
 
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/background.h"
 #include "mongo/db/btree.h"
+#include "mongo/db/index_legacy.h"
+#include "mongo/db/index_names.h"
+#include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_cursor.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_update.h"
-#include "mongo/db/namespace-inl.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/structure/collection.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
-    IndexInterface::IndexInserter::IndexInserter() {}
-    IndexInterface::IndexInserter::~IndexInserter() {
-        for (size_t i = 0; i < _continuations.size(); ++i)
-            delete _continuations[i];
-    }
+    // What's the default version of our indices?
+    const int DefaultIndexVersionNumber = 1;
 
-    void IndexInterface::IndexInserter::addInsertionContinuation(IndexInsertionContinuation *c) {
-        _continuations.push_back(c);
-    }
-
-    void IndexInterface::IndexInserter::finishAllInsertions() {
-        for (size_t i = 0; i < _continuations.size(); ++i) {
-            _continuations[i]->doIndexInsertionWrites();
-        }
-    }
-
-    IndexInterface& IndexInterface::defaultVersion() {
-        return *IndexDetails::iis[ DefaultIndexVersionNumber ];
-    }
-
-
-    template< class V >
-    class IndexInterfaceImpl : public IndexInterface { 
-    public:
-        typedef typename V::KeyOwned KeyOwned;
-        virtual int keyCompare(const BSONObj& l,const BSONObj& r, const Ordering &ordering);
-
-    public:
-        IndexInsertionContinuation *beginInsertIntoIndex(
-                int idxNo, IndexDetails &_idx,
-                DiskLoc _recordLoc, const BSONObj &_key,
-                const Ordering& _order, bool dupsAllowed) {
-
-            IndexInsertionContinuationImpl<V> *continuation = new IndexInsertionContinuationImpl<V>(
-                    _idx.head, _recordLoc, _key, _order, _idx);
-            ScopeGuard allocGuard = MakeGuard(boost::checked_delete<IndexInsertionContinuation>,
-                                              continuation);
-            _idx.head.btree<V>()->twoStepInsert(_idx.head, *continuation, dupsAllowed);
-            allocGuard.Dismiss();
-            return continuation;
-        }
-
-        virtual long long fullValidate(const DiskLoc& thisLoc, const BSONObj &order) { 
-            return thisLoc.btree<V>()->fullValidate(thisLoc, order);
-        }
-        virtual DiskLoc findSingle(const IndexDetails &indexdetails , const DiskLoc& thisLoc, const BSONObj& key) const { 
-            return thisLoc.btree<V>()->findSingle(indexdetails,thisLoc,key);
-        } 
-        virtual bool unindex(const DiskLoc thisLoc, IndexDetails& id, const BSONObj& key, const DiskLoc recordLoc) const {
-            return thisLoc.btree<V>()->unindex(thisLoc, id, key, recordLoc);
-        }
-        virtual int bt_insert(const DiskLoc thisLoc, const DiskLoc recordLoc,
-                      const BSONObj& key, const Ordering &order, bool dupsAllowed,
-                      IndexDetails& idx, bool toplevel = true) const {
-            return thisLoc.btree<V>()->bt_insert(thisLoc, recordLoc, key, order, dupsAllowed, idx, toplevel);
-        }
-        virtual DiskLoc addBucket(const IndexDetails& id) { 
-            return BtreeBucket<V>::addBucket(id);
-        }
-        virtual void uassertIfDups(IndexDetails& idx, vector<BSONObj*>& addedKeys, DiskLoc head, DiskLoc self, const Ordering& ordering) { 
-            const BtreeBucket<V> *h = head.btree<V>();
-            for( vector<BSONObj*>::iterator i = addedKeys.begin(); i != addedKeys.end(); i++ ) {
-                KeyOwned k(**i);
-                bool dup = h->wouldCreateDup(idx, head, k, ordering, self);
-                uassert( 11001 , h->dupKeyError( idx , k ) , !dup);
-            }
-        }
-
-        // for geo:
-        virtual bool isUsed(DiskLoc thisLoc, int pos) { return thisLoc.btree<V>()->isUsed(pos); }
-        virtual void keyAt(DiskLoc thisLoc, int pos, BSONObj& key, DiskLoc& recordLoc) {
-            recordLoc = DiskLoc();
-            const BtreeBucket<V>* bucket = thisLoc.btree<V>();
-            int n = bucket->nKeys();
-
-            if( pos < 0 || pos >= n || n == 0xffff /* bucket deleted */ || ! bucket->isUsed( pos ) ){
-                // log() << "Pos: " << pos << " n " << n << endl;
-                return;
-            }
-
-            typename BtreeBucket<V>::KeyNode kn = bucket->keyNode(pos);
-            key = kn.key.toBson();
-            recordLoc = kn.recordLoc;
-        }
-        virtual BSONObj keyAt(DiskLoc thisLoc, int pos) {
-            return thisLoc.btree<V>()->keyAt(pos).toBson();
-        }
-        virtual DiskLoc locate(const IndexDetails &idx , const DiskLoc& thisLoc, const BSONObj& key, const Ordering &order,
-                int& pos, bool& found, const DiskLoc &recordLoc, int direction=1) { 
-            return thisLoc.btree<V>()->locate(idx, thisLoc, key, order, pos, found, recordLoc, direction);
-        }
-        virtual DiskLoc advance(const DiskLoc& thisLoc, int& keyOfs, int direction, const char *caller) { 
-            return thisLoc.btree<V>()->advance(thisLoc,keyOfs,direction,caller);
-        }
-    };
-
-    int oldCompare(const BSONObj& l,const BSONObj& r, const Ordering &o); // key.cpp
-
-    template <>
-    int IndexInterfaceImpl< V0 >::keyCompare(const BSONObj& l, const BSONObj& r, const Ordering &ordering) { 
-        return oldCompare(l, r, ordering);
-    }
-
-    template <>
-    int IndexInterfaceImpl< V1 >::keyCompare(const BSONObj& l, const BSONObj& r, const Ordering &ordering) { 
-        return l.woCompare(r, ordering, /*considerfieldname*/false);
-    }
-
-    IndexInterfaceImpl<V0> iii_v0;
-    IndexInterfaceImpl<V1> iii_v1;
-
-    IndexInterface *IndexDetails::iis[] = { &iii_v0, &iii_v1 };
-
-    int removeFromSysIndexes(const char *ns, const char *idxName) {
-        string system_indexes = cc().database()->name + ".system.indexes";
+    int removeFromSysIndexes(const StringData& ns, const StringData& idxName) {
+        string system_indexes = cc().database()->name() + ".system.indexes";
         BSONObjBuilder b;
         b.append("ns", ns);
         b.append("name", idxName); // e.g.: { name: "ts_1", ns: "foo.coll" }
         BSONObj cond = b.done();
-        return (int) deleteObjects(system_indexes.c_str(), cond, false, false, true);
+        return (int) deleteObjects(system_indexes, cond, false, false, true);
     }
 
     /* this is just an attempt to clean up old orphaned stuff on a delete all indexes
        call. repair database is the clean solution, but this gives one a lighter weight
        partial option.  see dropIndexes()
     */
-    void assureSysIndexesEmptied(const char *ns, IndexDetails *idIndex) {
-        string system_indexes = cc().database()->name + ".system.indexes";
+    int assureSysIndexesEmptied(const StringData& ns, IndexDetails *idIndex) {
+        string system_indexes = cc().database()->name() + ".system.indexes"; // TODO
         BSONObjBuilder b;
         b.append("ns", ns);
         if( idIndex ) {
             b.append("name", BSON( "$ne" << idIndex->indexName().c_str() ));
         }
         BSONObj cond = b.done();
-        int n = (int) deleteObjects(system_indexes.c_str(), cond, false, false, true);
+        int n = (int) deleteObjects(system_indexes, cond, false, false, true);
         if( n ) {
             log() << "info: assureSysIndexesEmptied cleaned up " << n << " entries" << endl;
         }
+        return n;
     }
 
     int IndexDetails::keyPatternOffset( const string& key ) const {
@@ -187,92 +95,41 @@ namespace mongo {
         return -1;
     }
 
-    const IndexSpec& IndexDetails::getSpec() const {
-        SimpleMutex::scoped_lock lk(NamespaceDetailsTransient::_qcMutex);
-        return NamespaceDetailsTransient::get_inlock( info.obj()["ns"].valuestr() ).getIndexSpec( this );
-    }
-
     /* delete this index.  does NOT clean up the system catalog
        (system.indexes or system.namespaces) -- only NamespaceIndex.
+       TOOD: above comment is wrong, also, document durability assumptions
     */
     void IndexDetails::kill_idx() {
         string ns = indexNamespace(); // e.g. foo.coll.$ts_1
         try {
 
             string pns = parentNS(); // note we need a copy, as parentNS() won't work after the drop() below
+            string name = indexName(); // ts_1
+
+            Database* db = cc().database();
+
+            Collection* parentCollection = db->getCollection( pns );
 
             // clean up parent namespace index cache
-            NamespaceDetailsTransient::get( pns.c_str() ).deletedIndex();
+            if ( parentCollection )
+                parentCollection->infoCache()->reset();
 
-            string name = indexName();
+            Status s = db->_dropNS( ns );
+            if ( !s.isOK() ) {
+                LOG(2) << "IndexDetails::kill(): couldn't drop ns " << ns;
+            }
 
-            /* important to catch exception here so we can finish cleanup below. */
-            try {
-                dropNS(ns.c_str());
-            }
-            catch(DBException& ) {
-                LOG(2) << "IndexDetails::kill(): couldn't drop ns " << ns << endl;
-            }
             head.setInvalid();
             info.setInvalid();
 
             // clean up in system.indexes.  we do this last on purpose.
-            int n = removeFromSysIndexes(pns.c_str(), name.c_str());
+            int n = removeFromSysIndexes(pns, name);
             wassert( n == 1 );
 
+            db->_clearCollectionCache( ns );
         }
         catch ( DBException &e ) {
             log() << "exception in kill_idx: " << e << ", ns: " << ns << endl;
-        }
-    }
-
-    void IndexDetails::getKeysFromObject( const BSONObj& obj, BSONObjSet& keys) const {
-        getSpec().getKeys( obj, keys );
-    }
-
-    void setDifference(BSONObjSet &l, BSONObjSet &r, vector<BSONObj*> &diff) {
-        // l and r must use the same ordering spec.
-        verify( l.key_comp().order() == r.key_comp().order() );
-        BSONObjSet::iterator i = l.begin();
-        BSONObjSet::iterator j = r.begin();
-        while ( 1 ) {
-            if ( i == l.end() )
-                break;
-            while ( j != r.end() && j->woCompare( *i ) < 0 )
-                j++;
-            if ( j == r.end() || i->woCompare(*j) != 0  ) {
-                const BSONObj *jo = &*i;
-                diff.push_back( (BSONObj *) jo );
-            }
-            i++;
-        }
-    }
-
-    void getIndexChanges(vector<IndexChanges>& v, const char *ns, NamespaceDetails& d,
-                         BSONObj newObj, BSONObj oldObj, bool &changedId) {
-        int z = d.getTotalIndexCount();
-        v.resize(z);
-        for( int i = 0; i < z; i++ ) {
-            IndexDetails& idx = d.idx(i);
-            BSONObj idxKey = idx.info.obj().getObjectField("key"); // eg { ts : 1 }
-            IndexChanges& ch = v[i];
-            idx.getKeysFromObject(oldObj, ch.oldkeys);
-            idx.getKeysFromObject(newObj, ch.newkeys);
-            if( ch.newkeys.size() > 1 )
-                d.setIndexIsMultikey(ns, i);
-            setDifference(ch.oldkeys, ch.newkeys, ch.removed);
-            setDifference(ch.newkeys, ch.oldkeys, ch.added);
-            if ( ch.removed.size() > 0 && ch.added.size() > 0 && idx.isIdIndex() ) {
-                changedId = true;
-            }
-        }
-    }
-
-    void dupCheck(vector<IndexChanges>& v, NamespaceDetails& d, DiskLoc curObjLoc) {
-        int z = d.getTotalIndexCount();
-        for( int i = 0; i < z; i++ ) {
-            IndexDetails& idx = d.idx(i);
-            v[i].dupCheck(idx, curObjLoc);
         }
     }
 
@@ -288,7 +145,7 @@ namespace mongo {
     }
 
     static bool needToUpgradeMinorVersion(const string& newPluginName) {
-        if (IndexPlugin::existedBefore24(newPluginName))
+        if (IndexNames::existedBefore24(newPluginName))
             return false;
 
         DataFileHeader* dfh = cc().database()->getFile(0)->getHeader();
@@ -301,13 +158,14 @@ namespace mongo {
     }
 
     static void upgradeMinorVersionOrAssert(const string& newPluginName) {
-        const string systemIndexes = cc().database()->name + ".system.indexes";
-        shared_ptr<Cursor> cursor(theDataFileMgr.findAll(systemIndexes));
-        for ( ; cursor && cursor->ok(); cursor->advance()) {
-            const BSONObj index = cursor->current();
+        const string systemIndexes = cc().database()->name() + ".system.indexes";
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(systemIndexes));
+        BSONObj index;
+        Runner::RunnerState state;
+        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&index, NULL))) {
             const BSONObj key = index.getObjectField("key");
-            const string plugin = IndexPlugin::findPluginName(key);
-            if (IndexPlugin::existedBefore24(plugin))
+            const string plugin = IndexNames::findPluginName(key);
+            if (IndexNames::existedBefore24(plugin))
                 continue;
 
             const string errmsg = str::stream()
@@ -320,8 +178,45 @@ namespace mongo {
             uasserted(16738, errmsg);
         }
 
+        if (Runner::RUNNER_EOF != state) {
+            warning() << "Internal error while reading collection " << systemIndexes << endl;
+        }
+
         DataFileHeader* dfh = cc().database()->getFile(0)->getHeader();
         getDur().writingInt(dfh->versionMinor) = PDFILE_VERSION_MINOR_24_AND_NEWER;
+    }
+
+    /**
+     * @param newSpec the new index specification to check.
+     * @param existingDetails the currently existing index details to compare with.
+     *
+     * @return true if the given newSpec has the same options as the
+     *     existing index assuming the key spec matches.
+     */
+    bool areIndexOptionsEquivalent(const BSONObj& newSpec,
+                                   const IndexDetails& existingDetails) {
+        if (existingDetails.dropDups() != newSpec["dropDups"].trueValue()) {
+            return false;
+        }
+
+        const BSONElement sparseSpecs =
+                existingDetails.info.obj().getField("sparse");
+
+        if (sparseSpecs.trueValue() != newSpec["sparse"].trueValue()) {
+            return false;
+        }
+
+        // Note: { _id: 1 } or { _id: -1 } implies unique: true.
+        if (!existingDetails.isIdIndex() &&
+                existingDetails.unique() != newSpec["unique"].trueValue()) {
+            return false;
+        }
+
+        const BSONElement existingExpireSecs =
+                existingDetails.info.obj().getField("expireAfterSeconds");
+        const BSONElement newExpireSecs = newSpec["expireAfterSeconds"];
+
+        return existingExpireSecs == newExpireSecs;
     }
 
     bool prepareToBuildIndex(const BSONObj& io,
@@ -334,13 +229,21 @@ namespace mongo {
 
         // the collection for which we are building an index
         sourceNS = io.getStringField("ns");
+        NamespaceString nss(sourceNS);
         uassert(10096, "invalid ns to index", sourceNS.find( '.' ) != string::npos);
-        massert(10097, str::stream() << "bad table to index name on add index attempt current db: " << cc().database()->name << "  source: " << sourceNS ,
-                cc().database()->name == nsToDatabase(sourceNS));
+        uassert(17072, "cannot create indexes on the system.indexes collection",
+                !nss.isSystemDotIndexes());
+        massert(10097, str::stream() << "bad table to index name on add index attempt current db: "
+                << cc().database()->name() << "  source: " << sourceNS,
+                cc().database()->name() == nss.db());
 
         // logical name of the index.  todo: get rid of the name, we don't need it!
         const char *name = io.getStringField("name");
         uassert(12523, "no index name specified", *name);
+        string indexNamespace = IndexDetails::indexNamespaceFromObj(io);
+        uassert(16829, str::stream() << "namespace name generated from index name \"" <<
+                                     indexNamespace << "\" is too long (128 char max)",
+                indexNamespace.length() <= 128);
 
         BSONObj key = io.getObjectField("key");
         uassert(12524, "index key pattern too large", key.objsize() <= 2048);
@@ -365,20 +268,50 @@ namespace mongo {
                 return false;
             }
             sourceCollection = nsdetails(sourceNS);
-            tlog() << "info: creating collection " << sourceNS << " on add index" << endl;
+            MONGO_TLOG(0) << "info: creating collection " << sourceNS << " on add index" << endl;
             verify( sourceCollection );
         }
 
-        if ( sourceCollection->findIndexByName(name) >= 0 ) {
-            // index already exists.
-            return false;
-        }
-        if( sourceCollection->findIndexByKeyPattern(key) >= 0 ) {
-            LOG(2) << "index already exists with diff name " << name << ' ' << key.toString() << endl;
-            return false;
+        {
+            // Check both existing and in-progress indexes (2nd param = true)
+            const int idx = sourceCollection->findIndexByName(name, true);
+            if (idx >= 0) {
+                // index already exists.
+                const IndexDetails& indexSpec(sourceCollection->idx(idx));
+                BSONObj existingKeyPattern(indexSpec.keyPattern());
+                uassert(16850, str::stream() << "Trying to create an index "
+                        << "with same name " << name
+                        << " with different key spec " << key
+                        << " vs existing spec " << existingKeyPattern,
+                        existingKeyPattern.equal(key));
+
+                uassert(16851, str::stream() << "Index with name: " << name
+                        << " already exists with different options",
+                        areIndexOptionsEquivalent(io, indexSpec));
+
+                // Index already exists with the same options, so no need to build a new
+                // one (not an error). Most likely requested by a client using ensureIndex.
+                return false;
+            }
         }
 
-        if ( sourceCollection->nIndexes >= NamespaceDetails::NIndexesMax ) {
+        {
+            // Check both existing and in-progress indexes (2nd param = true)
+            const int idx = sourceCollection->findIndexByKeyPattern(key, true);
+            if (idx >= 0) {
+                LOG(2) << "index already exists with diff name " << name
+                        << ' ' << key.toString() << endl;
+
+                const IndexDetails& indexSpec(sourceCollection->idx(idx));
+                uassert(16852, str::stream() << "Index with pattern: " << key
+                        << " already exists with different options",
+                        areIndexOptionsEquivalent(io, indexSpec));
+
+                return false;
+            }
+        }
+
+        if ( sourceCollection->getTotalIndexCount() >= NamespaceDetails::NIndexesMax ) {
             stringstream ss;
             ss << "add index fails, too many indexes for " << sourceNS << " key:" << key.toString();
             string s = ss.str();
@@ -403,13 +336,11 @@ namespace mongo {
                 return false;
         }
 
-        string pluginName = IndexPlugin::findPluginName( key );
-        IndexPlugin * plugin = NULL;
+        string pluginName = IndexNames::findPluginName( key );
         if (pluginName.size()) {
-            plugin = IndexPlugin::get(pluginName);
             uassert(16734, str::stream() << "Unknown index plugin '" << pluginName << "' "
-                                         << "in index "<< key
-                   , plugin);
+                                         << "in index "<< key,
+                    IndexNames::isKnownName(pluginName));
 
             if (needToUpgradeMinorVersion(pluginName))
                 upgradeMinorVersionOrAssert(pluginName);
@@ -417,9 +348,7 @@ namespace mongo {
 
         { 
             BSONObj o = io;
-            if ( plugin ) {
-                o = plugin->adjustIndexSpec(o);
-            }
+            o = IndexLegacy::adjustIndexSpecObject(o);
             BSONObjBuilder b;
             int v = DefaultIndexVersionNumber;
             if( !o["v"].eoo() ) {
@@ -452,38 +381,5 @@ namespace mongo {
         }
 
         return true;
-    }
-
-    void IndexSpec::reset(const IndexDetails * details) {
-        const DataFileHeader* dfh = cc().database()->getFile(0)->getHeader();
-        IndexSpec::PluginRules rules = dfh->versionMinor == PDFILE_VERSION_MINOR_24_AND_NEWER
-                                            ? IndexSpec::RulesFor24
-                                            : IndexSpec::RulesFor22
-                                            ;
-
-        _details = details;
-        reset(details->info, rules);
-    }
-
-    void IndexSpec::reset(const BSONObj& _info, PluginRules rules) {
-        info = _info;
-        keyPattern = info["key"].embeddedObjectUserCheck();
-        if ( keyPattern.objsize() == 0 ) {
-            out() << info.toString() << endl;
-            verify(false);
-        }
-        _init(rules);
-    }
-
-    void IndexChanges::dupCheck(IndexDetails& idx, DiskLoc curObjLoc) {
-        if (added.empty() || 
-            !idx.unique() || 
-            ignoreUniqueIndex(idx)) {
-            return;
-        }
-        const Ordering ordering = Ordering::make(idx.keyPattern());
-
-        // "E11001 duplicate key on update"
-        idx.idxInterface().uassertIfDups(idx, added, idx.head, curObjLoc, ordering);
     }
 }

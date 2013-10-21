@@ -18,11 +18,12 @@
 
 // _ todo: reconnect?
 
-#include "pch.h"
-#include "connpool.h"
-#include "syncclusterconnection.h"
-#include "../s/shard.h"
+#include "mongo/pch.h"
+
+#include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_rs.h"
+#include "mongo/client/syncclusterconnection.h"
+#include "mongo/s/shard.h"
 
 namespace mongo {
 
@@ -61,7 +62,8 @@ namespace mongo {
                 microSec > _minValidCreationTimeMicroSec) {
             _minValidCreationTimeMicroSec = microSec;
             log() << "Detected bad connection created at " << _minValidCreationTimeMicroSec
-                    << " microSec, clearing pool for " << _hostName << endl;
+                    << " microSec, clearing pool for " << _hostName
+                    << " of " << _pool.size() << " connections" << endl;
             clear();
         }
     }
@@ -148,8 +150,8 @@ namespace mongo {
     }
 
     bool PoolForHost::StoredConnection::ok( time_t now ) {
-        // if connection has been idle for 30 minutes, kill it
-        return ( now - when ) < 1800;
+        // Poke the connection to see if we're still ok
+        return conn->isStillConnected();
     }
 
     void PoolForHost::createdOne( DBClientBase * base) {

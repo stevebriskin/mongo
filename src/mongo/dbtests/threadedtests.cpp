@@ -17,21 +17,23 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
-#include "../server.h"
-#include "../bson/util/atomic_int.h"
-#include "../util/concurrency/mvar.h"
-#include "../util/concurrency/thread_pool.h"
-#include "../util/concurrency/list.h"
-#include "../util/timer.h"
-#include <boost/thread.hpp>
+#include "mongo/pch.h"
+
 #include <boost/bind.hpp>
-#include "../db/d_concurrency.h"
-#include "../util/concurrency/synchronization.h"
-#include "../util/concurrency/qlock.h"
-#include "dbtests.h"
-#include "mongo/util/concurrency/ticketholder.h"
+#include <boost/thread.hpp>
+
+#include "mongo/bson/util/atomic_int.h"
+#include "mongo/db/d_concurrency.h"
+#include "mongo/dbtests/dbtests.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/util/concurrency/mvar.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/list.h"
+#include "mongo/util/timer.h"
+#include "mongo/util/concurrency/synchronization.h"
+#include "mongo/util/concurrency/qlock.h"
+#include "mongo/util/concurrency/ticketholder.h"
+#include "mongo/server.h"
 
 namespace mongo { 
     void testNonGreedy();
@@ -253,7 +255,7 @@ namespace ThreadedTests {
             cc().shutdown();
         }
         virtual void validate() {
-            log() << "mongomutextest validate" << endl;
+            mongo::unittest::log() << "mongomutextest validate" << endl;
             ASSERT( ! Lock::isReadLocked() );
             ASSERT( wToXSuccessfulUpgradeCount >= 39 * N / 2000 );
             {
@@ -637,7 +639,7 @@ namespace ThreadedTests {
                     RWLock::Upgradable u(m);
                     LOG(Z) << x << ' ' << ch << " got" << endl;
                     if( ch == 'U' ) {
-#ifdef MONGO_USE_SRW_ON_WINDOWS
+#if defined(NTDDI_VERSION) && defined(NTDDI_WIN7) && (NTDDI_VERSION >= NTDDI_WIN7)
                         // SRW locks are neither fair nor FIFO, as per docs
                         if( t.millis() > 2000 ) {
 #else
@@ -645,10 +647,13 @@ namespace ThreadedTests {
 #endif
                             DEV {
                                 // a _DEBUG buildbot might be slow, try to avoid false positives
-                                log() << "warning lock upgrade was slow " << t.millis() << endl;
+                                mongo::unittest::log() <<
+                                    "warning lock upgrade was slow " << t.millis() << endl;
                             }
                             else {
-                                log() << "assertion failure: lock upgrade was too slow: " << t.millis() << endl;
+                                mongo::unittest::log() <<
+                                    "assertion failure: lock upgrade was too slow: " <<
+                                    t.millis() << endl;
                                 ASSERT( false );
                             }
                         }
@@ -946,7 +951,7 @@ namespace ThreadedTests {
                 _hotel.checkOut();
 
                 if( ( i % ( checkIns / 10 ) ) == 0 )
-                    log() << "checked in " << i << " times..." << endl;
+                    mongo::unittest::log() << "checked in " << i << " times..." << endl;
 
             }
 
@@ -994,7 +999,7 @@ namespace ThreadedTests {
 
 
             add< RWLockTest1 >();
-            //add< RWLockTest2 >(); // SERVER-2996
+            add< RWLockTest2 >();
             add< RWLockTest3 >();
             add< RWLockTest4 >();
 
