@@ -165,11 +165,6 @@ namespace mongo {
 
     int NamespaceDetails::quantizePowerOf2AllocationSpace(int allocSize) {
         int allocationSize = bucketSizes[ bucket( allocSize ) ];
-        if ( allocationSize == bucketSizes[MaxBucket] ) {
-            // if we get here, it means we're allocating more than 4mb, so round
-            // to the nearest megabyte
-            allocationSize = 1 + ( allocSize | ( ( 1 << 20 ) - 1 ) );
-        }
         return allocationSize;
     }
 
@@ -300,7 +295,7 @@ namespace mongo {
             }
             if ( bestmatchlen < 0x7fffffff && --extra <= 0 )
                 break;
-            if ( ++chain > 30 && b < MaxBucket ) {
+            if ( ++chain > 30 && b <= MaxBucket ) {
                 // too slow, force move to next bucket to grab a big chunk
                 //b++;
                 freelistIterations.increment( chain );
